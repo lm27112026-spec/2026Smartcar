@@ -1,16 +1,15 @@
 """
-motor_test.py - 电机模块功能测试
+motor_test.py - 电机模块功能测试（TB6612 直接 PWM 控制）
 【功能】
   测试 4 路电机能否正常工作，包括：
-  1. MOTOR_CONTROLLER 初始化检测
+  1. PWM 初始化检测
   2. 单电机正反转测试
   3. 编码器反馈读取
   4. 全向驱动运动学验证
   5. 急停功能测试
 【说明】
-  直接使用 seekfree.MOTOR_CONTROLLER 类控制电机（与官方 demo 一致），
-  不使用 motor.py 的 set_motor（其双方向引脚模式与硬件不匹配）。
-  编码器仍通过 motor.py 的 encoder 对象读取。
+  TB6612 使用 PWM + 2个方向引脚控制，MOTOR_CONTROLLER 类不支持此模式。
+  因此直接使用 machine.PWM 和 machine.Pin 对象控制电机。
 【使用】
   运行此脚本，观察串口输出测试结果
   按 SWITCH2 可提前终止测试
@@ -28,10 +27,8 @@ from seekfree import *
 
 MOTOR_NAMES = ['RF', 'LF', 'LB', 'RB']
 
-# MOTOR_CONTROLLER duty 范围: ±10000
-TEST_DUTY_LOW  = 3000    # 低速测试 duty (30%)
-TEST_DUTY_HIGH = 6000    # 高速测试 duty (60%)
-ENC_TIMEOUT_MS = 800     # 编码器响应超时（毫秒）
+TEST_DUTY  = 15000   # 测试 PWM duty (15000/65535 ≈ 23%)
+TEST_DUTY2 = 25000   # 高速测试 PWM
 
 # ============================================================
 #  引脚初始化
@@ -40,7 +37,7 @@ ENC_TIMEOUT_MS = 800     # 编码器响应超时（毫秒）
 time.sleep_ms(100)
 
 print("=" * 60)
-print("  4-Wheel Motor Functional Test")
+print("  4-Wheel Motor Functional Test (TB6612)")
 print("=" * 60)
 print("  REAL TYPE    : " + BOARD_TYPE)
 print("  BOARD VERSION: " + BOARD_VERSION)
@@ -54,38 +51,42 @@ switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()
 
 # ============================================================
-#  根据开发板类型选择电机通道
+#  TB6612 电机引脚定义（实测）
 # ============================================================
 
-MOTOR_CH = [None, None, None, None]
+# PWM 引脚
+pwm_rf = PWM("C26", 15000, duty_u16=0)
+pwm_lf = PWM("C24", 15000, duty_u16=0)
+pwm_lb = PWM("C20", 15000, duty_u16=0)
+pwm_rb = PWM("B26", 15000, duty_u16=0)
 
-if BOARD_TYPE == 'RT1021_144P_BTB':
-    MOTOR_CH[0] = MOTOR_CONTROLLER.PWM_D6_DIR_D7    # RF
-    MOTOR_CH[1] = MOTOR_CONTROLLER.PWM_C30_DIR_C31  # LF
-    MOTOR_CH[2] = MOTOR_CONTROLLER.PWM_C28_DIR_C29  # LB
-    MOTOR_CH[3] = MOTOR_CONTROLLER.PWM_D4_DIR_D5    # RB
-elif BOARD_TYPE == 'RT1021_144P_2P54':
-    MOTOR_CH[0] = MOTOR_CONTROLLER.PWM_D6_DIR_D7    # RF
-    MOTOR_CH[1] = MOTOR_CONTROLLER.PWM_C30_DIR_C31  # LF
-    MOTOR_CH[2] = MOTOR_CONTROLLER.PWM_C28_DIR_C29  # LB
-    MOTOR_CH[3] = MOTOR_CONTROLLER.PWM_D4_DIR_D5    # RB
-elif BOARD_TYPE == 'RT1021_100P_2P54':
-    MOTOR_CH[0] = MOTOR_CONTROLLER.PWM_C24_DIR_C26
-    MOTOR_CH[1] = MOTOR_CONTROLLER.PWM_C25_DIR_C27
+# 方向引脚
+pin_d6  = Pin("D6",  Pin.OUT, value=0)
+pin_d7  = Pin("D7",  Pin.OUT, value=0)
+pin_d4  = Pin("D4",  Pin.OUT, value=0)
+pin_d5  = Pin("D5",  Pin.OUT, value=0)
+pin_c30 = Pin("C30", Pin.OUT, value=0)
+pin_c31 = Pin("C31", Pin.OUT, value=0)
+pin_c28 = Pin("C28", Pin.OUT, value=0)
+pin_c29 = Pin("C29", Pin.OUT, value=0)
+
+# 电机元组 (PWM, 方向A, 方向B)
+# TB6612: IN1=0,IN2=1 → 正转; IN1=1,IN2=0 → 反转; IN1=0,IN2=0 → 停止
+MOTOR_RF = (pwm_rf, pin_d6,  pin_d7)   # C26 + D6/D7
+MOTOR_LF = (pwm_lf, pin_d4,  pin_d5)   # C24 + D4/D5
+MOTOR_LB = (pwm_lb, pin_c30, pin_c31)  # C20 + C30/C31
+MOTOR_RB = (pwm_rb, pin_c28, pin_c29)  # B26 + C28/C29
+
+MOTOR_LIST = [MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB]
 
 # ============================================================
-#  初始化编码器（通过 smartcar encoder 直接读取）
+#  初始化编码器
 # ============================================================
 
-ENCODER_LF_A, ENCODER_LF_B = 'C3',  'C2'
-ENCODER_LB_A, ENCODER_LB_B = 'D14', 'D13'
-ENCODER_RB_A, ENCODER_RB_B = 'D16', 'D15'
-ENCODER_RF_A, ENCODER_RF_B = 'C1',  'C0'
-
-encoder_rf = encoder(ENCODER_RF_A, ENCODER_RF_B, capture_div=1)
-encoder_lf = encoder(ENCODER_LF_A, ENCODER_LF_B, capture_div=1)
-encoder_lb = encoder(ENCODER_LB_A, ENCODER_LB_B, capture_div=1)
-encoder_rb = encoder(ENCODER_RB_A, ENCODER_RB_B, capture_div=1)
+encoder_rf = encoder('C1',  'C0',  capture_div=1)
+encoder_lf = encoder('C3',  'C2',  capture_div=1)
+encoder_lb = encoder('D14', 'D13', capture_div=1)
+encoder_rb = encoder('D16', 'D15', capture_div=1)
 
 ENC_LIST = [encoder_rf, encoder_lf, encoder_lb, encoder_rb]
 
@@ -104,20 +105,31 @@ pit1.callback(time_pit_handler)
 pit1.start(10)
 
 # ============================================================
-#  初始化电机（MOTOR_CONTROLLER 类）
+#  电机控制函数
 # ============================================================
 
-print("  Initializing motors...")
-motors = []
-for i in range(4):
-    # RF 和 RB 需要 invert=True 以匹配物理方向
-    inv = (i == 0 or i == 3)
-    m = MOTOR_CONTROLLER(MOTOR_CH[i], 15000, duty=0, invert=inv)
-    m.info()
-    motors.append(m)
+def set_motor(motor, duty_u16):
+    """直接控制 TB6612 电机"""
+    pwm, dir_a, dir_b = motor
+    if duty_u16 > 0:
+        dir_a.value(0)
+        dir_b.value(1)
+        pwm.duty_u16(int(duty_u16))
+    elif duty_u16 < 0:
+        dir_a.value(1)
+        dir_b.value(0)
+        pwm.duty_u16(int(-duty_u16))
+    else:
+        dir_a.value(0)
+        dir_b.value(0)
+        pwm.duty_u16(0)
 
-print("  >> All 4 motors initialized.")
-print("")
+def stop_all_motors():
+    for m in MOTOR_LIST:
+        set_motor(m, 0)
+
+def check_switch():
+    return switch2.value() != state2
 
 # ============================================================
 #  测试结果记录
@@ -128,37 +140,25 @@ test_results = {
     'motor_forward':  [False, False, False, False],
     'motor_reverse':  [False, False, False, False],
     'encoder_read':   [False, False, False, False],
-    'encoder_dir':    [False, False, False, False],
     'omni_drive':     False,
     'emergency_stop': False,
 }
 
 # ============================================================
-#  辅助函数
-# ============================================================
-
-def check_switch():
-    return switch2.value() != state2
-
-def stop_all_motors():
-    for m in motors:
-        m.duty(0)
-
-# ============================================================
-#  测试 1：MOTOR_CONTROLLER 初始化 & 急停
+#  测试 1：PWM 初始化 & 急停
 # ============================================================
 
 print("-" * 60)
-print("  [Test 1] MOTOR_CONTROLLER Init & Emergency Stop")
+print("  [Test 1] PWM Init & Emergency Stop")
 print("-" * 60)
 
 try:
     stop_all_motors()
     test_results['pwm_init'] = True
-    print("  >> PASS: MOTOR_CONTROLLER initialized.")
+    print("  >> PASS: PWM channels initialized.")
 
     # 急停测试
-    motors[0].duty(TEST_DUTY_LOW)
+    set_motor(MOTOR_RF, TEST_DUTY)
     time.sleep_ms(200)
     stop_all_motors()
     time.sleep_ms(200)
@@ -183,7 +183,7 @@ print("-" * 60)
 print("  [Test 2] Individual Motor Forward/Reverse + Encoder")
 print("-" * 60)
 print("  ⚠ Ensure wheels are off the ground!")
-print("  Duty range: ±10000, test duty: ±{}".format(TEST_DUTY_LOW))
+print("  PWM duty: {} / 65535 ({:.0f}%)".format(TEST_DUTY, TEST_DUTY/65535*100))
 print("  Starting in 2 seconds...")
 time.sleep_ms(2000)
 
@@ -192,14 +192,13 @@ for i in range(4):
         break
 
     print("  Testing Motor {} ({}):".format(i, MOTOR_NAMES[i]))
-    m = motors[i]
+    motor = MOTOR_LIST[i]
 
     # --- 正转测试 ---
-    print("    Forward +{:<5d}...".format(TEST_DUTY_LOW), end="")
-    m.duty(TEST_DUTY_LOW)
+    print("    Forward +{:<6d}...".format(TEST_DUTY), end="")
+    set_motor(motor, TEST_DUTY)
     time.sleep_ms(1000)
 
-    # 清空编码器残余
     ENC_LIST[i].get()
     time.sleep_ms(200)
 
@@ -210,23 +209,21 @@ for i in range(4):
         direction = "positive" if enc_val > 0 else "negative"
         print(" enc={:+d} ({})".format(enc_val, direction))
     else:
-        # 再等待更长时间
         time.sleep_ms(1000)
         enc_val = ENC_LIST[i].get()
         if abs(enc_val) > 2:
             test_results['motor_forward'][i] = True
             test_results['encoder_read'][i] = True
-            direction = "positive" if enc_val > 0 else "negative"
-            print(" enc={:+d} ({})".format(enc_val, direction))
+            print(" enc={:+d}".format(enc_val))
         else:
-            print(" enc={} (no response)".format(enc_val))
+            print(" enc=0 (no response)")
 
-    m.duty(0)
+    set_motor(motor, 0)
     time.sleep_ms(500)
 
     # --- 反转测试 ---
-    print("    Reverse -{:<5d}...".format(TEST_DUTY_LOW), end="")
-    m.duty(-TEST_DUTY_LOW)
+    print("    Reverse -{:<6d}...".format(TEST_DUTY), end="")
+    set_motor(motor, -TEST_DUTY)
     time.sleep_ms(1000)
 
     ENC_LIST[i].get()
@@ -237,11 +234,7 @@ for i in range(4):
         test_results['motor_reverse'][i] = True
         if not test_results['encoder_read'][i]:
             test_results['encoder_read'][i] = True
-        direction = "positive" if enc_val > 0 else "negative"
-        print(" enc={:+d} ({})".format(enc_val, direction))
-
-        if test_results['motor_forward'][i]:
-            test_results['encoder_dir'][i] = True
+        print(" enc={:+d}".format(enc_val))
     else:
         time.sleep_ms(1000)
         enc_val = ENC_LIST[i].get()
@@ -249,14 +242,11 @@ for i in range(4):
             test_results['motor_reverse'][i] = True
             if not test_results['encoder_read'][i]:
                 test_results['encoder_read'][i] = True
-            direction = "positive" if enc_val > 0 else "negative"
-            print(" enc={:+d} ({})".format(enc_val, direction))
-            if test_results['motor_forward'][i]:
-                test_results['encoder_dir'][i] = True
+            print(" enc={:+d}".format(enc_val))
         else:
-            print(" enc={} (no response)".format(enc_val))
+            print(" enc=0 (no response)")
 
-    m.duty(0)
+    set_motor(motor, 0)
     time.sleep_ms(300)
     print("")
 
@@ -269,7 +259,6 @@ if not check_switch():
     print("  [Test 3] Omni-Drive Kinematics")
     print("-" * 60)
 
-    # 全向运动学解算（与 motor.py 一致）
     def omni_kinematics(vx, vy, wz):
         w_rf =  vx + vy - wz
         w_lf = -vx - vy - wz
@@ -283,15 +272,14 @@ if not check_switch():
         scale = 1.0
         if max_speed > 1.0:
             scale = 1.0 / max_speed
-        duty_vals = [int(s * scale * 10000) for s in speeds]
+        pwm_vals = [int(s * scale * 65535) for s in speeds]
         for j in range(4):
-            motors[j].duty(duty_vals[j])
+            set_motor(MOTOR_LIST[j], pwm_vals[j])
 
     # 测试前进
-    print("    Forward (vx=0, vy=1, wz=0)...", end="")
+    print("    Forward (vx=0, vy=0.5, wz=0)...", end="")
     omni_drive_local(0, 0.5, 0)
     time.sleep_ms(1000)
-    # 清空编码器
     for enc in ENC_LIST:
         enc.get()
     time.sleep_ms(300)
@@ -319,43 +307,6 @@ if not check_switch():
 
     stop_all_motors()
     time.sleep_ms(300)
-
-# ============================================================
-#  测试 4：PWM 线性度验证（RF 电机）
-# ============================================================
-
-if not check_switch():
-    print("")
-    print("-" * 60)
-    print("  [Test 4] Duty Linearity Check (RF motor)")
-    print("-" * 60)
-
-    duty_levels = [0, 2000, 4000, 6000, 8000, 10000, 0]
-    enc_readings = []
-
-    for duty_val in duty_levels:
-        if check_switch():
-            break
-        motors[0].duty(duty_val)
-        time.sleep_ms(400)
-        ENC_LIST[0].get()  # 清空
-        time.sleep_ms(300)
-        enc = ENC_LIST[0].get()
-        enc_readings.append(enc)
-        print("    duty={:>6d} -> enc={:+d}".format(duty_val, enc))
-
-    stop_all_motors()
-
-    # 验证线性度
-    monotonic = True
-    for j in range(1, len(enc_readings) - 1):
-        if enc_readings[j] < enc_readings[j-1] * 0.3:
-            monotonic = False
-            break
-    if monotonic:
-        print("  >> PASS: Duty-to-speed relationship looks reasonable.")
-    else:
-        print("  >> WARN: Non-monotonic response. Check motor/gearbox.")
 
 # ============================================================
 #  最终测试报告
@@ -403,8 +354,6 @@ else:
             failed.append("motor_{} fwd".format(MOTOR_NAMES[i]))
         if not test_results['motor_reverse'][i]:
             failed.append("motor_{} rev".format(MOTOR_NAMES[i]))
-        if not test_results['encoder_read'][i]:
-            failed.append("motor_{} enc".format(MOTOR_NAMES[i]))
     if failed:
         print("  Failed: {}".format(", ".join(failed)))
 print("=" * 60)

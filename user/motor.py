@@ -24,7 +24,7 @@ SWITCH2_PIN = 'D10'
 # ⚠ 实测编码器在轮轴侧（减速后），PPR=7，无减速比倍乘
 #   7 脉冲/轮圈 ÷ (π × 0.05m/轮圈) = 44.6 脉冲/米
 #   各轮独立标定方法：让车轮空转 N 圈 → total_pulses / (N * 0.1571)
-ENC_SCALE = [44.6, 44.6, 44.6, 44.6]  # [rf, lf, lb, rb] 脉冲/米
+ENC_SCALE = [833, 840, 853, 817]  # [rf, lf, lb, rb] — 2026-06-08 去掉负号
 
 # ============================================================
 #  一、编码器引脚定义 & 初始化
@@ -214,10 +214,11 @@ pin_d6  = Pin("D6",  Pin.OUT, value=0)
 pin_d7  = Pin("D7",  Pin.OUT, value=0)
 
 # 电机元组 (PWM, 方向A, 方向B)
-MOTOR_RF = (pwm_3, pin_d4,  pin_d5)   # 右前
-MOTOR_LF = (pwm_2, pin_c30, pin_c31)  # 左前
-MOTOR_LB = (pwm_1, pin_c28, pin_c29)  # 左后
-MOTOR_RB = (pwm_4, pin_d6,  pin_d7)   # 右后
+# TB6612 驱动板映射 — 2026-06-08 实测
+MOTOR_RF = (pwm_4, pin_d6,  pin_d7)   # C26 + D6/D7
+MOTOR_LF = (pwm_3, pin_d4,  pin_d5)   # C24 + D4/D5
+MOTOR_LB = (pwm_2, pin_c30, pin_c31)  # C20 + C30/C31
+MOTOR_RB = (pwm_1, pin_c28, pin_c29)  # B26 + C28/C29
 
 def stop_all():
     """急停：所有电机方向引脚置 0，PWM 置 0"""

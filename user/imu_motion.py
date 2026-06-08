@@ -14,7 +14,6 @@ import gc, time, math
 from machine import *
 from smartcar import *
 from seekfree import *
-from motor import omni_drive, SWITCH2_PIN
 from motor import omni_drive, SWITCH2_PIN, encoder_rf, encoder_lf, encoder_lb, encoder_rb, ENC_SCALE
 
 # ============================================================
