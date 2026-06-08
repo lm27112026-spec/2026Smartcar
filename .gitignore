@@ -1,0 +1,44 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Build artifacts (embedded)
+*.bin
+*.hex
+*.elf
+*.map
+*.o
+*.d
+*.a
+*.out
+*.axf
+*.lst
+*.log
+
+# OpenCode agent files
+.omo/
+
+# NXP MCUBootUtility build
+NXP-MCUBootUtility-*/bin/
+NXP-MCUBootUtility-*/dist/
+NXP-MCUBootUtility-*/build/
+NXP-MCUBootUtility-*/*.spec
+NXP-MCUBootUtility-*/*.exe
+
+# Virtual environment
+venv/
+.venv/
+env/
