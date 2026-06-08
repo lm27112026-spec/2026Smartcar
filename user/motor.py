@@ -18,28 +18,28 @@ from pid import PID
 ANG_OFFSET = 0.0
 MAX_PWM = 50000
 LED_PIN = 'C4'
-SWITCH2_PIN = 'D9'
+SWITCH2_PIN = 'D10'
 
 # 编码器标定因子（脉冲数/米），4个轮子各自独立
 # ⚠ 实测编码器在轮轴侧（减速后），PPR=7，无减速比倍乘
 #   7 脉冲/轮圈 ÷ (π × 0.05m/轮圈) = 44.6 脉冲/米
 #   各轮独立标定方法：让车轮空转 N 圈 → total_pulses / (N * 0.1571)
-ENC_SCALE = [833, 840, -853, -817]  # [rf, lf, lb, rb] 脉冲/米——2026-06-05 卷尺标定: 5s@0.3 实测 0.652m
+ENC_SCALE = [44.6, 44.6, 44.6, 44.6]  # [rf, lf, lb, rb] 脉冲/米
 
 # ============================================================
 #  一、编码器引脚定义 & 初始化
 #  接线表（编码器 A/B 相已对调以修正计数方向）:
 #    电机位置   编码器 A 相   编码器 B 相  （驱动方向  → 计数符号）
-# 左前 (LF)      C3           C2          正 PWM → 正计数
-# 左后 (LB)      D14          D13         正 PWM → 正计数
-# 右后 (RB)      D16          D15         正 PWM → 正计数
-# 右前 (RF)      C1           C0          正 PWM → 正计数
+# 右前 (RF)      C3           C2          正 PWM → 正计数
+# 左前 (LF)      D14          D13         正 PWM → 正计数
+# 左后 (LB)      D16          D15         正 PWM → 正计数
+# 右后 (RB)      C1           C0          正 PWM → 正计数
 # ============================================================
 
-ENCODER_LF_A, ENCODER_LF_B = 'C3',  'C2'   # 左前编码器
-ENCODER_LB_A, ENCODER_LB_B = 'D14', 'D13'  # 左后编码器
-ENCODER_RB_A, ENCODER_RB_B = 'D16', 'D15'  # 右后编码器
-ENCODER_RF_A, ENCODER_RF_B = 'C1',  'C0'   # 右前编码器
+ENCODER_RF_A, ENCODER_RF_B = 'C3',  'C2'   # 右前编码器
+ENCODER_LF_A, ENCODER_LF_B = 'D14', 'D13'  # 左前编码器
+ENCODER_LB_A, ENCODER_LB_B = 'D16', 'D15'  # 左后编码器
+ENCODER_RB_A, ENCODER_RB_B = 'C1',  'C0'   # 右后编码器
 
 encoder_rf = encoder(ENCODER_RF_A, ENCODER_RF_B, capture_div=1)
 encoder_lf = encoder(ENCODER_LF_A, ENCODER_LF_B, capture_div=1)
@@ -100,10 +100,8 @@ def get_encoder_speeds_filtered(dt):
 
 CTRL_DT = 0.02                 # 控制周期 20ms（与主循环一致）
 
-# PI 增益（配合修正后的 PID *dt 实现）
-# 目标：0.005 m/s 误差 → P+I 输出 ~1500 PWM（10% 前馈）
 WHEEL_PI = [
-    PID(kp=100000, ki=20000, kd=0.0, integral_limit=0.5, output_limit=MAX_PWM)
+    PID(kp=8000, ki=1000, kd=0.0, integral_limit=5000, output_limit=MAX_PWM)
     for _ in range(4)
 ]
 
@@ -136,7 +134,7 @@ def omni_drive_closed_loop(vx, vy, wz, actual_speeds=None):
             continue
 
         feedforward = target_mps * PWM_PER_MPS[i]
-        correction = WHEEL_PI[i].compute(target_mps, actual[i], CTRL_DT)
+        correction = WHEEL_PI[i].compute(target_mps, actual[i])
         final_pwm = feedforward + correction
         final_pwm = max(-MAX_PWM, min(final_pwm, MAX_PWM))
 
@@ -148,10 +146,10 @@ def omni_drive_closed_loop(vx, vy, wz, actual_speeds=None):
 # ============================================================
 
 def omni_kinematics(vx, vy, wz):
-    w_rf =  vx + vy - wz
+    w_rf =  vx - vy - wz
     w_lf = -vx - vy - wz
-    w_lb =  vx - vy - wz
-    w_rb = -vx + vy - wz
+    w_lb = -vx + vy - wz
+    w_rb =  vx + vy - wz
     return [w_rf, w_lf, w_lb, w_rb]
 
 
@@ -188,8 +186,8 @@ def omni_drive(vx, vy, wz, max_pwm=MAX_PWM):
 
 def omni_move_by_angle(speed, angle_deg, rotation=0, max_pwm=MAX_PWM):
     rad = math.radians(angle_deg)
-    vx = speed * math.cos(rad)
-    vy = speed * math.sin(rad)
+    vx = speed * math.sin(rad)
+    vy = speed * math.cos(rad)
     omni_drive(vx, vy, rotation, max_pwm)
 
 # ============================================================
@@ -215,12 +213,11 @@ pin_d5  = Pin("D5",  Pin.OUT, value=0)
 pin_d6  = Pin("D6",  Pin.OUT, value=0)
 pin_d7  = Pin("D7",  Pin.OUT, value=0)
 
-
 # 电机元组 (PWM, 方向A, 方向B)
-MOTOR_LF = (pwm_2, pin_c30, pin_c31)
-MOTOR_LB = (pwm_1, pin_c28, pin_c29)
-MOTOR_RB = (pwm_3, pin_d4,  pin_d5)
-MOTOR_RF = (pwm_4, pin_d6,  pin_d7)
+MOTOR_RF = (pwm_3, pin_d4,  pin_d5)   # 右前
+MOTOR_LF = (pwm_2, pin_c30, pin_c31)  # 左前
+MOTOR_LB = (pwm_1, pin_c28, pin_c29)  # 左后
+MOTOR_RB = (pwm_4, pin_d6,  pin_d7)   # 右后
 
 def stop_all():
     """急停：所有电机方向引脚置 0，PWM 置 0"""
@@ -232,5 +229,3 @@ def stop_all():
 
 # 导入完成后立即强制停机一次
 stop_all()
-
-
