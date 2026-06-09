@@ -21,7 +21,7 @@ import gc, time
 from machine import Pin
 from smartcar import ticker
 from motor import (
-    stop_all,
+    stop_all, get_encoder_counts,
     LED_PIN, SWITCH2_PIN,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
 )
@@ -69,8 +69,9 @@ expected_samples = int(TEST_DURATION_S * 1000 / SAMPLE_INTERVAL_MS)
 print("\n" + "=" * 60)
 print("  Encoder Static Drift Test ({}s, ~{} samples)".format(TEST_DURATION_S, expected_samples))
 print("  Robot MUST be lifted off ground – motors stay OFF")
-print("  Press SWITCH2 to abort at any time")
+print("  Toggle SWITCH2 to abort at any time")
 print("=" * 60)
+print("")
 
 # ---------------------------------------------------------------------------
 #  Main sampling loop
@@ -88,11 +89,11 @@ for _ in range(expected_samples):
     #  Check abort button
     if switch2.value() != state2:
         aborted = True
-        print("\n  [ABORT] SWITCH2 pressed – stopping.")
+        print("\n  [ABORT] SWITCH2 toggled – stopping.")
         break
 
     elapsed = time.ticks_diff(time.ticks_ms(), t_start) / 1000.0
-    counts = [encoder_rf.get(), encoder_lf.get(), encoder_lb.get(), encoder_rb.get()]
+    counts = get_encoder_counts()
     total_samples += 1
 
     event = False

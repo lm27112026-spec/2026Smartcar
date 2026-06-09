@@ -13,6 +13,10 @@ from motor import (
     LED_PIN, SWITCH2_PIN,
 )
 
+LED_PIN     = 'C4'
+SWITCH2_PIN = 'D9'
+
+
 led     = Pin(LED_PIN, Pin.OUT, value=True)
 switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()

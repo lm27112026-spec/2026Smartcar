@@ -27,13 +27,16 @@ import gc, time
 from machine import Pin
 from smartcar import ticker
 from motor import (
-    set_motor, stop_all, omni_drive,
+    set_motor, stop_all, omni_drive, omni_kinematics,
     LED_PIN, SWITCH2_PIN,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
     MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB,
     ENC_SCALE, MAX_SPEED_MPS, MAX_PWM,
 )
 import imu_motion
+
+SWITCH2_PIN = 'D9'
+LED_PIN = 'C4'
 
 # ============================================================
 #  Startup safety
@@ -75,7 +78,7 @@ yaw_start = imu_motion.yaw
 # ============================================================
 #  Constants
 # ============================================================
-TEST_PWM      = 30000   # 60% MAX_PWM, mid-range
+TEST_PWM      = 10000   # 60% MAX_PWM, mid-range
 TARGET_DIST_M = 0.25    # 25cm — short-distance test
 CONTROL_INTERVAL_S = 0.02
 TIMEOUT_S     = 10      # 25cm 短距 10s 足够
@@ -96,10 +99,11 @@ print("  SWITCH2 to exit | {}s timeout".format(TIMEOUT_S))
 print("=" * 60)
 
 # ============================================================
-#  Drive — same open-loop PWM on all 4 wheels
+#  Drive — open-loop PWM with correct kinematics direction
 # ============================================================
-for m in (MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB):
-    set_motor(m, TEST_PWM)
+norms = omni_kinematics(1, 0, 0)  # [1, -1, -1, 1]
+for i, m in enumerate((MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB)):
+    set_motor(m, int(norms[i] * TEST_PWM))
 
 # ============================================================
 #  Main control loop

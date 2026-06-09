@@ -28,7 +28,7 @@ switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2 = switch2.value()
 
 # ============================================================
-#  温度稳定等待（10 秒，可取消）
+#  温度稳定等待（10 秒）
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -36,16 +36,16 @@ print("  IMU Static Yaw Drift Test (60s)")
 print("=" * 60)
 print("")
 print("  机器人放在平坦表面，不要触碰！")
-print("  等待 IMU 温度稳定 ...")
-print("  (按 SWITCH2 可取消)")
+print("  等待 IMU 温度稳定 10 秒...")
+print("  拨动 SWITCH2 可提前跳过等待")
 
+state2 = switch2.value()
 for i in range(10, 0, -1):
     print("  {} 秒 ...".format(i))
     time.sleep_ms(1000)
     if switch2.value() != state2:
-        print("  SW2 — 用户取消")
-        led.off()
-        raise SystemExit(0)
+        print("  SW2 拨动 — 跳过等待")
+        break
 
 print("  温度稳定完成。")
 print("")
@@ -106,7 +106,7 @@ while iteration < SAMPLES_TOTAL:
     if switch2.value() != state2:
         aborted = True
         elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        print("  SW2 stop — partial result: {:.1f}s elapsed".format(elapsed))
+        print("  SW2 toggled — partial result: {:.1f}s elapsed".format(elapsed))
         break
 
     time.sleep_ms(SAMPLE_INTERVAL_MS)

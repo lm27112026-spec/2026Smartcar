@@ -18,7 +18,7 @@ from pid import PID
 ANG_OFFSET = 0.0
 MAX_PWM = 50000
 LED_PIN = 'C4'
-SWITCH2_PIN = 'D10'
+SWITCH2_PIN = 'D9'
 
 # 编码器标定因子（脉冲数/米），4个轮子各自独立
 # ⚠ 实测编码器在轮轴侧（减速后），PPR=7，无减速比倍乘
@@ -29,11 +29,11 @@ ENC_SCALE = [833, 840, 853, 817]  # [rf, lf, lb, rb] — 2026-06-08 去掉负号
 # ============================================================
 #  一、编码器引脚定义 & 初始化
 #  接线表（编码器 A/B 相已对调以修正计数方向）:
-#    电机位置   编码器 A 相   编码器 B 相  （驱动方向  → 计数符号）
-# 右前 (RF)      C3           C2          正 PWM → 正计数
-# 左前 (LF)      D14          D13         正 PWM → 正计数
-# 左后 (LB)      D16          D15         正 PWM → 正计数
-# 右后 (RB)      C1           C0          正 PWM → 正计数
+#    电机位置   编码器 A 相   编码器 B 相  （驱动方向  → 原始计数 → 代码修正后）
+# 右前 (RF)      C3           C2          正 PWM → 负计数 → 代码取反为正
+# 左前 (LF)      D14          D13         正 PWM → 负计数（与运动学目标一致）
+# 左后 (LB)      D16          D15         正 PWM → 正计数 → 代码取反为负
+# 右后 (RB)      C1           C0          正 PWM → 正计数（与运动学目标一致）
 # ============================================================
 
 ENCODER_RF_A, ENCODER_RF_B = 'C3',  'C2'   # 右前编码器
@@ -50,8 +50,9 @@ def get_encoder_counts():
     """
     返回 4 个编码器脉冲增量 [rf, lf, lb, rb]
     每次调用返回自上次 get() 以来的脉冲变化量，停止时为 0
+    注意：RF 和 LB 编码器物理方向与运动学约定相反，需取反
     """
-    return [encoder_rf.get(), encoder_lf.get(), encoder_lb.get(), encoder_rb.get()]
+    return [-encoder_rf.get(), encoder_lf.get(), -encoder_lb.get(), encoder_rb.get()]
 
 
 def get_encoder_speeds(dt):
@@ -108,7 +109,7 @@ WHEEL_PI = [
 SPD_DEADBAND = 0.005           # 5mm/s 以下视为静止，清零积分
 
 MAX_SPEED_MPS = [0.123, 0.123, 0.123, 0.123]  # [rf, lf, lb, rb] 由 encoder_check.py 标定
-PWM_PER_MPS   = [405455, 405455, 405455, 405455]  # [rf, lf, lb, rb]
+PWM_PER_MPS   = [106687, 108527, 111976, 109835]  # [rf, lf, lb, rb] — 2026-06-09 标定
 
 
 def omni_drive_closed_loop(vx, vy, wz, actual_speeds=None):
@@ -146,10 +147,10 @@ def omni_drive_closed_loop(vx, vy, wz, actual_speeds=None):
 # ============================================================
 
 def omni_kinematics(vx, vy, wz):
-    w_rf =  vx - vy - wz
-    w_lf = -vx - vy - wz
-    w_lb = -vx + vy - wz
-    w_rb =  vx + vy - wz
+    w_rf =  vx - vy + wz
+    w_lf = -vx - vy + wz
+    w_lb = -vx + vy + wz
+    w_rb =  vx + vy + wz
     return [w_rf, w_lf, w_lb, w_rb]
 
 
@@ -230,3 +231,5 @@ def stop_all():
 
 # 导入完成后立即强制停机一次
 stop_all()
+
+

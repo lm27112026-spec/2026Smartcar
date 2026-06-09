@@ -24,7 +24,7 @@ import time
 from machine import Pin
 from smartcar import ticker
 from motor import (
-    omni_drive, stop_all,
+    omni_drive, stop_all, get_encoder_counts,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
     ENC_SCALE, LED_PIN, SWITCH2_PIN,
 )
@@ -78,14 +78,11 @@ CALIB_FACTOR = 1.0         # ← 实测偏差倍数，根据实际调整
 
 # ============================================================
 #  五、编码器归零
-#     连续读取 5 次，清空编码器 get() 的增量缓冲
+#     连续读取 5 次，清空编码器增量缓冲
 # ============================================================
 print("Zeroing encoders...")
 for _ in range(5):
-    encoder_rf.get()
-    encoder_lf.get()
-    encoder_lb.get()
-    encoder_rb.get()
+    get_encoder_counts()
     time.sleep_ms(10)
 
 # ============================================================
@@ -115,13 +112,8 @@ while True:
         print("SW2 stop — button toggled.")
         break
 
-    # ---- 读取 4 路编码器增量脉冲（独立调用，不用 get_encoder_counts）----
-    counts = [
-        encoder_rf.get(),
-        encoder_lf.get(),
-        encoder_lb.get(),
-        encoder_rb.get(),
-    ]
+    # ---- 读取 4 路编码器增量脉冲（统一走 get_encoder_counts，自动处理符号）----
+    counts = get_encoder_counts()
 
     # ---- 累加脉冲 ----
     for i in range(4):
