@@ -1,140 +1,88 @@
-"""
-main.py - 闭环运动控制（编码器 + IMU + PID 融合）
-【功能】
-  - 初始化所有硬件模块
-  - 每 20ms 执行一次控制循环：
-    1. 读取 IMU → 更新姿态角
-    2. 读取编码器 → 计算各轮转速
-    3. 速度斜坡（平滑启动）
-    4. 航向 PID → yaw 保持
-    5. omni_drive_closed_loop → 闭环驱动
-  - SWITCH2 退出
-【依赖】motor（电机+编码器）、imu_motion（姿态）、pid（控制器）
-"""
-
-import gc, time
-from machine import Pin
-from smartcar import *
-from seekfree import *
-from motor import (
-    omni_drive_closed_loop, stop_all, reset_encoders,
-    get_encoder_speeds_filtered,
-    LED_PIN, SWITCH2_PIN,
-    encoder_rf, encoder_lf, encoder_lb, encoder_rb,
-)
-from imu_motion import imu, update_angle
-import imu_motion
-from pid import PID
+from machine import UART, Pin
+import time
+import gc
+from motor import stop_all
+from kalman_filter import CameraKalmanFilter
+from control import CascadeController
 
 # ============================================================
-#  一、初始化
+# 硬件初始化
 # ============================================================
-
-time.sleep_ms(100)
-stop_all()
-
-led     = Pin(LED_PIN, Pin.OUT, value=True)
-switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
+uart = UART(7, baudrate=9600, bits=8, parity=None, stop=1)
+switch2 = Pin('D9', Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()
 
-# ============================================================
-#  二、PID 参数
-# ============================================================
+# 卡尔曼滤波器 — 对摄像头原始数据 (ex, dist, roll) 降噪
+kf = CameraKalmanFilter()
 
-# 航向 PID：yaw 误差（度）→ wz（归一化 -1~1）
-# 注意：error_yaw 是度数，kp 按度数设计（不是弧度）
-heading_pid = PID(
-    kp=0.10,            # 1° 误差 → 0.10 wz
-    ki=0.0005,          # 慢积分消除稳态偏置
-    kd=0.0,             # 关掉微分（陀螺仪噪声大）
-    integral_limit=0.1,
-    output_limit=0.5,
-)
+# 级联 PID 控制器 (外环位置环 + 内环速度环)
+ctrl = CascadeController()
 
-# ============================================================
-#  三、运动参数
-# ============================================================
+def main():
+    print("System Starting: Cascade PID Control...")
+    stop_all()
 
-TARGET_SPEED = 0.3      # 目标速度 (0~1)
-RAMP_RATE = 0.015       # 每 20ms 增加量（约 0.4s 到目标）
-current_speed = 0.0
-CONTROL_INTERVAL_S = 0.02
+    last_data_time = time.ticks_ms()
+    tracking = False
 
-# ============================================================
-#  四、编码器清零
-# ============================================================
+    while True:
+        if uart.any() >= 6:
+            buf = uart.read()
+            idx = buf.find(b'\xAA')
 
-print("Calibrating encoders...")
-time.sleep_ms(500)
-reset_encoders()
-time.sleep_ms(100)
+            if idx != -1 and len(buf) >= idx + 6:
+                if buf[idx + 5] == 0xBB:
 
-# ============================================================
-#  五、定时器（每 10ms 硬件捕获）
-# ============================================================
+                    # 1. 数据解析
+                    raw_ex   = buf[idx + 1]
+                    raw_ey   = buf[idx + 2]
+                    dist     = buf[idx + 3]
+                    raw_roll = buf[idx + 4]
 
-ticker_flag = False
-ticker_count = 0
+                    ex   = raw_ex if raw_ex < 128 else raw_ex - 256
+                    ey   = raw_ey if raw_ey < 128 else raw_ey - 256
+                    roll = raw_roll if raw_roll < 128 else raw_roll - 256
 
-def ticker_handler(t):
-    global ticker_flag, ticker_count
-    ticker_flag = True
-    ticker_count = (ticker_count + 1) % 100
+                    last_data_time = time.ticks_ms()
 
-pit = ticker(1)
-pit.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-pit.callback(ticker_handler)
-pit.start(10)
+                    # 2. 卡尔曼滤波: 对 ex / dist / roll 降噪
+                    ex_f, dist_f, roll_f = kf.update(ex, dist, roll)
 
-# ============================================================
-#  六、主控制循环（每 20ms 执行一次）
-# ============================================================
+                    # 3. 目标检测 (原始值全零 = 摄像头未检测到目标)
+                    tracking = not (ex == 0 and ey == 0 and dist == 0 and roll == 0)
 
-print("\n=== Closed-Loop Fusion Control ===")
-print("Target speed: {:.1f}, heading hold enabled".format(TARGET_SPEED))
-print("Toggle SWITCH2 to stop.\n")
+                    # 4. 级联 PID 控制 (外环位置 + 内环速度)
+                    vx_out, vy_out, wz_out, actual_speeds, dt = ctrl.step(
+                        ex_f, dist_f, roll_f, tracking)
 
-target_yaw = imu_motion.yaw  # 锁定当前航向
+                    # 打印状态和数据
+                    state = "TRACK" if tracking else "LOST"
+                    spd_lf, spd_rf, spd_lb, spd_rb = actual_speeds
+                    print("[{}] raw EX:{:4d} Dist:{:3d} Roll:{:4d} | filt EX:{:5.1f} Dist:{:5.1f} Roll:{:5.1f} | vx:{:.3f} vy:{:.3f} wz:{:.3f} | whl {:.3f} {:.3f} {:.3f} {:.3f} | dt:{:.0f}ms".format(
+                        state, ex, dist, roll,
+                        ex_f, dist_f, roll_f,
+                        vx_out, vy_out, wz_out,
+                        spd_lf, spd_rf, spd_lb, spd_rb, dt * 1000))
 
-while True:
-    # 按 SWITCH2 退出
-    if switch2.value() != state2:
-        stop_all()
-        pit.stop()
-        print("Stopped.")
-        break
+        # 安全看门狗
+        if time.ticks_diff(time.ticks_ms(), last_data_time) > 500:
+            ctrl.emergency_stop()
+            if tracking:
+                tracking = False
+                print("[LOST] Connection timeout.")
 
-    if ticker_flag and ticker_count % 2 == 0:
-        # ----- 1. IMU 读取 & 姿态更新 -----
-        data = imu.read()
-        update_angle(data[0], data[1], data[2],
-                     data[3], data[4], data[5])
+        time.sleep_ms(10)
 
-        # ----- 2. 编码器速度读取 -----
-        actual_spd = get_encoder_speeds_filtered(CONTROL_INTERVAL_S)
+        # 拨码开关退出逻辑
+        if switch2.value() != state2:
+            print("Switch triggered. Test program stopped.")
+            break
 
-        # ----- 3. 速度斜坡（平滑启动）-----
-        if current_speed < TARGET_SPEED:
-            current_speed += RAMP_RATE
-            if current_speed > TARGET_SPEED:
-                current_speed = TARGET_SPEED
+        gc.collect()
 
-        # ----- 4. 航向 PID（保持直线）-----
-        error_yaw = target_yaw - imu_motion.yaw
-        error_yaw = (error_yaw + 180) % 360 - 180  # 包裹到 [-180, 180)
-        wz = heading_pid.compute(0, -error_yaw)
-
-        # ----- 5. 闭环驱动（前馈 + 每轮 PI 反馈 + 航向修正）-----
-        omni_drive_closed_loop(current_speed, 0, wz, actual_spd)
-
-        # ----- 6. 调试打印（每 100ms）-----
-        if ticker_count % 10 == 0:
-            led.toggle()
-            print("yaw={:6.1f}  spd={:.3f}  wz={:+.3f}  act={:.3f} {:.3f} {:.3f} {:.3f}".format(
-                imu_motion.yaw, current_speed, wz,
-                actual_spd[0], actual_spd[1], actual_spd[2], actual_spd[3]))
-
-        ticker_flag = False
-
-    gc.collect()
- 
+try:
+    main()
+except KeyboardInterrupt:
+    print("\nProgram stopped by user.")
+finally:
+    stop_all()

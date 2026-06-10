@@ -13,12 +13,14 @@ import gc, time, math
 from machine import *
 from smartcar import *
 from seekfree import *
+from smartcar import ticker
+from smartcar import encoder
 from pid import PID
 
 ANG_OFFSET = 0.0
 MAX_PWM = 50000
 LED_PIN = 'C4'
-SWITCH2_PIN = 'D9'
+SWITCH2_PIN = 'D10'
 
 # 编码器标定因子（脉冲数/米），4个轮子各自独立
 # ⚠ 实测编码器在轮轴侧（减速后），PPR=7，无减速比倍乘
@@ -29,30 +31,41 @@ ENC_SCALE = [833, 840, 853, 817]  # [rf, lf, lb, rb] — 2026-06-08 去掉负号
 # ============================================================
 #  一、编码器引脚定义 & 初始化
 #  接线表（编码器 A/B 相已对调以修正计数方向）:
-#    电机位置   编码器 A 相   编码器 B 相  （驱动方向  → 原始计数 → 代码修正后）
-# 右前 (RF)      C3           C2          正 PWM → 负计数 → 代码取反为正
-# 左前 (LF)      D14          D13         正 PWM → 负计数（与运动学目标一致）
-# 左后 (LB)      D16          D15         正 PWM → 正计数 → 代码取反为负
-# 右后 (RB)      C1           C0          正 PWM → 正计数（与运动学目标一致）
+# 电机位置   	编码器 A 相     编码器 B 相  	  PWM脚     电机
+# 左前 (LF)      C3             C2                C24       M3
+# 右前 (RF)      C1             C0                C26       M4
+# 左后 (LB)      D14            D13           	  C20       M2
+# 右后 (RB)      D16            D15               B26       M1
 # ============================================================
 
-ENCODER_RF_A, ENCODER_RF_B = 'C3',  'C2'   # 右前编码器
-ENCODER_LF_A, ENCODER_LF_B = 'D14', 'D13'  # 左前编码器
-ENCODER_LB_A, ENCODER_LB_B = 'D16', 'D15'  # 左后编码器
-ENCODER_RB_A, ENCODER_RB_B = 'C1',  'C0'   # 右后编码器
+ENCODER_LF_A, ENCODER_LF_B = 'C3', 'C2'     # 左前编码器
+ENCODER_RF_A, ENCODER_RF_B = 'C1', 'C0'     # 右前编码器
+ENCODER_LB_A, ENCODER_LB_B = 'D14', 'D13'   # 左后编码器 
+ENCODER_RB_A, ENCODER_RB_B = 'D16', 'D15'   # 右后编码器
 
-encoder_rf = encoder(ENCODER_RF_A, ENCODER_RF_B, capture_div=1)
-encoder_lf = encoder(ENCODER_LF_A, ENCODER_LF_B, capture_div=1)
-encoder_lb = encoder(ENCODER_LB_A, ENCODER_LB_B, capture_div=1)
-encoder_rb = encoder(ENCODER_RB_A, ENCODER_RB_B, capture_div=1)
+encoder_lf = encoder(ENCODER_LF_A, ENCODER_LF_B)
+encoder_rf = encoder(ENCODER_RF_A, ENCODER_RF_B)
+encoder_lb = encoder(ENCODER_LB_A, ENCODER_LB_B)
+encoder_rb = encoder(ENCODER_RB_A, ENCODER_RB_B)
+
+
+enc_ticker = ticker(1) 
+# 将四个编码器统统挂载到定时器的自动采集列表上
+enc_ticker.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
+# 启动定时器，底层开始以 10ms 为周期疯狂帮你采集数据
+enc_ticker.start(10)
 
 def get_encoder_counts():
     """
     返回 4 个编码器脉冲增量 [rf, lf, lb, rb]
     每次调用返回自上次 get() 以来的脉冲变化量，停止时为 0
-    注意：RF 和 LB 编码器物理方向与运动学约定相反，需取反
     """
-    return [-encoder_rf.get(), encoder_lf.get(), -encoder_lb.get(), encoder_rb.get()]
+    encoder_rf.capture()
+    encoder_lf.capture()
+    encoder_lb.capture()
+    encoder_rb.capture()
+
+    return [encoder_rf.get(), encoder_lf.get(), encoder_lb.get(), encoder_rb.get()]
 
 
 def get_encoder_speeds(dt):
@@ -95,12 +108,15 @@ def get_encoder_speeds_filtered(dt):
     return _prev_spd
 
 
+def reset_encoder_filter():
+    """重置速度滤波器状态（用于主循环启动前的一次性初始化）"""
+    global _spd_first
+    _spd_first = True
+
+
 # ============================================================
 #  二-b、闭环驱动（前馈 + PI 反馈）
 # ============================================================
-
-CTRL_DT = 0.02                 # 控制周期 20ms（与主循环一致）
-
 WHEEL_PI = [
     PID(kp=8000, ki=1000, kd=0.0, integral_limit=5000, output_limit=MAX_PWM)
     for _ in range(4)
@@ -109,33 +125,42 @@ WHEEL_PI = [
 SPD_DEADBAND = 0.005           # 5mm/s 以下视为静止，清零积分
 
 MAX_SPEED_MPS = [0.123, 0.123, 0.123, 0.123]  # [rf, lf, lb, rb] 由 encoder_check.py 标定
-PWM_PER_MPS   = [106687, 108527, 111976, 109835]  # [rf, lf, lb, rb] — 2026-06-09 标定
+PWM_PER_MPS   = [405455, 405455, 405455, 405455]  # [rf, lf, lb, rb]
 
 
-def omni_drive_closed_loop(vx, vy, wz, actual_speeds=None):
-    """
-    前馈 + PI 反馈闭环全向驱动（替换 omni_drive 用于直线行驶）
-    vx, vy, wz: 归一化值（-1 ~ 1），同 omni_drive 语义
-    actual_speeds: 外部传入的 4 轮速度 [rf,lf,lb,rb]（米/秒）
-                   为 None 时内部自动读取编码器
-    """
+def reset_wheel_pi():
+    """重置所有轮子 PI 控制器积分（方向切换 / 段间调用）"""
+    for pi in WHEEL_PI:
+        pi.reset()
+
+# 新增电机死区补偿参数（需要实测，填入电机刚开始转动的最小 PWM）
+MIN_PWM = 3500 
+
+# 闭环控制函数：根据目标速度和实际速度计算 PWM 输出
+def omni_drive_closed_loop(vx, vy, wz, actual_speeds, dt):
+    # 运动学解算获取各轮目标速度 (米/秒)
     norms = omni_kinematics(vx, vy, wz)
-    if actual_speeds is None:
-        actual = get_encoder_speeds_filtered(CTRL_DT)
-    else:
-        actual = actual_speeds
     motor_list = [MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB]
 
     for i in range(4):
         target_mps = norms[i] * MAX_SPEED_MPS[i]
 
+        # 速度死区：指令极小时直接刹车，清空 PID
         if abs(target_mps) < SPD_DEADBAND:
             WHEEL_PI[i].reset()
             set_motor(motor_list[i], 0)
             continue
 
-        feedforward = target_mps * PWM_PER_MPS[i]
-        correction = WHEEL_PI[i].compute(target_mps, actual[i])
+        # 【核心改进】：前馈计算引入死区补偿
+        if target_mps > 0:
+            feedforward = MIN_PWM + (target_mps * PWM_PER_MPS[i])
+        else:
+            feedforward = -MIN_PWM + (target_mps * PWM_PER_MPS[i])
+
+        # PID 反馈修正 (基于重构后的 pid.py)
+        correction = WHEEL_PI[i].compute(target_mps, actual_speeds[i], dt)
+        
+        # 总输出 = 基础前馈 + 反馈动态调整
         final_pwm = feedforward + correction
         final_pwm = max(-MAX_PWM, min(final_pwm, MAX_PWM))
 
@@ -171,7 +196,7 @@ def set_motor(motor, duty_val):
         dir_b.value(0)
         pwm.duty_u16(0)
 
-
+# 开环驱动函数：直接根据输入的 vx, vy, wz 计算 PWM 输出，无速度反馈
 def omni_drive(vx, vy, wz, max_pwm=MAX_PWM):
     speeds = omni_kinematics(vx, vy, wz)
     max_speed = max(abs(s) for s in speeds)
@@ -216,8 +241,8 @@ pin_d7  = Pin("D7",  Pin.OUT, value=0)
 
 # 电机元组 (PWM, 方向A, 方向B)
 # TB6612 驱动板映射 — 2026-06-08 实测
-MOTOR_RF = (pwm_4, pin_d6,  pin_d7)   # C26 + D6/D7
 MOTOR_LF = (pwm_3, pin_d4,  pin_d5)   # C24 + D4/D5
+MOTOR_RF = (pwm_4, pin_d6,  pin_d7)   # C26 + D6/D7
 MOTOR_LB = (pwm_2, pin_c30, pin_c31)  # C20 + C30/C31
 MOTOR_RB = (pwm_1, pin_c28, pin_c29)  # B26 + C28/C29
 
@@ -231,5 +256,3 @@ def stop_all():
 
 # 导入完成后立即强制停机一次
 stop_all()
-
-
