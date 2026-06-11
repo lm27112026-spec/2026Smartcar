@@ -36,20 +36,24 @@ print("BOARD VERSION : " + BOARD_VERSION)
 IMU660RX.help()
 imu = IMU660RX()
 imu.info()
-imu_data = imu.get()
+imu_data = imu.read()
 
 # ============================================================
 #  陀螺仪零偏校准（启动时静止采样）
 # ============================================================
 
-GYRO_CALIB_SAMPLES = 200
-print("Calibrating gyro zero offset ({})...".format(GYRO_CALIB_SAMPLES))
+GYRO_CALIB_SAMPLES = 500
+
+# 延时 1 秒等待陀螺仪稳定（ticker 启动瞬间可能有数据跳变）
+time.sleep_ms(1000)
+
+print("Calibrating gyro zero offset ({} samples)...".format(GYRO_CALIB_SAMPLES))
 
 _gx_sum = 0
 _gy_sum = 0
 _gz_sum = 0
 for _ in range(GYRO_CALIB_SAMPLES):
-    d = imu.get()
+    d = imu.read()
     _gx_sum += d[3]
     _gy_sum += d[4]
     _gz_sum += d[5]
@@ -141,11 +145,11 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
     # 清空残余值
     for _ in range(5):
         encoder_rf.get(); encoder_lf.get(); encoder_lb.get(); encoder_rb.get()
-        d = imu.get()
+        d = imu.read()
         time.sleep_ms(5)
 
     # 锁定起始航向
-    d = imu.get()
+    d = imu.read()
     update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
     target_heading = yaw
 
@@ -179,7 +183,7 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
             return True
 
         # IMU 更新航向
-        d = imu.get()
+        d = imu.read()
         update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
         # P 控制
