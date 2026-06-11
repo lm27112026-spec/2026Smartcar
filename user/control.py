@@ -2,22 +2,22 @@
 
 import time
 from pid import PID
-from motor import get_encoder_counts, get_encoder_speeds_filtered, omni_drive_closed_loop, stop_all
+from motor import get_encoder_counts, get_encoder_speeds_filtered, omni_drive_closed_loop, enc_ticker, stop_all
 
 # === 控制参数 ===
 TARGET_DIST = 70
 
 PID_EX_KP   = 0.020
-PID_EX_KI   = 0.002
+PID_EX_KI   = 0.0
 PID_EX_KD   = 0.0
-PID_DIST_KP = 0.020
-PID_DIST_KI = 0.002
+PID_DIST_KP = 1.0
+PID_DIST_KI = 0.0
 PID_DIST_KD = 0.0
-PID_ROLL_KP = 0.015
+PID_ROLL_KP = 0.02
 PID_ROLL_KI = 0.001
 PID_ROLL_KD = 0.0
-PID_I_LIMIT   = 3.0
-PID_OUT_LIMIT = 0.35
+PID_I_LIMIT   = 0.5
+PID_OUT_LIMIT = 0.4
 
 DT_CLAMP     = 0.1
 DT_FALLBACK  = 0.02
@@ -34,6 +34,7 @@ class CascadeController:
         self.pid_roll = PID(kp=PID_ROLL_KP, ki=PID_ROLL_KI, kd=PID_ROLL_KD,
                             integral_limit=PID_I_LIMIT, output_limit=PID_OUT_LIMIT)
         self._last_time = time.ticks_ms()
+        enc_ticker.stop()
         _ = get_encoder_counts()
 
     def step(self, ex_f, dist_f, roll_f, tracking):
@@ -69,6 +70,7 @@ class CascadeController:
 
     def emergency_stop(self):
         stop_all()
+        enc_ticker.start(10)
         self.pid_ex.reset()
         self.pid_dist.reset()
         self.pid_roll.reset()
