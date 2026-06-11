@@ -20,13 +20,13 @@ from pid import PID
 ANG_OFFSET = 0.0
 MAX_PWM = 50000
 LED_PIN = 'C4'
-SWITCH2_PIN = 'D10'
+SWITCH2_PIN = 'D9'
 
 # 编码器标定因子（脉冲数/米），4个轮子各自独立
 # ⚠ 实测编码器在轮轴侧（减速后），PPR=7，无减速比倍乘
 #   7 脉冲/轮圈 ÷ (π × 0.05m/轮圈) = 44.6 脉冲/米
 #   各轮独立标定方法：让车轮空转 N 圈 → total_pulses / (N * 0.1571)
-ENC_SCALE = [833, 840, 853, 817]  # [rf, lf, lb, rb] — 2026-06-08 去掉负号
+ENC_SCALE = [1621, 1519, 1624, 1535]  # [rf, lf, lb, rb] — 2026-06-11 绝对距离法标定
 
 # ============================================================
 #  一、编码器引脚定义 & 初始化
@@ -118,14 +118,14 @@ def reset_encoder_filter():
 #  二-b、闭环驱动（前馈 + PI 反馈）
 # ============================================================
 WHEEL_PI = [
-    PID(kp=8000, ki=1000, kd=0.0, integral_limit=5000, output_limit=MAX_PWM)
+    PID(kp=40000, ki=0, kd=0.0, integral_limit=5000, output_limit=MAX_PWM)
     for _ in range(4)
 ]
 
 SPD_DEADBAND = 0.005           # 5mm/s 以下视为静止，清零积分
 
-MAX_SPEED_MPS = [0.123, 0.123, 0.123, 0.123]  # [rf, lf, lb, rb] 由 encoder_check.py 标定
-PWM_PER_MPS   = [405455, 405455, 405455, 405455]  # [rf, lf, lb, rb]
+MAX_SPEED_MPS = [0.425, 0.431, 0.437, 0.424]  # [rf, lf, lb, rb] — (MAX_PWM-MIN_PWM)/PWM_PER_MPS
+PWM_PER_MPS   = [105985, 104300, 102874, 106076]  # [rf, lf, lb, rb] — 2026-06-11 04标定
 
 
 def reset_wheel_pi():
@@ -134,7 +134,8 @@ def reset_wheel_pi():
         pi.reset()
 
 # 新增电机死区补偿参数（需要实测，填入电机刚开始转动的最小 PWM）
-MIN_PWM = 3500 
+MIN_PWM_POS = 5000   # 正转起步 PWM（后轮需要更大死区补偿）
+MIN_PWM_NEG = 5000   # 反转起步 PWM（前轮反转超速，降低死区补偿）
 
 # 闭环控制函数：根据目标速度和实际速度计算 PWM 输出
 def omni_drive_closed_loop(vx, vy, wz, actual_speeds, dt):
@@ -153,9 +154,9 @@ def omni_drive_closed_loop(vx, vy, wz, actual_speeds, dt):
 
         # 【核心改进】：前馈计算引入死区补偿
         if target_mps > 0:
-            feedforward = MIN_PWM + (target_mps * PWM_PER_MPS[i])
+            feedforward = MIN_PWM_POS + (target_mps * PWM_PER_MPS[i])
         else:
-            feedforward = -MIN_PWM + (target_mps * PWM_PER_MPS[i])
+            feedforward = -MIN_PWM_NEG + (target_mps * PWM_PER_MPS[i])
 
         # PID 反馈修正 (基于重构后的 pid.py)
         correction = WHEEL_PI[i].compute(target_mps, actual_speeds[i], dt)
@@ -256,3 +257,5 @@ def stop_all():
 
 # 导入完成后立即强制停机一次
 stop_all()
+
+
