@@ -37,7 +37,7 @@ IMU660RX.help()
 imu = IMU660RX()
 imu.info()
 
-imu_data = imu.get()
+imu_data = imu.read()
 
 ticker_flag = False
 ticker_count = 0
