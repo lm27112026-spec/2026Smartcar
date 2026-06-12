@@ -88,7 +88,7 @@ try:
     IMU660RX.help()
     imu = IMU660RX()
     imu.info()
-    imu_data = imu.get()
+    imu_data = imu.read()
     test_results['init'] = True
     print("  >> PASS: IMU660RX initialized successfully.")
     print("  >> Data buffer linked: {}".format(type(imu_data)))

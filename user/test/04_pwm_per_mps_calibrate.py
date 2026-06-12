@@ -12,9 +12,9 @@
 
 import gc, time
 from machine import Pin
-from smartcar import ticker
 from motor import (
     omni_drive, stop_all, get_encoder_counts,
+    enc_ticker,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
     ENC_SCALE, LED_PIN, SWITCH2_PIN, MAX_PWM, 
 )
@@ -24,19 +24,14 @@ from motor import (
 # ============================================================
 DRIVE_SPEED = 0.3          # 归一化速度（0~1）
 TEST_DURATION_S = 5.0      # 标定时间（秒）
-ACTUAL_PWM = int(DRIVE_SPEED * MAX_PWM)  # 实际 PWM = 15000
-
-# ============================================================
-#  初始化
+ACTUAL_PWM = int(DRIVE_SPEED * MAX_PWM)  # 实际 PWM = 15000 初始化
 # ============================================================
 stop_all()
 time.sleep_ms(50)
 
 led = Pin(LED_PIN, Pin.OUT, value=True)
 
-pit = ticker(1)
-pit.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-pit.start(10)
+enc_ticker.stop()
 
 # 归零编码器
 print("Zeroing encoders...")
@@ -77,7 +72,7 @@ while True:
 # 停止
 omni_drive(0, 0, 0)
 stop_all()
-pit.stop()
+enc_ticker.start(10)
 led.off()
 
 actual_duration_s = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0

@@ -64,9 +64,9 @@ imu_motion.last_time = 0
 imu_motion.gz_filtered = 0.0
 
 # update_angle 首次调用只初始化 last_time，第二次开始积分
-d = imu_motion.imu.get()
+d = imu_motion.imu.read()
 imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-d = imu_motion.imu.get()
+d = imu_motion.imu.read()
 imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
 # ============================================================
@@ -92,7 +92,7 @@ iteration = 0
 aborted = False
 
 while iteration < SAMPLES_TOTAL:
-    d = imu_motion.imu.get()
+    d = imu_motion.imu.read()
     imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
     iteration += 1
 

@@ -19,9 +19,9 @@
 
 import gc, time
 from machine import Pin
-from smartcar import ticker
 from motor import (
     stop_all, get_encoder_counts,
+    enc_ticker,
     LED_PIN, SWITCH2_PIN,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
 )
@@ -48,9 +48,7 @@ state2 = switch2.value()
 # ---------------------------------------------------------------------------
 #  Ticker – hardware pulse capture at 10 ms period
 # ---------------------------------------------------------------------------
-pit = ticker(1)
-pit.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-pit.start(10)
+enc_ticker.stop()
 
 # ---------------------------------------------------------------------------
 #  Zero out any residual encoder counts
@@ -114,7 +112,7 @@ for _ in range(expected_samples):
 # ---------------------------------------------------------------------------
 #  Cleanup
 # ---------------------------------------------------------------------------
-pit.stop()
+enc_ticker.start(10)
 led.off()
 
 # ---------------------------------------------------------------------------

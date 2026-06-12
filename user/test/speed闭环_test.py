@@ -19,10 +19,13 @@ from seekfree import *
 from motor import (
     omni_drive_closed_loop, stop_all,
     get_encoder_speeds_filtered,
+    enc_ticker,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
-    WHEEL_PI, MAX_SPEED_MPS, CTRL_DT,
+    WHEEL_PI, MAX_SPEED_MPS,
     LED_PIN, SWITCH2_PIN,
 )
+
+CTRL_DT = 0.02              # 控制周期 20ms
 
 LED_PIN = 'C4'
 SWITCH2_PIN = 'D9'
@@ -40,26 +43,14 @@ led     = Pin(LED_PIN, Pin.OUT, value=True)
 switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()
 
-# ============================================================
-#  编码器 ticker
-# ============================================================
-
-pit = ticker(1)
-pit.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-
-ticker_flag = False
-def ticker_handler(t):
-    global ticker_flag
-    ticker_flag = True
-
-pit.callback(ticker_handler)
-pit.start(10)
+# 暂停 motor.py 的自动 ticker，避免偷脉冲
+enc_ticker.stop()
 
 # ============================================================
 #  测试参数
 # ============================================================
 
-TARGET_SPEEDS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.3, 0.2, 0.1, 0.0]  # 速度斜坡
+TARGET_SPEEDS = [0.1]  # 速度斜坡
 STEP_TIME_S   = 3.0    # 每个速度台阶持续时间（秒）
 PRINT_INTERVAL = 200    # 打印间隔（毫秒）
 
@@ -88,25 +79,22 @@ for target_vx in TARGET_SPEEDS:
         if switch2.value() != state2:
             break
         
-        if ticker_flag:
-            ticker_flag = False
-            
-            # 读取编码器速度
-            actual = get_encoder_speeds_filtered(CTRL_DT)
-            
-            # 闭环驱动
-            omni_drive_closed_loop(target_vx, 0, 0, actual)
-            
-            # 打印
-            now = time.ticks_ms()
-            if time.ticks_diff(now, last_print_ms) >= PRINT_INTERVAL:
-                last_print_ms = now
-                t = time.ticks_diff(now, start_ms) / 1000.0
-                avg = sum(actual) / 4.0
-                print("  {:.1f}s  {:+.3f}  {:+.4f}  {:+.4f}  {:+.4f}  {:+.4f}  {:+.4f}".format(
-                    t, target_vx, actual[0], actual[1], actual[2], actual[3], avg))
+        # 读取编码器速度
+        actual = get_encoder_speeds_filtered(CTRL_DT)
         
-        time.sleep_ms(5)
+        # 闭环驱动
+        omni_drive_closed_loop(target_vx, 0, 0, actual, CTRL_DT)
+        
+        # 打印
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_print_ms) >= PRINT_INTERVAL:
+            last_print_ms = now
+            t = time.ticks_diff(now, start_ms) / 1000.0
+            avg = sum(actual) / 4.0
+            print("  {:.1f}s  {:+.3f}  {:+.4f}  {:+.4f}  {:+.4f}  {:+.4f}  {:+.4f}".format(
+                t, target_vx, actual[0], actual[1], actual[2], actual[3], avg))
+        
+        time.sleep_ms(10)
         gc.collect()
 
 # ============================================================
@@ -114,7 +102,7 @@ for target_vx in TARGET_SPEEDS:
 # ============================================================
 
 stop_all()
-pit.stop()
+enc_ticker.start(10)
 led.off()
 
 print("")

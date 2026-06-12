@@ -25,9 +25,9 @@
 
 import gc, time
 from machine import Pin
-from smartcar import ticker
 from motor import (
     set_motor, stop_all, omni_drive, omni_kinematics,
+    get_encoder_counts, enc_ticker,
     LED_PIN, SWITCH2_PIN,
     encoder_rf, encoder_lf, encoder_lb, encoder_rb,
     MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB,
@@ -54,24 +54,19 @@ state2 = switch2.value()
 # ============================================================
 #  Ticker (encoder capture timer)
 # ============================================================
-pit = ticker(1)
-pit.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-pit.start(10)
+enc_ticker.stop()
 
 # ============================================================
 #  Zero encoders (drain residual pulses)
 # ============================================================
 for _ in range(5):
-    encoder_rf.get()
-    encoder_lf.get()
-    encoder_lb.get()
-    encoder_rb.get()
+    _ = get_encoder_counts()
     time.sleep_ms(10)
 
 # ============================================================
 #  Initialize IMU yaw baseline
 # ============================================================
-d = imu_motion.imu.get()
+d = imu_motion.imu.read()
 imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 yaw_start = imu_motion.yaw
 
@@ -126,12 +121,7 @@ while True:
         break
 
     # -- Read encoder deltas --
-    counts = [
-        encoder_rf.get(),
-        encoder_lf.get(),
-        encoder_lb.get(),
-        encoder_rb.get(),
-    ]
+    counts = get_encoder_counts()
 
     for i in range(4):
         total_counts[i] += counts[i]
@@ -146,7 +136,7 @@ while True:
     max_dist = max(wheel_dist)
 
     # -- Read IMU and update angle --
-    d = imu_motion.imu.get()
+    d = imu_motion.imu.read()
     imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
     # -- Progress print every 5 ticks (~100ms) --
@@ -170,7 +160,7 @@ while True:
 for m in (MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB):
     set_motor(m, 0)
 stop_all()
-pit.stop()
+enc_ticker.start(10)
 led.off()
 
 # ============================================================
