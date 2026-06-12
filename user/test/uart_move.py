@@ -2,8 +2,7 @@
 uart_move.py — 闭环路线：右移30 → 前进60 → 旋转180° → 右移30
 【控制】
   直线段：距离 PID + 编码器反馈精确停车
-         前进用航向 PID + 角速度闭环锁直线（内环 imu_motion.angular_velocity_control）
-         横移不用航向（避免 vy+wz 干涉）
+         所有方向均有航向保持（yaw 偏差 → 角速度闭环纠正）
   旋转段：梯形速度曲线 + 角速度闭环（imu_motion.angular_velocity_control）
 【安全】SWITCH2 随时终止
 【依赖】imu_motion 角速度闭环（需先完成 MAX_WZ_DPS 标定）
@@ -225,13 +224,13 @@ print("\n" + "=" * 50)
 print("  Route: RIGHT 30 → FWD 60 → ROT 180 → RIGHT 30")
 print("=" * 50)
 
-ok = move_straight(0, 1, 0.30, "1/4 RIGHT 30cm", use_heading=False)
+ok = move_straight(0, 1, 0.30, "1/4 RIGHT 30cm", use_heading=True)
 if ok:
     ok = move_straight(1, 0, 0.60, "2/4 FWD 60cm", use_heading=True)
 if ok:
     ok = rotate_to(180, "3/4 ROT 180°")
 if ok:
-    ok = move_straight(0, 1, 0.30, "4/4 RIGHT 30cm", use_heading=False)
+    ok = move_straight(0, 1, 0.30, "4/4 RIGHT 30cm", use_heading=True)
 
 omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], DT)
 stop_all()
