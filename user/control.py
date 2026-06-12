@@ -3,6 +3,7 @@
 import time
 from pid import PID
 from motor import get_encoder_counts, get_encoder_speeds_filtered, omni_drive_closed_loop, enc_ticker, stop_all
+from imu_motion import update_angle, get_angular_velocity, angular_velocity_control, reset_ang_vel_pid, imu
 
 # === 控制参数 ===
 TARGET_DIST = 70
@@ -22,6 +23,9 @@ PID_OUT_LIMIT = 0.4
 DT_CLAMP     = 0.1
 DT_FALLBACK  = 0.02
 
+# 角速度换算：归一化 wz=1.0 对应 MAX_WZ_DPS dps（需与 imu_motion.py 保持一致）
+MAX_WZ_DPS = 384.0  # 标定值：wz=0.3 时实测 115.3 dps → 115.3/0.3 = 384
+
 
 class CascadeController:
     """级联 PID 控制器：外环(位置) → omni_drive_closed_loop(内环速度)"""
@@ -36,6 +40,10 @@ class CascadeController:
         self._last_time = time.ticks_ms()
         enc_ticker.stop()
         _ = get_encoder_counts()
+        # IMU 角速度闭环初始化（确保 update_angle 首次调用建立基准）
+        d = imu.read()
+        update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+        reset_ang_vel_pid()
 
     def step(self, ex_f, dist_f, roll_f, tracking):
         """
@@ -50,6 +58,11 @@ class CascadeController:
         if dt > DT_CLAMP:
             dt = DT_FALLBACK
 
+        # ── IMU 角速度更新（供内环角速度闭环使用）──
+        d = imu.read()
+        update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+        actual_wz_dps = get_angular_velocity()
+
         actual_speeds = get_encoder_speeds_filtered(dt)
 
         if tracking:
@@ -59,14 +72,20 @@ class CascadeController:
             vx_out = max(-0.8, min(vx_out, 0.8))
             vy_out = max(-0.8, min(vy_out, 0.8))
             wz_out = max(-0.6, min(wz_out, 0.6))
+
+            # ── 角速度闭环：视觉 PID 输出的 wz → 目标 dps → 角速度 PID 纠正 → 归一化 wz ──
+            target_dps = wz_out * MAX_WZ_DPS
+            wz_corrected = angular_velocity_control(target_dps, actual_wz_dps, dt)
         else:
-            vx_out = vy_out = wz_out = 0.0
+            vx_out = vy_out = 0.0
+            wz_corrected = 0.0
             self.pid_ex.reset()
             self.pid_dist.reset()
             self.pid_roll.reset()
+            reset_ang_vel_pid()
 
-        omni_drive_closed_loop(vx_out, vy_out, wz_out, actual_speeds, dt)
-        return vx_out, vy_out, wz_out, actual_speeds, dt
+        omni_drive_closed_loop(vx_out, vy_out, wz_corrected, actual_speeds, dt)
+        return vx_out, vy_out, wz_corrected, actual_speeds, dt
 
     def emergency_stop(self):
         stop_all()
@@ -74,3 +93,4 @@ class CascadeController:
         self.pid_ex.reset()
         self.pid_dist.reset()
         self.pid_roll.reset()
+        reset_ang_vel_pid()

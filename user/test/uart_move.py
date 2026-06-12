@@ -2,9 +2,11 @@
 uart_move.py — 闭环路线：右移30 → 前进60 → 旋转180° → 右移30
 【控制】
   直线段：距离 PID + 编码器反馈精确停车
-         前进用航向 PID 锁直线，横移不用航向（避免干扰）
-  旋转段：梯形速度曲线 + 陀螺仪前馈 + 角度判断到位
+         前进用航向 PID + 角速度闭环锁直线（内环 imu_motion.angular_velocity_control）
+         横移不用航向（避免 vy+wz 干涉）
+  旋转段：梯形速度曲线 + 角速度闭环（imu_motion.angular_velocity_control）
 【安全】SWITCH2 随时终止
+【依赖】imu_motion 角速度闭环（需先完成 MAX_WZ_DPS 标定）
 """
 
 import gc, time
@@ -15,6 +17,10 @@ from motor import (
     enc_ticker, ENC_SCALE, LED_PIN, SWITCH2_PIN, MAX_SPEED_MPS,
 )
 import imu_motion
+from imu_motion import (
+    update_angle, get_angular_velocity, angular_velocity_control,
+    reset_ang_vel_pid, MAX_WZ_DPS,
+)
 
 # ── 硬件 ──
 led = Pin(LED_PIN, Pin.OUT, value=True)
@@ -32,19 +38,14 @@ DIST_KI = 0.5
 DIST_OUT_LIMIT = 0.30
 MIN_SPEED = 0.08
 
-# 航向 PID（仅前进/后退时使用）
-HDG_KP = 0.06
-HDG_KI = 0.001
-HDG_DB = 0.5
-HDG_WZ_MAX = 0.15
-HDG_I_MAX = 1.0
+# 航向 PID（外环：航向偏差 → 目标 dps，内环由 imu_motion 角速度闭环处理）
+HDG_KP = 0.08     # 航向偏差 (°) → 目标 dps：1° → 30dps，5° → 150dps
+HDG_DB = 0.5      # 航向死区（度）
 
-# 旋转参数
-ROT_MAX_RATE = 65
-ROT_MAX_ACCEL = 90
-ROT_DEADBAND = 3.0
-ROT_FF = 0.006
-ROT_FB = 0.004
+# 旋转参数（梯形速度曲线）
+ROT_MAX_RATE = 150   # dps（角速度闭环已验证 120dps 误差 < 15%，150 也应在范围内）
+ROT_MAX_ACCEL = 90   # dps/s²
+ROT_DEADBAND = 3.0   # 到位判定（度）
 
 # ── 初始化 ──
 stop_all()
@@ -77,14 +78,13 @@ def move_straight(vx_dir, vy_dir, target_m, label, use_heading=True):
     last_print_ms = start_ms
 
     # 航向状态
-    heading_integral = 0.0
-    prev_hdg_dev = 0.0
     target_heading = None
+    reset_ang_vel_pid()
 
     if use_heading:
         for _ in range(5):
             d = imu_motion.imu.read()
-            imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+            update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
             time.sleep_ms(10)
         target_heading = imu_motion.yaw
 
@@ -101,29 +101,19 @@ def move_straight(vx_dir, vy_dir, target_m, label, use_heading=True):
             print("  SW2 stop")
             return False
 
-        # t=0ms: IMU 读取（第 1 次）
+        # 单次 IMU 读取（减少延迟，提高航向保持响应）
         wz = 0.0
         if use_heading:
             d = imu_motion.imu.read()
-            imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-
-        time.sleep_ms(5)
-
-        # t=5ms: IMU 读取（第 2 次） + 编码器 + 控制
-        if use_heading:
-            d = imu_motion.imu.read()
-            imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-            hdg_dev = target_heading - imu_motion.yaw
-            while hdg_dev > 180: hdg_dev -= 360
-            while hdg_dev < -180: hdg_dev += 360
-            if abs(hdg_dev - prev_hdg_dev) > 180:
-                heading_integral = 0.0
-            prev_hdg_dev = hdg_dev
-            if abs(hdg_dev) > HDG_DB:
-                heading_integral += hdg_dev * DT
-                heading_integral = max(-HDG_I_MAX, min(heading_integral, HDG_I_MAX))
-                wz = HDG_KP * hdg_dev + HDG_KI * heading_integral
-                wz = max(-HDG_WZ_MAX, min(wz, HDG_WZ_MAX))
+            update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+            hdg_err = target_heading - imu_motion.yaw
+            while hdg_err > 180: hdg_err -= 360
+            while hdg_err < -180: hdg_err += 360
+            # 航向偏差 → 目标 dps → 角速度闭环
+            if abs(hdg_err) > HDG_DB:
+                target_dps = hdg_err * HDG_KP * MAX_WZ_DPS
+                target_dps = max(-180, min(target_dps, 180))
+                wz = angular_velocity_control(target_dps, get_angular_velocity(), DT)
 
         raw_counts = get_encoder_counts()
         raw_speeds = [raw_counts[i] / ENC_SCALE[i] / DT for i in range(4)]
@@ -151,7 +141,7 @@ def move_straight(vx_dir, vy_dir, target_m, label, use_heading=True):
         if dist >= target_m:
             break
 
-        time.sleep_ms(5)
+        time.sleep_ms(10)
 
     print("  >>> [{:s}] done: {:.1f}cm <<<".format(label, dist * 100))
     return True
@@ -161,10 +151,11 @@ def move_straight(vx_dir, vy_dir, target_m, label, use_heading=True):
 #  旋转（梯形曲线 + 前馈）
 # ============================================================
 def rotate_to(target_delta, label):
-    """返回 True=成功"""
+    """返回 True=成功（角速度闭环 + 梯形速度曲线）"""
+    reset_ang_vel_pid()
     for _ in range(5):
         d = imu_motion.imu.read()
-        imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+        update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
         time.sleep_ms(10)
 
     start_yaw = imu_motion.yaw
@@ -172,8 +163,6 @@ def rotate_to(target_delta, label):
     while target_yaw > 180: target_yaw -= 360
     while target_yaw < -180: target_yaw += 360
 
-    gyro_offset_z = imu_motion.gyro_offset_z
-    gz_f = 0.0
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
 
@@ -186,15 +175,9 @@ def rotate_to(target_delta, label):
         if switch2.value() != state2:
             print("  SW2 stop"); return False
 
-        # t=0ms: IMU 第 1 次（yaw 积分）
-        d0 = imu_motion.imu.read()
-        imu_motion.update_angle(d0[0], d0[1], d0[2], d0[3], d0[4], d0[5])
-
-        time.sleep_ms(5)
-
-        # t=5ms: IMU 第 2 次 + 编码器 + 控制
+        # IMU 读取（使用 imu_motion 的 update_angle + _wz_dps）
         d = imu_motion.imu.read()
-        imu_motion.update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+        update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
         err = target_yaw - imu_motion.yaw
         while err > 180: err -= 360
@@ -202,15 +185,14 @@ def rotate_to(target_delta, label):
         if abs(err) <= ROT_DEADBAND:
             break
 
+        # 梯形速度曲线：目标角速度 (dps)
         ideal = (2 * ROT_MAX_ACCEL * abs(err)) ** 0.5
         tgt_rate = min(ideal, ROT_MAX_RATE)
         if err < 0: tgt_rate = -tgt_rate
 
-        gz_dps = (d[5] - gyro_offset_z) / 16.4
-        gz_f = gz_dps if gz_f == 0.0 else 0.5 * gz_f + 0.5 * gz_dps
-
-        wz = tgt_rate * ROT_FF + ROT_FB * (tgt_rate - gz_f)
-        wz = max(-0.7, min(wz, 0.7))
+        # 角速度闭环（替代了手动 FF+P 滤波代码）
+        actual_dps = get_angular_velocity()
+        wz = angular_velocity_control(tgt_rate, actual_dps, DT)
 
         rc = get_encoder_counts()
         rs = [rc[i] / ENC_SCALE[i] / DT for i in range(4)]
@@ -220,9 +202,9 @@ def rotate_to(target_delta, label):
             last_print_ms = now_ms
             print("  {:4.1f}s  gz={:+.0f}  tgt={:+.0f}  err={:+.0f}  wz={:+.3f}  yaw={:.0f}".format(
                 time.ticks_diff(now_ms, start_ms) / 1000.0,
-                gz_f, tgt_rate, err, wz, imu_motion.yaw))
+                actual_dps, tgt_rate, err, wz, imu_motion.yaw))
 
-        time.sleep_ms(5)
+        time.sleep_ms(int(DT * 1000))
 
     omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], DT)
     _ = get_encoder_counts()

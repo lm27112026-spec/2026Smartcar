@@ -15,6 +15,7 @@ from machine import *
 from smartcar import *
 from seekfree import *
 from motor import omni_drive, SWITCH2_PIN, encoder_rf, encoder_lf, encoder_lb, encoder_rb, ENC_SCALE
+from pid import PID
 
 # ============================================================
 #  一、IMU 常数 & 初始化
@@ -78,6 +79,9 @@ filter_alpha = 0.98
 gz_filtered = 0.0
 gz_filter_alpha = 0.7  # 0.3=超强滤波（运动中噪声大），0.5=强，0.7=中等，0.9=弱
 
+# 最新滤波后的 Z 轴角速度 (dps)，供角速度闭环使用
+_wz_dps = 0.0
+
 
 def update_angle(ax, ay, az, gx, gy, gz):
     """
@@ -85,7 +89,7 @@ def update_angle(ax, ay, az, gx, gy, gz):
     ax, ay, az: 加速度计原始值
     gx, gy, gz: 陀螺仪原始值
     """
-    global roll, pitch, yaw, last_time, gz_filtered
+    global roll, pitch, yaw, last_time, gz_filtered, _wz_dps
     now = time.ticks_ms()
     if last_time == 0:
         last_time = now
@@ -110,6 +114,7 @@ def update_angle(ax, ay, az, gx, gy, gz):
     # 对 gz 进行低通滤波，减少噪声影响
     gz_filtered = gz_filter_alpha * gz_filtered + (1 - gz_filter_alpha) * gz
     gz_dps = (gz_filtered - gyro_offset_z) / GYRO_SENSITIVITY
+    _wz_dps = gz_dps  # 供外部角速度闭环使用
 
     roll  = filter_alpha * (roll  + gx_dps * dt) + (1 - filter_alpha) * roll_a
     pitch = filter_alpha * (pitch + gy_dps * dt) + (1 - filter_alpha) * pitch_a
@@ -118,7 +123,68 @@ def update_angle(ax, ay, az, gx, gy, gz):
 
 
 # ============================================================
-#  三、运动控制（航向保持行驶）
+#  三、角速度闭环控制（IMU 陀螺仪 Z 轴反馈）
+# ============================================================
+
+# 归一化 wz → dps 换算因子：wz=1.0 时车体旋转角速度 (deg/s)
+# 需要实测标定：让车以固定 wz 旋转，读取陀螺仪实际 dps
+MAX_WZ_DPS = 384.0  # 标定值：wz=0.3 时实测 115.3 dps → 115.3/0.3 = 384
+
+# 角速度闭环 PID（工作在 dps 空间）
+ANG_VEL_KP = 0.6          # P 增益（从 0.5 调高，加快响应）
+ANG_VEL_KI = 0.6          # I 增益（从 0.3 调高，更快消除静差）
+ANG_VEL_KD = 0.0
+ANG_VEL_FF = 0.92         # 前馈系数（从 0.85 调高，正转偏低的问题）
+ANG_VEL_OUTPUT_LIMIT = 300   # PID 输出限幅 (dps)
+ANG_VEL_INTEGRAL_LIMIT = 150  # 积分限幅 (dps·s)（给 KI 更多空间）
+
+_ang_vel_pid = PID(kp=ANG_VEL_KP, ki=ANG_VEL_KI, kd=ANG_VEL_KD,
+                   integral_limit=ANG_VEL_INTEGRAL_LIMIT,
+                   output_limit=ANG_VEL_OUTPUT_LIMIT)
+
+
+def get_angular_velocity():
+    """返回当前 Z 轴角速度 (dps)"""
+    return _wz_dps
+
+
+def angular_velocity_control(target_dps, actual_dps, dt):
+    """
+    角速度 PID 闭环 + 前馈
+    target_dps: 目标角速度 (deg/s)
+    actual_dps: 实际角速度 (deg/s)，来自陀螺仪
+    dt:         控制周期 (s)
+    返回:       wz 归一化值 (-1~1)，可直接喂给 omni_drive_closed_loop
+    """
+    # 前馈
+    ff = target_dps * ANG_VEL_FF
+    # PID 反馈
+    fb = _ang_vel_pid.compute(target_dps, actual_dps, dt)
+    # 合成 dps
+    wz_dps = ff + fb
+    wz_dps = max(-ANG_VEL_OUTPUT_LIMIT, min(wz_dps, ANG_VEL_OUTPUT_LIMIT))
+    # 转换为归一化 wz
+    wz = wz_dps / MAX_WZ_DPS
+    return max(-1.0, min(wz, 1.0))
+
+
+def reset_ang_vel_pid():
+    """重置角速度 PID 积分"""
+    _ang_vel_pid.reset()
+
+
+def set_ang_vel_pid(kp=None, ki=None, kd=None):
+    """在线调整角速度 PID 增益"""
+    if kp is not None:
+        _ang_vel_pid.kp = kp
+    if ki is not None:
+        _ang_vel_pid.ki = ki
+    if kd is not None:
+        _ang_vel_pid.kd = kd
+
+
+# ============================================================
+#  四、运动控制（航向保持行驶）
 # ============================================================
 
 
@@ -205,4 +271,5 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
     pit_enc.stop()
     omni_drive(0, 0, 0)
     return False
+
 
