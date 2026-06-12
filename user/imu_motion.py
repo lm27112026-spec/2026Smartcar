@@ -21,7 +21,7 @@ from motor import omni_drive, SWITCH2_PIN, encoder_rf, encoder_lf, encoder_lb, e
 # ============================================================
 
 ACCEL_SENSITIVITY = 4096
-GYRO_SENSITIVITY = 16.4
+GYRO_SENSITIVITY = 14.2
 
 HEADING_KP     = 0.10     # P 增益
 YAW_DEADBAND   = 1.0      # 死区（度）：<1° 不纠偏
@@ -76,7 +76,7 @@ filter_alpha = 0.98
 # 陀螺仪 Z 轴低通滤波（平滑噪声数据）
 # 运动中陀螺仪有大量电机干扰噪声，需要强滤波
 gz_filtered = 0.0
-gz_filter_alpha = 0.3  # 0.3=超强滤波（运动中噪声大），0.5=强，0.7=中等，0.9=弱
+gz_filter_alpha = 0.7  # 0.3=超强滤波（运动中噪声大），0.5=强，0.7=中等，0.9=弱
 
 
 def update_angle(ax, ay, az, gx, gy, gz):
@@ -94,7 +94,7 @@ def update_angle(ax, ay, az, gx, gy, gz):
     dt = (now - last_time) * 0.001
     last_time = now
 
-    if dt > 0.05:
+    if dt > 0.5:
         dt = 0.05
 
     ax_g = ax / ACCEL_SENSITIVITY
@@ -205,3 +205,4 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
     pit_enc.stop()
     omni_drive(0, 0, 0)
     return False
+
