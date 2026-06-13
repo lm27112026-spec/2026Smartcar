@@ -29,7 +29,7 @@ RESTART_DIST_M = 0.25
 d_filt = 0.0
 is_stopped = False
 
-uart = UART(7)
+uart = UART(0)
 uart.init(baudrate=115200, bits=8, parity=None, stop=1)
 
 rx_line = bytearray()

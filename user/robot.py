@@ -22,7 +22,8 @@ import gc, time, math, json
 from machine import UART, Pin
 from motor import (
     omni_drive_closed_loop, omni_move_by_angle, stop_all,
-    get_encoder_counts, ENC_SCALE, enc_ticker,
+    get_encoder_counts, get_encoder_speeds_filtered,
+    ENC_SCALE, enc_ticker,
     LED_PIN, SWITCH2_PIN, reset_encoder_filter,
 )
 import imu_motion
@@ -34,6 +35,8 @@ from pid import PID
 from kalman_filter import CameraKalmanFilter
 from control import CascadeController
 from utils import normalize_angle, limit_value
+from uwb_tracker import UWBTracker
+from uart_master import MasterBT
 
 
 # ============================================================
@@ -301,16 +304,19 @@ class Robot:
     MODE_UWB_FOLLOW    = 2
     MODE_UART_REMOTE   = 3
     MODE_ROUTE_NAV     = 4
+    MODE_VISUAL_APPROACH = 5
+    MODE_SLAVE_CMD       = 6
+    MODE_SYNC_DRIVE      = 7
 
-    MODE_NAMES  = ["IDLE", "CAMERA_TRACK", "UWB_FOLLOW", "UART_REMOTE", "ROUTE_NAV"]
-    MODE_COUNT  = 5
+    MODE_NAMES  = ["IDLE", "CAMERA_TRACK", "UWB_FOLLOW", "UART_REMOTE", "ROUTE_NAV",
+                   "VISUAL_APPROACH", "SLAVE_CMD", "SYNC_DRIVE"]
+    MODE_COUNT  = 8
 
     # ── LED 闪烁周期（ms），0 = 常亮 ──
-    LED_PERIODS = [500, 0, 100, 250, 300]
+    LED_PERIODS = [500, 0, 100, 250, 300, 200, 150, 100]
 
-    # ── SW2 参数 ──
-    SW2_DEBOUNCE_MS     = 30
-    SW2_LONG_PRESS_MS   = 1000
+    # ── 按键参数 ──
+    KEY3_DEBOUNCE_MS    = 30      # KEY3 消抖窗口
 
     # ============================================================
     #  初始化
@@ -327,12 +333,15 @@ class Robot:
         self._led_state      = False
         self._led_last_toggle = time.ticks_ms()
 
-        # ── SW2 ──
-        self._sw2           = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
-        self._sw2_prev      = self._sw2.value()
-        self._sw2_press_start = 0
-        self._sw2_pressed   = False
-        self._sw2_handled   = False
+        # ── SW2（拨码开关）—— 拨动即退出主循环 ──
+        self._sw2      = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
+        self._sw2_init = self._sw2.value()  # 保存初始状态
+
+        # ── KEY3（C14 按键）—— 短按循环切换模式 ──
+        self._key3           = Pin('C14', Pin.IN, pull=Pin.PULL_UP_47K)
+        self._key3_prev      = self._key3.value()
+        self._key3_press_start = 0
+        self._key3_pressed   = False
 
         # ── 模式状态 ──
         self._mode     = self.MODE_IDLE
@@ -349,14 +358,7 @@ class Robot:
         self._cam_tracking  = False
 
         # UWB_FOLLOW
-        self._uwb_uart           = None
-        self._uwb_rx_line        = bytearray()
-        self._uwb_last_data      = 0
-        self._uwb_p_filt         = 0.0
-        self._uwb_d_filt         = 0.0
-        self._uwb_is_stopped     = False
-        self._uwb_timeout_stopped = False
-        self._uwb_frame_count    = 0
+        self._uwb  = None
 
         # UART_REMOTE
         self._remote_uart = None
@@ -364,9 +366,12 @@ class Robot:
         # ROUTE_NAV
         self._route = None
 
+        # Master-Slave 通信
+        self._master_bt = None
+
         # ── 安全保障 ──
         stop_all()
-        print("Robot initialized. Mode: IDLE  |  SW2 short=cycle  long=EMERGENCY STOP")
+        print("Robot initialized. Mode: IDLE  |  KEY3=cycle mode  |  SW2 toggle=exit")
 
     # ============================================================
     #  主循环
@@ -380,14 +385,21 @@ class Robot:
         self._running = True
         print("=" * 50)
         print("Robot.run() started")
-        print("  SW2 short press  : cycle mode (IDLE → CAMERA → UWB → UART → ROUTE)")
-        print("  SW2 long press   : EMERGENCY STOP → IDLE")
+        print("  KEY3 short press : cycle mode")
+        print("  SW2 toggle       : exit program (clean stop)")
         print("=" * 50)
 
         while self._running:
             now = time.ticks_ms()
 
-            self._handle_sw2(now)
+            # SW2 拨动 → 退出主循环
+            if self._sw2.value() != self._sw2_init:
+                print("[SW2] Toggled → exiting main loop")
+                break
+
+            # KEY3 短按 → 循环切换模式
+            self._handle_key3(now)
+
             self._update_led(now)
             self._dispatch_mode()
 
@@ -442,11 +454,14 @@ class Robot:
             self._cam_kf   = None
             self._cam_ctrl = None
         elif old_mode == self.MODE_UWB_FOLLOW:
-            self._uwb_uart      = None
-            self._uwb_rx_line   = bytearray()
-            self._uwb_p_filt    = 0.0
-            self._uwb_d_filt    = 0.0
-            self._uwb_timeout_stopped = True
+            if self._uwb:
+                self._uwb.stop()
+            self._uwb = None
+        elif old_mode == self.MODE_VISUAL_APPROACH:
+            if self._cam_ctrl:
+                self._cam_ctrl.emergency_stop()
+            self._cam_kf   = None
+            self._cam_ctrl = None
         elif old_mode == self.MODE_UART_REMOTE:
             self._remote_uart = None
         elif old_mode == self.MODE_ROUTE_NAV:
@@ -454,6 +469,10 @@ class Robot:
                 self._route.aborted = True
             self._route = None
             enc_ticker.start(10)
+        elif old_mode == self.MODE_SLAVE_CMD or old_mode == self.MODE_SYNC_DRIVE:
+            if self._master_bt:
+                self._master_bt.send_emergency_stop()
+            self._master_bt = None
 
         reset_encoder_filter()
         reset_ang_vel_pid()
@@ -461,43 +480,26 @@ class Robot:
         print(">>> MODE: IDLE (after EMERGENCY STOP) <<<")
 
     # ============================================================
-    #  SW2 处理（消抖 + 短按/长按）
+    #  KEY3 处理（消抖 + 短按循环切换模式）
     # ============================================================
 
-    def _handle_sw2(self, now):
-        val = self._sw2.value()
+    def _handle_key3(self, now):
+        val = self._key3.value()
 
-        if val != self._sw2_prev:
-            # 电平变化
-            diff = time.ticks_diff(now, self._sw2_press_start)
-            if diff < self.SW2_DEBOUNCE_MS:
-                # 消抖：忽略快速跳变
-                pass
-            elif val == 0:
-                # 按下（低电平有效）
-                self._sw2_press_start = now
-                self._sw2_pressed = True
-                self._sw2_handled = False
-            else:
-                # 释放
-                if self._sw2_pressed and not self._sw2_handled:
-                    press_ms = time.ticks_diff(now, self._sw2_press_start)
-                    if press_ms < self.SW2_LONG_PRESS_MS:
-                        # 短按：循环切换模式
+        if val != self._key3_prev:
+            diff = time.ticks_diff(now, self._key3_press_start)
+            if diff >= self.KEY3_DEBOUNCE_MS:
+                if val == 0:
+                    # 按下（低电平有效）
+                    self._key3_press_start = now
+                    self._key3_pressed = True
+                else:
+                    # 释放 → 短按触发模式循环
+                    if self._key3_pressed:
                         next_mode = (self._mode + 1) % self.MODE_COUNT
                         self.set_mode(next_mode)
-                self._sw2_pressed = False
-                self._sw2_handled = False
-
-        # 长按检测（持续按住时）
-        if self._sw2_pressed and not self._sw2_handled:
-            press_ms = time.ticks_diff(now, self._sw2_press_start)
-            if press_ms >= self.SW2_LONG_PRESS_MS:
-                self.emergency_stop()
-                self._sw2_handled = True
-                print("[SW2] Long press → EMERGENCY STOP")
-
-        self._sw2_prev = val
+                        self._key3_pressed = False
+            self._key3_prev = val
 
     # ============================================================
     #  LED 状态指示
@@ -532,6 +534,12 @@ class Robot:
             self._mode_uart_remote()
         elif self._mode == self.MODE_ROUTE_NAV:
             self._mode_route_nav()
+        elif self._mode == self.MODE_VISUAL_APPROACH:
+            self._mode_visual_approach()
+        elif self._mode == self.MODE_SLAVE_CMD:
+            self._mode_slave_cmd()
+        elif self._mode == self.MODE_SYNC_DRIVE:
+            self._mode_sync_drive()
 
     # ============================================================
     #  模式切换钩子
@@ -550,6 +558,12 @@ class Robot:
             self._exit_uart_remote()
         elif self._mode == self.MODE_ROUTE_NAV:
             self._exit_route_nav()
+        elif self._mode == self.MODE_VISUAL_APPROACH:
+            self._exit_visual_approach()
+        elif self._mode == self.MODE_SLAVE_CMD:
+            self._exit_slave_cmd()
+        elif self._mode == self.MODE_SYNC_DRIVE:
+            self._exit_sync_drive()
 
     def _enter_mode(self):
         """进入新模式：初始化资源。"""
@@ -563,6 +577,12 @@ class Robot:
             self._enter_uart_remote()
         elif self._mode == self.MODE_ROUTE_NAV:
             self._enter_route_nav()
+        elif self._mode == self.MODE_VISUAL_APPROACH:
+            self._enter_visual_approach()
+        elif self._mode == self.MODE_SLAVE_CMD:
+            self._enter_slave_cmd()
+        elif self._mode == self.MODE_SYNC_DRIVE:
+            self._enter_sync_drive()
 
         # 重置 LED 定时器，让新模式立即显示正确的 LED 状态
         self._led_last_toggle = time.ticks_ms()
@@ -578,6 +598,76 @@ class Robot:
     def _mode_idle(self):
         """IDLE 模式：无动作，LED 慢闪。"""
         pass
+
+    # ============================================================
+    #  MODE VISUAL_APPROACH（视觉逼近）
+    # ============================================================
+
+    def _enter_visual_approach(self):
+        """视觉逼近初始化。使用 Kalman + Cascade PID 逼近目标至 10cm。"""
+        if not self._cam_uart:
+            self._cam_uart = UART(7, baudrate=9600, bits=8, parity=None, stop=1)
+        self._cam_kf   = CameraKalmanFilter()
+        self._cam_ctrl = CascadeController()
+        self._cam_last_data = time.ticks_ms()
+        self._cam_tracking  = False
+        print("VISUAL_APPROACH: approaching target to 10cm")
+
+    def _mode_visual_approach(self):
+        """视觉逼近单次迭代。目标距离 ≤10cm → SLAVE_CMD，丢失 → UWB_FOLLOW。"""
+        if not self._cam_uart:
+            return
+
+        if self._cam_uart.any() >= 6:
+            buf = self._cam_uart.read()
+            if buf:
+                idx = buf.find(b'\xAA')
+                if idx != -1 and len(buf) >= idx + 6 and buf[idx + 5] == 0xBB:
+                    raw_ex   = buf[idx + 1]
+                    raw_ey   = buf[idx + 2]
+                    dist     = buf[idx + 3]
+                    raw_roll = buf[idx + 4]
+                    ex   = raw_ex   if raw_ex   < 128 else raw_ex   - 256
+                    ey   = raw_ey   if raw_ey   < 128 else raw_ey   - 256
+                    roll = raw_roll if raw_roll < 128 else raw_roll - 256
+
+                    self._cam_last_data = time.ticks_ms()
+                    self._cam_tracking = not (ex == 0 and ey == 0 and dist == 0 and roll == 0)
+
+                    if self._cam_tracking:
+                        ex_f, dist_f, roll_f = self._cam_kf.update(ex, dist, roll)
+                        vx_out, vy_out, wz_out, actual_speeds, dt = self._cam_ctrl.step(
+                            ex_f, dist_f, roll_f, True)
+                        print("[VISUAL] ex_f={:.1f} dist_f={:.1f} | vx={:.3f} vy={:.3f}".format(
+                            ex_f, dist_f, vx_out, vy_out))
+
+                        # 到达 10cm → 切换到 SLAVE_CMD
+                        if dist_f <= 10:
+                            print("[VISUAL] Target reached! dist_f={:.1f} → SLAVE_CMD".format(dist_f))
+                            if self._cam_ctrl:
+                                self._cam_ctrl.emergency_stop()
+                            self.set_mode(self.MODE_SLAVE_CMD)
+                            return
+                    else:
+                        print("[VISUAL] Target lost → UWB_FOLLOW")
+                        if self._cam_ctrl:
+                            self._cam_ctrl.emergency_stop()
+                        self.set_mode(self.MODE_UWB_FOLLOW)
+                        return
+
+        # 看门狗
+        if time.ticks_diff(time.ticks_ms(), self._cam_last_data) > 500:
+            if self._cam_ctrl:
+                self._cam_ctrl.emergency_stop()
+            print("[VISUAL] Timeout → UWB_FOLLOW")
+            self.set_mode(self.MODE_UWB_FOLLOW)
+
+    def _exit_visual_approach(self):
+        """视觉逼近清理。"""
+        if self._cam_ctrl:
+            self._cam_ctrl.emergency_stop()
+        self._cam_kf   = None
+        self._cam_ctrl = None
 
     # ============================================================
     #  MODE CAMERA_TRACK
@@ -667,115 +757,67 @@ class Robot:
     # ============================================================
 
     def _enter_uwb_follow(self):
-        """UWB 跟随初始化。
-
-        将 UART7 重设为 115200 波特率（匹配 UWB 模块）。
-        """
-        self._uwb_uart = UART(7, baudrate=115200, bits=8, parity=None, stop=1)
-        self._uwb_rx_line         = bytearray()
-        self._uwb_last_data       = time.ticks_ms()
-        self._uwb_p_filt          = 0.0
-        self._uwb_d_filt          = 0.0
-        self._uwb_is_stopped      = False
-        self._uwb_timeout_stopped = False
-        self._uwb_frame_count     = 0
-
-        print("UWB_FOLLOW: UART7 115200 | filter active")
+        """UWB 跟随初始化。UART0@115200 + 摄像头 UART7@9600。"""
+        self._uwb = UWBTracker(uart_id=0, baudrate=115200, target_anchor="8834")
+        # 同时初始化摄像头 UART7（用于中断检测）
+        self._cam_uart = UART(7, baudrate=9600, bits=8, parity=None, stop=1)
+        print("UWB_FOLLOW: UART0 115200 | Camera UART7 9600 (polling)")
 
     def _exit_uwb_follow(self):
         """UWB 跟随清理。"""
         stop_all()
-        self._uwb_uart           = None
-        self._uwb_timeout_stopped = True
+        if self._uwb:
+            self._uwb.stop()
+        self._uwb = None
 
     def _mode_uwb_follow(self):
-        """UWB 跟随单次迭代。
-
-        从 UART7 读取 JSON TWR 帧 → 低通滤波 → 接近/停止逻辑 → omni_move_by_angle。
-        """
-        if not self._uwb_uart:
+        """UWB 跟随单次迭代。读取 UART0 + 轮询摄像头中断。"""
+        if not self._uwb:
             return
 
-        # ── 超时安全 ──
-        if time.ticks_diff(time.ticks_ms(), self._uwb_last_data) > 800:
-            if not self._uwb_timeout_stopped:
-                stop_all()
-                self._uwb_timeout_stopped = True
-
-        # ── 读取 UART 数据 ──
-        if self._uwb_uart.any():
-            raw = self._uwb_uart.read(self._uwb_uart.any())
-            if raw:
-                for b in raw:
-                    if b == 0x0D or b == 0x0A:
-                        if len(self._uwb_rx_line) > 0:
-                            line_str = ''
-                            for c in self._uwb_rx_line:
-                                line_str += chr(c)
-                            self._process_uwb_line(line_str)
-                            self._uwb_rx_line = bytearray()
-                    else:
-                        self._uwb_rx_line.append(b)
-                        if len(self._uwb_rx_line) > 200:
-                            self._uwb_rx_line = bytearray()
-
-    # ── UWB 辅助方法 ──
-
-    def _process_uwb_line(self, line_str):
-        """解析并处理一行 UWB JSON 数据。"""
-        data = self._parse_json_line(line_str)
-        if data is None or 'TWR' not in data:
-            return
-
-        twr     = data['TWR']
-        anchor  = twr.get('a16', '?')
-        d_cm    = twr.get('D', 0)
-        angle_p = twr.get('P', 0)
-
-        self._uwb_last_data = time.ticks_ms()
-        self._uwb_timeout_stopped = False
-
-        # 一阶低通滤波
-        self._uwb_p_filt = 0.3 * angle_p + 0.7 * self._uwb_p_filt
-        self._uwb_d_filt = 0.3 * d_cm   + 0.7 * self._uwb_d_filt
-
-        angle_for_motor = -self._uwb_p_filt
-        if abs(angle_for_motor) < 10:
-            angle_for_motor = 0
-
-        dist_m_filt = self._uwb_d_filt / 100.0
-
-        self._uwb_frame_count += 1
-        print("[{:d}] a={:s} D={:d} D_filt={:.1f} P_raw={:+d} P_filt={:+.0f} → mot={:+.0f}".format(
-            self._uwb_frame_count, str(anchor), d_cm, self._uwb_d_filt,
-            angle_p, self._uwb_p_filt, angle_for_motor))
-
-        # 目标锚点过滤
-        TARGET_ANCHOR = "8834"
-        if TARGET_ANCHOR is not None and str(anchor) != TARGET_ANCHOR:
-            return
-
-        # 接近/停止状态机
-        if self._uwb_is_stopped:
-            if dist_m_filt > 0.25:
-                self._uwb_is_stopped = False
-                omni_move_by_angle(0.30, angle_for_motor)
-        elif dist_m_filt <= 0.20:
-            self._uwb_is_stopped = True
+        # 超时检测
+        if self._uwb.is_timeout():
             stop_all()
-        else:
-            omni_move_by_angle(0.30, angle_for_motor)
+            return
 
-    @staticmethod
-    def _parse_json_line(line_str):
-        """尝试从字符串中提取并解析 JSON（容忍行首噪声）。"""
-        try:
-            idx = line_str.find('{')
-            if idx < 0:
-                return None
-            return json.loads(line_str[idx:])
-        except Exception:
-            return None
+        # 读取 UWB 命令并执行
+        cmd = self._uwb.get_command()
+        if cmd:
+            speed, angle = cmd
+            omni_move_by_angle(speed, angle)
+
+        # 轮询摄像头中断检测
+        self._poll_camera_interrupt()
+
+    # ── 摄像头中断检测 ──
+
+    def _poll_camera_interrupt(self):
+        """非阻塞检查摄像头 UART7 是否检测到有效目标。
+        检测到则中断切换到 VISUAL_APPROACH。"""
+        if self._mode != self.MODE_UWB_FOLLOW:
+            return
+        if not self._cam_uart:
+            return
+        if self._cam_uart.any() < 6:
+            return
+
+        buf = self._cam_uart.read()
+        if not buf:
+            return
+
+        idx = buf.find(b'\xAA')
+        if idx != -1 and len(buf) >= idx + 6 and buf[idx + 5] == 0xBB:
+            raw_ex   = buf[idx + 1]
+            raw_ey   = buf[idx + 2]
+            dist     = buf[idx + 3]
+            raw_roll = buf[idx + 4]
+            ex   = raw_ex   if raw_ex   < 128 else raw_ex   - 256
+            ey   = raw_ey   if raw_ey   < 128 else raw_ey   - 256
+            roll = raw_roll if raw_roll < 128 else raw_roll - 256
+            valid = not (ex == 0 and ey == 0 and dist == 0 and roll == 0)
+            if valid:
+                print("[CAM INTERRUPT] Target detected! → VISUAL_APPROACH")
+                self.set_mode(self.MODE_VISUAL_APPROACH)
 
     # ============================================================
     #  MODE UART_REMOTE（蓝牙遥控）
@@ -871,3 +913,55 @@ class Robot:
         elif result == _RouteStateMachine.RESULT_ABORT:
             print("Route aborted.")
             self.set_mode(self.MODE_IDLE)
+
+    # ============================================================
+    #  MODE SLAVE_CMD（向从车发送指令）
+    # ============================================================
+
+    def _enter_slave_cmd(self):
+        """初始化蓝牙通信。"""
+        self._master_bt = MasterBT(uart_id=5, baudrate=9600)
+        print("SLAVE_CMD: waiting for slave...")
+
+    def _mode_slave_cmd(self):
+        """发送 POS_ADJ 给从车，等待 POS_OK。"""
+        if not self._master_bt:
+            return
+
+        ok = self._master_bt.send_pos_adjust(0.0, 0.0, 0.0)
+        if ok:
+            print("[SLAVE_CMD] POS_OK received → SYNC_DRIVE")
+            self.set_mode(self.MODE_SYNC_DRIVE)
+        else:
+            print("[SLAVE_CMD] No response from slave")
+            self.emergency_stop()
+
+    def _exit_slave_cmd(self):
+        """SLAVE_CMD 清理。"""
+        self._master_bt = None
+
+    # ============================================================
+    #  MODE SYNC_DRIVE（两车同步行驶）
+    # ============================================================
+
+    def _enter_sync_drive(self):
+        """同步驾驶初始化。"""
+        print("SYNC_DRIVE: master + slave synchronized")
+
+    def _mode_sync_drive(self):
+        """同步驾驶：计算控制量 → 发送 SYNC_MOVE → 自身执行。"""
+        vx = 0.5
+        vy = 0.0
+        wz = 0.0
+
+        if self._master_bt:
+            self._master_bt.send_sync_move(vx, vy, wz)
+
+        speeds = get_encoder_speeds_filtered(0.01)
+        omni_drive_closed_loop(vx, vy, wz, speeds, 0.01)
+
+    def _exit_sync_drive(self):
+        """同步驾驶清理。"""
+        stop_all()
+        if self._master_bt:
+            self._master_bt.send_emergency_stop()
