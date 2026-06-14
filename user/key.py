@@ -20,12 +20,16 @@ SCAN_PERIOD_MS = 10
 key = KEY_HANDLER(SCAN_PERIOD_MS)
 
 ticker_flag = False
+_ticker_once = False
 
 def _ticker_handler(t):
-    global ticker_flag
+    global ticker_flag, _ticker_once
     ticker_flag = True
+    if not _ticker_once:
+        _ticker_once = True
+        print("[key] ticker running (PIT1)")
 
-_pit = ticker(0)  # PIT0: 独立于 motor.py 的 enc_ticker(PIT1)
+_pit = ticker(1)  # PIT1: 与 motor.py enc_ticker 共用同一 PIT，运行时永不停机
 _pit.capture_list(key)
 _pit.callback(_ticker_handler)
 _pit.start(SCAN_PERIOD_MS)

@@ -359,8 +359,9 @@ class Robot:
         self._sw2_exit = False                # 主循环退出标志
 
         # ── KEY3（通过 key.py 矩阵扫描检测，不直接读 Pin——C14 GPIO 不可靠） ──
-        self._key3_press_start = 0
-        self._key3_pressed   = False
+        self._key3_press_start  = 0
+        self._key3_pressed      = False
+        self._key3_release_cnt  = 0      # 释放消抖计数器（连续未按下帧数）
 
         # ── 模式状态 ──
         self._mode     = self.MODE_IDLE
@@ -545,42 +546,57 @@ class Robot:
 
     def _handle_key3(self, now):
         """KEY3 检测：通过 seekfree KEY_HANDLER 矩阵扫描（不直接读 C14 GPIO）。
-        
+
         矩阵扫描由独立 ticker（key.py 的 PIT1 或 fallback 的 PIT0）自动驱动，
         此处手动 capture() 为兜底刷新。
+
+        消抖机制：释放需连续 3 帧未按下才确认，防止电机噪声导致的单帧毛刺
+        误判为释放（从而重置长按计时器）。
         """
+        KEY3_DEBOUNCE = 3  # 连续未按下帧数阈值
+
         try:
             _key_matrix.capture()
             state = _key_matrix.get()
             key3_down = bool(state[2]) if len(state) >= 3 else False
+            read_ok = True
         except Exception as e:
             # 不要静默吞 — 至少打印一次，方便排查硬件/驱动问题
             print("[KEY3] capture error:", e)
             key3_down = False
+            read_ok = False   # 异常帧不参与消抖计数
 
-        if key3_down and not self._key3_pressed:
-            # 首次按下
-            self._key3_press_start = now
-            self._key3_pressed = True
-        elif not key3_down and self._key3_pressed:
-            # 释放
-            hold_ms = time.ticks_diff(now, self._key3_press_start)
-            if hold_ms >= 2000:
-                print("[KEY3] Long press {:d}ms → emergency exit".format(hold_ms))
-                self.emergency_stop()
-                self._sw2_exit = True
+        if key3_down:
+            # ── 按键按下 → 清零释放计数器 ──
+            self._key3_release_cnt = 0
+
+            if not self._key3_pressed:
+                # 首次按下
+                self._key3_press_start = now
+                self._key3_pressed = True
             else:
-                next_mode = (self._mode + 1) % self.MODE_COUNT
-                self.set_mode(next_mode)
-            self._key3_pressed = False
-        elif key3_down and self._key3_pressed:
-            # 持续按下中
-            hold_ms = time.ticks_diff(now, self._key3_press_start)
-            if hold_ms >= 2000:
-                print("[KEY3] Long press {:d}ms → emergency exit".format(hold_ms))
-                self.emergency_stop()
-                self._sw2_exit = True
-                self._key3_pressed = False
+                # 持续按下中 → 检查长按
+                hold_ms = time.ticks_diff(now, self._key3_press_start)
+                if hold_ms >= 2000:
+                    print("[KEY3] Long press {:d}ms → emergency exit".format(hold_ms))
+                    self.emergency_stop()
+                    self._sw2_exit = True
+                    self._key3_pressed = False
+        else:
+            # ── 按键未按下 ──
+            if self._key3_pressed and read_ok:
+                self._key3_release_cnt += 1
+                # 消抖：连续 N 帧未按下才确认释放
+                if self._key3_release_cnt >= KEY3_DEBOUNCE:
+                    hold_ms = time.ticks_diff(now, self._key3_press_start)
+                    if hold_ms >= 2000:
+                        print("[KEY3] Long press {:d}ms → emergency exit".format(hold_ms))
+                        self.emergency_stop()
+                        self._sw2_exit = True
+                    else:
+                        next_mode = (self._mode + 1) % self.MODE_COUNT
+                        self.set_mode(next_mode)
+                    self._key3_pressed = False
 
     # ============================================================
     #  LED 状态指示
