@@ -2,7 +2,7 @@
 
 import time
 from pid import PID
-from motor import get_encoder_counts, get_encoder_speeds_filtered, omni_drive_closed_loop, enc_ticker, stop_all
+from motor import get_encoder_counts, get_encoder_speeds_filtered, omni_drive_closed_loop, stop_all
 from imu_motion import update_angle, get_angular_velocity, angular_velocity_control, reset_ang_vel_pid, imu
 
 # === 控制参数 ===
@@ -38,7 +38,6 @@ class CascadeController:
         self.pid_roll = PID(kp=PID_ROLL_KP, ki=PID_ROLL_KI, kd=PID_ROLL_KD,
                             integral_limit=PID_I_LIMIT, output_limit=PID_OUT_LIMIT)
         self._last_time = time.ticks_ms()
-        enc_ticker.stop()
         _ = get_encoder_counts()
         # IMU 角速度闭环初始化（确保 update_angle 首次调用建立基准）
         d = imu.read()
@@ -89,7 +88,6 @@ class CascadeController:
 
     def emergency_stop(self):
         stop_all()
-        enc_ticker.start(10)
         self.pid_ex.reset()
         self.pid_dist.reset()
         self.pid_roll.reset()

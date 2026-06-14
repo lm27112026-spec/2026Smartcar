@@ -25,7 +25,7 @@ def _ticker_handler(t):
     global ticker_flag
     ticker_flag = True
 
-_pit = ticker(1)
+_pit = ticker(0)  # PIT0: 独立于 motor.py 的 enc_ticker(PIT1)
 _pit.capture_list(key)
 _pit.callback(_ticker_handler)
 _pit.start(SCAN_PERIOD_MS)
@@ -76,3 +76,8 @@ def wait_any_key(timeout_ms=0):
         if timeout_ms > 0 and time.ticks_ms() - start > timeout_ms:
             return None
         time.sleep_ms(1)
+
+
+def stop():
+    """停止按键扫描 ticker（程序退出时调用，解除对 REPL 的干扰）。"""
+    _pit.stop()

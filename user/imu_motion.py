@@ -31,12 +31,7 @@ CTRL_DT        = 0.02     # 控制周期 20ms
 
 
 time.sleep_ms(100)
-print("REAL TYPE : " + BOARD_TYPE)
-print("BOARD VERSION : " + BOARD_VERSION)
-
-IMU660RX.help()
 imu = IMU660RX()
-imu.info()
 imu_data = imu.read()
 
 # ============================================================

@@ -247,6 +247,16 @@ MOTOR_RF = (pwm_4, pin_d6,  pin_d7)   # C26 + D6/D7
 MOTOR_LB = (pwm_2, pin_c30, pin_c31)  # C20 + C30/C31
 MOTOR_RB = (pwm_1, pin_c28, pin_c29)  # B26 + C28/C29
 
+def pause_encoder_ticker():
+    """暂停编码器自动采集 — 用于手动接管编码器读取的模块调用。
+    调用者必须在完成后调用 resume_encoder_ticker() 恢复。"""
+    enc_ticker.stop()
+
+def resume_encoder_ticker():
+    """恢复编码器自动采集（10ms 周期）。"""
+    enc_ticker.start(10)
+
+
 def stop_all():
     """急停：所有电机方向引脚置 0，PWM 置 0"""
     for pin in (pin_c28, pin_c29, pin_c30, pin_c31, pin_d4, pin_d5, pin_d6, pin_d7):
