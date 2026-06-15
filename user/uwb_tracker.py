@@ -175,16 +175,12 @@ class UWBFollower:
         x_cm  = twr.get('Xcm', 0)
         y_cm  = twr.get('Ycm', 0)
 
-        # 跳过非目标锚点
-        if self._target_anchor is not None and str(anchor) != self._target_anchor:
-            return
-
-        # ── 更新计时 ──
+        # ── 更新计时（所有锚点都刷新，与 uwb_following.py 对齐）──
         self._frame_count += 1
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
 
-        # ── 低通滤波 ──
+        # ── 低通滤波（所有锚点参与滤波，保持滤波器"热"）──
         if self._x_filt is None:
             self._x_filt = float(x_cm)
             self._y_filt = float(y_cm)
@@ -205,11 +201,15 @@ class UWBFollower:
             self._d_filt = self.D_FILT_ALPHA * d_cm + (1 - self.D_FILT_ALPHA) * self._d_filt
         dist_m_filt = self._d_filt / 100.0
 
-        # ── Debug 打印 ──
+        # ── Debug 打印（所有锚点都打印，方便观测）──
         print("[{}] a={} D={} Df={:.1f} X={} Y={} ang={:+.0f}° ang_f={:+.0f}° spd={:.2f} state={}".format(
             self._frame_count, anchor, d_cm, self._d_filt,
             x_cm, y_cm, angle_to_target, self._angle_filt,
             self._ramp_speed(dist_m_filt), self._state))
+
+        # ── 跳过非目标锚点（滤波/tick 已更新，仅跳过电机控制）──
+        if self._target_anchor is not None and str(anchor) != self._target_anchor:
+            return
 
         # ── 状态机 ──
         if self._state == self.STATE_FOLLOW:

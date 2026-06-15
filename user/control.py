@@ -6,7 +6,7 @@ from motor import get_encoder_counts, get_encoder_speeds_filtered, omni_drive_cl
 from imu_motion import update_angle, get_angular_velocity, angular_velocity_control, reset_ang_vel_pid, imu
 
 # === 控制参数 ===
-TARGET_DIST = 70
+TARGET_DIST = 10   # 视觉逼近目标距离（cm），匹配 dist_f <= 10 模式切换条件
 
 PID_EX_KP   = 0.020
 PID_EX_KI   = 0.0
@@ -66,7 +66,7 @@ class CascadeController:
 
         if tracking:
             vx_out = self.pid_ex.compute(setpoint=0, measurement=ex_f, dt=dt)
-            vy_out = self.pid_dist.compute(setpoint=TARGET_DIST, measurement=dist_f, dt=dt)
+            vy_out = -self.pid_dist.compute(setpoint=TARGET_DIST, measurement=dist_f, dt=dt)
             wz_out = self.pid_roll.compute(setpoint=0, measurement=roll_f, dt=dt)
             vx_out = max(-0.8, min(vx_out, 0.8))
             vy_out = max(-0.8, min(vy_out, 0.8))

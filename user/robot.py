@@ -37,6 +37,104 @@ from control import CascadeController
 from utils import normalize_angle, limit_value
 from uwb_tracker import UWBFollower
 from uart_master import MasterBT
+
+
+# ============================================================
+#  摄像头 UART 环形缓冲区（解决粘包/断包问题）
+# ============================================================
+
+class _UARTRingBuffer:
+    """简易环形缓冲区，累积跨多次 UART.read() 的数据并提取完整 AA..BB 帧。"""
+
+    def __init__(self, size=128):
+        self._buf = bytearray(size)
+        self._size = size
+        self._head = 0  # 写入位置
+        self._tail = 0  # 读取位置
+
+    def feed(self, data):
+        """将新数据追加到缓冲区尾部。"""
+        for b in data:
+            self._buf[self._head] = b
+            self._head = (self._head + 1) % self._size
+            if self._head == self._tail:
+                # 缓冲区满，丢弃最旧字节
+                self._tail = (self._tail + 1) % self._size
+
+    def get_frame(self):
+        """从缓冲区中查找并提取第一个完整的 AA..BB 帧。
+
+        返回: bytes (10字节帧) 或 None (无完整帧)。
+        同时清除已消费的字节（包括帧前的废数据）。
+        """
+        # 收集所有可用字节
+        available = []
+        idx = self._tail
+        while idx != self._head:
+            available.append(self._buf[idx])
+            idx = (idx + 1) % self._size
+
+        if len(available) < 10:
+            return None
+
+        # P1-12: 循环查找有效帧，处理帧头后有多 AA 的情况
+        data = bytes(available)
+        search_offset = 0
+        while search_offset <= len(data) - 10:
+            aa_pos = data.find(b'\xAA', search_offset)
+            if aa_pos == -1:
+                # 无更多帧头，丢弃所有数据
+                self._tail = self._head
+                return None
+
+            if len(data) < aa_pos + 10:
+                # 帧头找到但数据不够，保留从 AA 开始的数据
+                self._tail = (self._tail + aa_pos) % self._size
+                return None
+
+            if data[aa_pos + 9] == 0xBB:
+                # 找到有效帧
+                frame = data[aa_pos:aa_pos + 10]
+                self._tail = (self._tail + aa_pos + 10) % self._size
+                return frame
+
+            # 帧头后第9字节不是帧尾，跳过这个 AA，继续查找下一个
+            search_offset = aa_pos + 1
+
+        # 所有 AA 都不是有效帧头，丢弃已扫描的数据
+        self._tail = self._head
+        return None
+
+    def clear(self):
+        """清空缓冲区。"""
+        self._head = 0
+        self._tail = 0
+
+
+def _parse_camera_frame(buf, idx):
+    """解析摄像头 AA..BB 协议帧。
+
+    参数:
+        buf: bytes, 包含 AA 帧头的数据
+        idx: int, AA 帧头在 buf 中的偏移量
+
+    返回: (x_cm, y_cm, label, detected) 或 None (解析失败)
+    """
+    if len(buf) < idx + 10 or buf[idx + 9] != 0xBB:
+        return None
+
+    raw_x      = (buf[idx + 1] << 8) | buf[idx + 2]
+    raw_y      = (buf[idx + 3] << 8) | buf[idx + 4]
+    raw_label  = (buf[idx + 5] << 8) | buf[idx + 6]
+    raw_status = (buf[idx + 7] << 8) | buf[idx + 8]
+
+    x_cm = (raw_x if raw_x < 32768 else raw_x - 65536) / 10.0
+    y_cm = (raw_y if raw_y < 32768 else raw_y - 65536) / 10.0
+    detected = (raw_status == 1)
+
+    return (x_cm, y_cm, raw_label, detected)
+
+
 _key_ticker = None  # 仅在 fallback 路径创建；key.py 路径下为 None
 
 try:
@@ -192,11 +290,7 @@ class _RouteStateMachine:
                 time.sleep_ms(10)
 
             self.start_yaw = imu_motion.yaw
-            self.target_yaw = self.start_yaw + target_delta
-            while self.target_yaw > 180:
-                self.target_yaw -= 360
-            while self.target_yaw < -180:
-                self.target_yaw += 360
+            self.target_yaw = normalize_angle(self.start_yaw + target_delta)
 
         self.start_ms = time.ticks_ms()
         print("\n  ── [{:s}] step {:d}/{:d} ──".format(
@@ -355,18 +449,30 @@ class Robot:
 
         # ── SW2（拨码开关）—— 纯轮询检测（不依赖 IRQ/ticker，该端口不可靠） ──
         self._sw2      = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
-        self._sw2_last = self._sw2.value()   # 初始电平，用于轮询比较
+        self._sw2_last = self._sw2.value()   # 已确认的电平
+        self._sw2_pending = self._sw2.value() # 待确认的电平（消抖用）
         self._sw2_exit = False                # 主循环退出标志
+        self._sw2_debounce_cnt = 0            # P1-10: SW2 消抖计数器
 
-        # ── KEY3（通过 key.py 矩阵扫描检测，不直接读 Pin——C14 GPIO 不可靠） ──
-        self._key3_press_start  = 0
-        self._key3_pressed      = False
-        self._key3_release_cnt  = 0      # 释放消抖计数器（连续未按下帧数）
+        # ── KEY3（KEY_HANDLER 事件语义：state[2]∈{1,2}=按下，独立计时器解耦噪声）──
+        self._key3_press_start = 0     # 按下时刻（只设一次，不受噪声重置）
+        self._key3_pressed     = False # 按下状态（需连续 10 帧无事件才释放）
+        self._key3_release_cnt = 0     # 释放消抖计数器
+
+        # ── C15（KEY4）按键状态：用于模式切换 ──
+        self._c15_press_start   = 0
+        self._c15_pressed       = False
+        self._c15_release_cnt   = 0
 
         # ── 模式状态 ──
         self._mode     = self.MODE_IDLE
         self._running  = False
         self._loop_cnt = 0
+
+        # ── SLAVE_CMD 非阻塞状态机 ──
+        self._slave_cmd_state    = "IDLE"  # IDLE → SEND → (poll per frame) → IDLE
+        self._slave_cmd_attempt  = 0
+        self._slave_cmd_deadline = 0
 
         # ── 模式资源（惰性创建）──
 
@@ -376,8 +482,20 @@ class Robot:
         self._cam_ctrl      = None
         self._cam_last_data = 0
         self._cam_tracking  = False
-        self._cam_confirm_count = 0
-        self._cam_confirm_threshold = 5   # 连续 N 帧确认才信任（防 YOLO 误检）
+        self._cam_timeout_handled = False  # 看门狗超时已处理标志（防止重复急停）
+        self._cam_ring = _UARTRingBuffer(128)  # 摄像头 UART 环形缓冲区
+        self._print_counter = 0  # 打印频率控制计数器
+
+        # P2-18: 滑动窗口目标确认
+        self._cam_window_size = 10        # 窗口大小（最近 N 帧）
+        self._cam_window_threshold = 7    # 窗口内有效帧阈值（≥7/10 则确认）
+        self._cam_window = []             # 滑动窗口：最近 N 帧的有效性记录
+
+        # ── 全局安全保障 ──
+        self._emergency_stopped = False  # 急停标志位（各模式迭代函数检测后跳过控制输出）
+
+        # ── 按键矩阵（key.py 的 KEY_HANDLER 单例，存为实例属性防止 MicroPython 局部变量作用域歧义）──
+        self._key_matrix = _key_matrix
 
         # UWB_FOLLOW
         self._uwb  = None
@@ -393,7 +511,7 @@ class Robot:
 
         # ── 安全保障 ──
         stop_all()
-        print("Robot initialized. Mode: IDLE  |  KEY3=cycle mode  |  SW2 toggle=exit")
+        print("Robot initialized. Mode: IDLE  |  C15=cycle mode  |  KEY3 long=exit  |  SW2 toggle=exit")
 
     # ============================================================
     #  主循环
@@ -402,42 +520,67 @@ class Robot:
     def run(self):
         """主循环，永不返回。
 
-        每次迭代：KEY3 → LED → 模式调度 → sleep → GC
+        每次迭代：C15 → KEY3 → LED → 模式调度 → sleep → GC
         """
         self._running = True
+        self._emergency_stopped = False
         print("=" * 50)
         print("Robot.run() started")
-        print("  KEY3 short press : cycle mode")
+        print("  C15  short press : cycle mode")
         print("  KEY3 long  press : exit program (>=2s)")
         print("=" * 50)
 
-        while self._running:
-            now = time.ticks_ms()
+        try:
+            while self._running:
+                now = time.ticks_ms()
 
-            # ── SW2 检测（D9 在此移植版不可靠，保留作兜底） ──
-            self._check_sw2()
-            if self._sw2_exit:
-                break
+                # ── SW2 检测（D9 在此移植版不可靠，保留作兜底） ──
+                self._check_sw2()
+                if self._sw2_exit:
+                    break
 
-            # ── KEY3 短按 → 循环切换模式 ──
-            self._handle_key3(now)
+                # ── 按键矩阵采集（每帧 capture+get，无盲帧）──
+                try:
+                    self._key_matrix.capture()
+                    _key_state = self._key_matrix.get()
+                    _key_read_ok = len(_key_state) >= 4
+                except Exception as e:
+                    print("[KEY] capture error:", e)
+                    _key_state = ()
+                    _key_read_ok = False
 
-            # ── LED ──
-            self._update_led(now)
+                # ── C15（KEY4）短按 → 循环切换模式 ──
+                self._handle_c15(now, _key_state, _key_read_ok)
 
-            # ── 模式调度（内部也有 SW2 检测兜底） ──
-            self._dispatch_mode()
-            if self._sw2_exit:   # dispatch 内也可能触发
-                break
+                # ── KEY3 长按 → 紧急退出（事件语义，计时器解耦噪声）──
+                self._handle_key3(now, _key_state, _key_read_ok)
 
-            time.sleep_ms(10)
+                # ── LED ──
+                self._update_led(now)
 
-            self._loop_cnt += 1
-            if self._loop_cnt % 50 == 0:
-                gc.collect()
+                # ── 模式调度（内部也有 SW2 检测兜底） ──
+                if not self._emergency_stopped:
+                    self._dispatch_mode()
+                if self._sw2_exit:   # dispatch 内也可能触发
+                    break
 
-        self._running = False
-        print("[Robot] run() ended")
+                time.sleep_ms(3)   # 缩短轮询间隔，减少 UART 响应延迟
+
+                self._loop_cnt += 1
+
+        except Exception as e:
+            print("[FATAL] Unhandled exception in main loop:")
+            try:
+                import sys
+                sys.print_exception(e)
+            except Exception:
+                print("  ", e)
+            self.emergency_stop()
+
+        finally:
+            self._running = False
+            stop_key_ticker()  # 确保 ticker 停止
+            print("[Robot] run() ended")
 
     # ============================================================
     #  公共 API
@@ -474,7 +617,9 @@ class Robot:
         """急停：所有电机停止 + 资源释放 + PID 重置 + 回到 IDLE。"""
         old_mode = self._mode
         print("[EMERGENCY STOP]")
+        self._emergency_stopped = True
         stop_all()
+        stop_key_ticker()  # 停止 KEY3 扫描 ticker，防止 ISR 干扰
 
         # 释放当前模式资源
         if old_mode == self.MODE_CAMERA_TRACK:
@@ -513,8 +658,14 @@ class Robot:
                 self._route.aborted = True
             self._route = None
         elif old_mode == self.MODE_SLAVE_CMD or old_mode == self.MODE_SYNC_DRIVE:
-            if self._master_bt:
+            pass  # _master_bt 处理见下方统一发送
+
+        # 无条件通知从车停止（只要蓝牙连接存在）
+        if self._master_bt:
+            try:
                 self._master_bt.send_emergency_stop()
+            except Exception:
+                pass
             self._master_bt = None
 
         reset_encoder_filter()
@@ -527,76 +678,103 @@ class Robot:
     # ============================================================
 
     def _check_sw2(self):
-        """读 Pin 电平，与上次值比较。通知检测到变化即退出。
+        """读 Pin 电平，变化后连续 N 帧一致才确认（消抖）。
         
         该端口（D9）的 IRQ 和 ticker 回调在此移植版上不可靠，
         因此采用纯主线程轮询——每次主循环 + dispatch 前/后调用。
         """
+        SW2_DEBOUNCE_THRESHOLD = 5  # P1-10: 变化后连续 5 帧一致才确认
         sw2_val = self._sw2.value()
-        if sw2_val != self._sw2_last:
-            self._sw2_last = sw2_val
-            print("[SW2] {} → emergency stop + exit".format(sw2_val))
-            self.emergency_stop()
-            self._sw2_exit = True
-            return
-
-    # ============================================================
-    #  KEY3 处理（消抖 + 短按循环切换模式）
-    # ============================================================
-
-    def _handle_key3(self, now):
-        """KEY3 检测：通过 seekfree KEY_HANDLER 矩阵扫描（不直接读 C14 GPIO）。
-
-        矩阵扫描由独立 ticker（key.py 的 PIT1 或 fallback 的 PIT0）自动驱动，
-        此处手动 capture() 为兜底刷新。
-
-        消抖机制：释放需连续 3 帧未按下才确认，防止电机噪声导致的单帧毛刺
-        误判为释放（从而重置长按计时器）。
-        """
-        KEY3_DEBOUNCE = 3  # 连续未按下帧数阈值
-
-        try:
-            _key_matrix.capture()
-            state = _key_matrix.get()
-            key3_down = bool(state[2]) if len(state) >= 3 else False
-            read_ok = True
-        except Exception as e:
-            # 不要静默吞 — 至少打印一次，方便排查硬件/驱动问题
-            print("[KEY3] capture error:", e)
-            key3_down = False
-            read_ok = False   # 异常帧不参与消抖计数
-
-        if key3_down:
-            # ── 按键按下 → 清零释放计数器 ──
-            self._key3_release_cnt = 0
-
-            if not self._key3_pressed:
-                # 首次按下
-                self._key3_press_start = now
-                self._key3_pressed = True
-            else:
-                # 持续按下中 → 检查长按
-                hold_ms = time.ticks_diff(now, self._key3_press_start)
-                if hold_ms >= 2000:
-                    print("[KEY3] Long press {:d}ms → emergency exit".format(hold_ms))
+        if sw2_val != self._sw2_pending:
+            # 电平变化 → 记录新值，重置消抖计数器
+            self._sw2_pending = sw2_val
+            self._sw2_debounce_cnt = 0
+        else:
+            # 电平持续一致 → 累加
+            self._sw2_debounce_cnt += 1
+            if self._sw2_debounce_cnt >= SW2_DEBOUNCE_THRESHOLD:
+                self._sw2_debounce_cnt = 0
+                self._sw2_pending = sw2_val  # 更新已确认值
+                if sw2_val != self._sw2_last:
+                    # 确认发生了有效切换
+                    self._sw2_last = sw2_val
+                    print("[SW2] {} → emergency stop + exit".format(sw2_val))
                     self.emergency_stop()
                     self._sw2_exit = True
-                    self._key3_pressed = False
+
+    # ============================================================
+    #  KEY3 处理 — KEY_HANDLER 事件语义 + 独立计时器（解耦噪声）
+    # ============================================================
+
+    def _handle_key3(self, now, state, read_ok):
+        """KEY3 检测：长按 ≥2s → 紧急退出。
+
+        使用 KEY_HANDLER 事件语义：state[2] 为 0/1/2（无事件/短按/长按）。
+        key3_active = state[2] ∈ {1,2} 表示 KEY_HANDLER 检测到按键活动。
+        
+        核心设计：
+        - _key3_pressed 只在首次事件时置 True，仅在连续 RELEASE_DEBOUNCE 帧
+          无事件后才重置 — 单帧噪声不会重置计时器。
+        - 长按检查独立于当前帧的 state，只要 _key3_pressed 就持续累加，
+          不依赖 KEY_HANDLER 内部的长按检测（阈值可能与我们的 2000ms 不同）。
+        """
+        RELEASE_DEBOUNCE = 10  # 连续 N 帧无事件才确认释放（~30ms）
+
+        # state[2]: 0=无事件, 1=短按事件, 2=长按事件（KEY_HANDLER 内部判定）
+        key3_active = (state[2] in (1, 2)) if len(state) >= 3 else False
+
+        if key3_active:
+            # 有按键事件 → 清零释放计数器
+            self._key3_release_cnt = 0
+            if not self._key3_pressed:
+                # 首次按下：记录起始时刻（只设一次）
+                self._key3_press_start = now
+                self._key3_pressed = True
         else:
-            # ── 按键未按下 ──
+            # 无按键事件 → 释放消抖
             if self._key3_pressed and read_ok:
                 self._key3_release_cnt += 1
-                # 消抖：连续 N 帧未按下才确认释放
-                if self._key3_release_cnt >= KEY3_DEBOUNCE:
-                    hold_ms = time.ticks_diff(now, self._key3_press_start)
-                    if hold_ms >= 2000:
-                        print("[KEY3] Long press {:d}ms → emergency exit".format(hold_ms))
-                        self.emergency_stop()
-                        self._sw2_exit = True
-                    else:
-                        next_mode = (self._mode + 1) % self.MODE_COUNT
-                        self.set_mode(next_mode)
+                if self._key3_release_cnt >= RELEASE_DEBOUNCE:
                     self._key3_pressed = False
+                    self._key3_release_cnt = 0
+
+        # ── 长按检测：独立于 state，_key3_pressed 为 True 就持续检查 ──
+        if self._key3_pressed:
+            hold_ms = time.ticks_diff(now, self._key3_press_start)
+            if hold_ms >= 2000:
+                print("[KEY3] Long press {:d}ms → exit".format(hold_ms))
+                self.emergency_stop()
+                self._sw2_exit = True
+                self._key3_pressed = False
+
+    # ============================================================
+    #  C15（KEY4）处理 — 短按循环切换模式
+    # ============================================================
+
+    def _handle_c15(self, now, state, read_ok):
+        """C15 按键检测：短按 → 循环切换运行模式。
+
+        state/read_ok 由 run() 统一采集后传入，本函数不再调用 capture()。
+        """
+        C15_DEBOUNCE = 3   # 连续未按下帧数阈值
+
+        c15_down = bool(state[3]) if len(state) >= 4 else False
+
+        if c15_down:
+            # ── 按下 ──
+            self._c15_release_cnt = 0
+            if not self._c15_pressed:
+                self._c15_press_start = now
+                self._c15_pressed = True
+        else:
+            # ── 释放检测（消抖确认）──
+            if self._c15_pressed and read_ok:
+                self._c15_release_cnt += 1
+                if self._c15_release_cnt >= C15_DEBOUNCE:
+                    # 仅短按有效 → 循环切换模式
+                    next_mode = (self._mode + 1) % self.MODE_COUNT
+                    self.set_mode(next_mode)
+                    self._c15_pressed = False
 
     # ============================================================
     #  LED 状态指示
@@ -643,17 +821,18 @@ class Robot:
         elif self._mode == self.MODE_SYNC_DRIVE:
             self._mode_sync_drive()
 
-        # 模式返回后再检测一次（捕获在 mode 内发生的拨动）
-        self._check_sw2()
+        # 模式返回后由 run() 主循环统一检测 SW2
+
 
     # ============================================================
     #  模式切换钩子
     # ============================================================
 
     def _exit_mode(self):
-        """退出当前模式：停电机 + 释放资源。"""
+        """退出当前模式：停电机 + 释放资源 + 重置PID。"""
         stop_all()
         reset_encoder_filter()
+        reset_ang_vel_pid()  # 重置角速度PID，防止积分残留导致启动冲击
 
         if self._mode == self.MODE_CAMERA_TRACK:
             self._exit_camera_track()
@@ -701,8 +880,8 @@ class Robot:
         pass
 
     def _mode_idle(self):
-        """IDLE 模式：无动作，LED 慢闪。"""
-        pass
+        """IDLE 模式：无动作，LED 慢闪。执行 GC 回收内存。"""
+        gc.collect()  # P3-26: 在 IDLE 模式下执行 GC，避免控制循环中卡顿
 
     # ============================================================
     #  MODE VISUAL_APPROACH（视觉逼近）
@@ -712,11 +891,16 @@ class Robot:
         """视觉逼近初始化。使用 Kalman + Cascade PID 逼近目标至 10cm。"""
         if not self._cam_uart:
             self._cam_uart = UART(7, baudrate=115200, bits=8, parity=None, stop=1)
+        # P3-3: 释放旧对象，防止内存泄漏
+        self._cam_kf   = None
+        self._cam_ctrl = None
         self._cam_kf   = CameraKalmanFilter()
         self._cam_ctrl = CascadeController()
         self._cam_last_data = time.ticks_ms()
         self._cam_tracking  = False
-        self._cam_confirm_count = 0   # 每次进入模式时重置
+        self._cam_timeout_handled = False
+        self._cam_ring.clear()
+        self._cam_window.clear()
         print("VISUAL_APPROACH: approaching target to 10cm")
 
     def _mode_visual_approach(self):
@@ -724,59 +908,75 @@ class Robot:
         if not self._cam_uart:
             return
 
-        if self._cam_uart.any() >= 10:
-            buf = self._cam_uart.read()
-            if buf:
-                idx = buf.find(b'\xAA')
-                if idx != -1 and len(buf) >= idx + 10 and buf[idx + 9] == 0xBB:
-                    # 协议: AA [X_H X_L] [Y_H Y_L] [LABEL_H LABEL_L] [STATUS_H STATUS_L] BB
-                    raw_x      = (buf[idx + 1] << 8) | buf[idx + 2]
-                    raw_y      = (buf[idx + 3] << 8) | buf[idx + 4]
-                    raw_label  = (buf[idx + 5] << 8) | buf[idx + 6]
-                    raw_status = (buf[idx + 7] << 8) | buf[idx + 8]
+        # ── 读取并解析 UART 数据（使用环形缓冲区处理粘包/断包）──
+        frame = None
+        if self._cam_uart.any() > 0:
+            raw = self._cam_uart.read()
+            if raw:
+                self._cam_ring.feed(raw)
+                frame = self._cam_ring.get_frame()
 
-                    x_cm = (raw_x if raw_x < 32768 else raw_x - 65536) / 10.0
-                    y_cm = (raw_y if raw_y < 32768 else raw_y - 65536) / 10.0
-                    label = raw_label
-                    target_detected = (raw_status == 1)
+        if frame:
+            parsed = _parse_camera_frame(frame, 0)
+            if parsed:
+                x_cm, y_cm, label, target_detected = parsed
+                self._cam_last_data = time.ticks_ms()
+                self._cam_timeout_handled = False  # 收到新数据，重置看门狗标志
 
-                    self._cam_last_data = time.ticks_ms()
+                # P2-18: 滑动窗口目标确认（最近10帧有7帧有效即确认）
+                is_valid = target_detected and not (x_cm == 0 and y_cm == 0)
+                self._cam_window.append(1 if is_valid else 0)
+                if len(self._cam_window) > self._cam_window_size:
+                    self._cam_window.pop(0)  # 保持窗口大小
 
-                    # ── 目标确认：连续 N 帧检测到才信任（防 YOLO 误检）──
-                    if target_detected and not (x_cm == 0 and y_cm == 0):
-                        self._cam_confirm_count += 1
-                    else:
-                        self._cam_confirm_count = 0
+                # 计算窗口内有效帧数
+                valid_count = sum(self._cam_window)
+                self._cam_tracking = (valid_count >= self._cam_window_threshold
+                                      and len(self._cam_window) >= self._cam_window_size)
 
-                    self._cam_tracking = (self._cam_confirm_count >= self._cam_confirm_threshold)
+                if self._cam_tracking:
+                    # x_cm → 横向偏差(ex), y_cm → 纵向距离(dist), roll=0(协议无此字段)
+                    ex_f, dist_f, roll_f = self._cam_kf.update(x_cm, y_cm, 0.0)
+                    vx_out, vy_out, wz_out, actual_speeds, dt = self._cam_ctrl.step(
+                        ex_f, dist_f, roll_f, True)
 
-                    if self._cam_tracking:
-                        # x_cm → 横向偏差(ex), y_cm → 纵向距离(dist), roll=0(协议无此字段)
-                        ex_f, dist_f, roll_f = self._cam_kf.update(x_cm, y_cm, 0.0)
-                        vx_out, vy_out, wz_out, actual_speeds, dt = self._cam_ctrl.step(
-                            ex_f, dist_f, roll_f, True)
+                    # 打印遥测（每10帧打印一次）
+                    self._print_counter += 1
+                    if self._print_counter >= 10:
+                        self._print_counter = 0
                         print("[VISUAL] id:{:d} ex_f={:.1f} dist_f={:.1f} | vx={:.3f} vy={:.3f}".format(
                             label, ex_f, dist_f, vx_out, vy_out))
 
+                    # P2-2: 检查 dist_f 有效性（NaN 或异常大值）
+                    if math.isnan(dist_f) or dist_f > 1000:
+                        print("[VISUAL] Invalid dist_f={:.1f}, resetting KF".format(dist_f))
+                        self._cam_kf.reset()
+                    elif dist_f <= 10:
                         # 到达 10cm → 切换到 SLAVE_CMD
-                        if dist_f <= 10:
-                            print("[VISUAL] Target reached! dist_f={:.1f} → SLAVE_CMD".format(dist_f))
-                            if self._cam_ctrl:
-                                self._cam_ctrl.emergency_stop()
-                            self.set_mode(self.MODE_SLAVE_CMD)
-                            return
-                    else:
-                        if self._cam_confirm_count > 0:
-                            print("[VISUAL] Confirming... {:d}/{:d}".format(
-                                self._cam_confirm_count, self._cam_confirm_threshold))
+                        print("[VISUAL] Target reached! dist_f={:.1f} → SLAVE_CMD".format(dist_f))
+                        if self._cam_ctrl:
+                            self._cam_ctrl.emergency_stop()
+                        self.set_mode(self.MODE_SLAVE_CMD)
+                        return
+                else:
+                    # P0-1: 无跟踪目标时输出零速度
+                    if self._cam_ctrl and not self._emergency_stopped:
+                        self._cam_ctrl.step(0.0, 0.0, 0.0, False)
+        else:
+            # P0-1: 无有效数据时输出零速度
+            if self._cam_ctrl and not self._emergency_stopped:
+                self._cam_ctrl.step(0.0, 0.0, 0.0, False)
 
-        # 看门狗
-        if time.ticks_diff(time.ticks_ms(), self._cam_last_data) > 500:
-            if self._cam_ctrl:
-                self._cam_ctrl.emergency_stop()
-            if self._cam_tracking:
-                self._cam_tracking = False
-                self._cam_confirm_count = 0
+        # P2-3 + P0-3: 看门狗（仅触发一次 + 直接调用 stop_all 兜底）
+        if not self._cam_timeout_handled:
+            if time.ticks_diff(time.ticks_ms(), self._cam_last_data) > 500:
+                self._cam_timeout_handled = True
+                stop_all()  # P0-3: 直接调用 stop_all() 作为兜底
+                if self._cam_ctrl:
+                    self._cam_ctrl.emergency_stop()
+                if self._cam_tracking:
+                    self._cam_tracking = False
+                    self._cam_window.clear()
                 print("[VISUAL] Timeout → UWB_FOLLOW")
                 self.set_mode(self.MODE_UWB_FOLLOW)
 
@@ -784,6 +984,11 @@ class Robot:
         """视觉逼近清理。"""
         if self._cam_ctrl:
             self._cam_ctrl.emergency_stop()
+        try:
+            self._cam_uart.deinit()
+        except AttributeError:
+            pass
+        self._cam_uart = None
         self._cam_kf   = None
         self._cam_ctrl = None
 
@@ -797,11 +1002,17 @@ class Robot:
         创建 UART7（115200）、卡尔曼滤波器、级联 PID 控制器。
         """
         self._cam_uart = UART(7, baudrate=115200, bits=8, parity=None, stop=1)
+        # P3-3: 释放旧对象，防止内存泄漏
+        self._cam_kf   = None
+        self._cam_ctrl = None
         self._cam_kf   = CameraKalmanFilter()
         self._cam_ctrl = CascadeController()
         self._cam_last_data = time.ticks_ms()
         self._cam_tracking  = False
-        self._cam_confirm_count = 0   # 每次进入模式时重置
+        self._cam_timeout_handled = False
+        self._cam_ring.clear()
+        self._cam_window.clear()
+        self._print_counter = 0
 
         print("CAMERA_TRACK: UART7 115200 | KF + CascadeController ready")
 
@@ -809,6 +1020,10 @@ class Robot:
         """摄像头追踪清理。"""
         if self._cam_ctrl:
             self._cam_ctrl.emergency_stop()
+        try:
+            self._cam_uart.deinit()
+        except AttributeError:
+            pass
         self._cam_uart = None
         self._cam_kf   = None
         self._cam_ctrl = None
@@ -822,57 +1037,71 @@ class Robot:
         if not self._cam_uart:
             return
 
-        # ── 读取并解析 UART 数据 ──
-        if self._cam_uart.any() >= 10:
-            buf = self._cam_uart.read()
-            if buf:
-                idx = buf.find(b'\xAA')
-                if idx != -1 and len(buf) >= idx + 10 and buf[idx + 9] == 0xBB:
-                    # 协议: AA [X_H X_L] [Y_H Y_L] [LABEL_H LABEL_L] [STATUS_H STATUS_L] BB
-                    raw_x      = (buf[idx + 1] << 8) | buf[idx + 2]
-                    raw_y      = (buf[idx + 3] << 8) | buf[idx + 4]
-                    raw_label  = (buf[idx + 5] << 8) | buf[idx + 6]
-                    raw_status = (buf[idx + 7] << 8) | buf[idx + 8]
+        # ── 读取并解析 UART 数据（使用环形缓冲区处理粘包/断包）──
+        frame = None
+        if self._cam_uart.any() > 0:
+            raw = self._cam_uart.read()
+            if raw:
+                self._cam_ring.feed(raw)
+                frame = self._cam_ring.get_frame()
 
-                    x_cm = (raw_x if raw_x < 32768 else raw_x - 65536) / 10.0
-                    y_cm = (raw_y if raw_y < 32768 else raw_y - 65536) / 10.0
-                    label = raw_label
-                    target_detected = (raw_status == 1)
+        if frame:
+            parsed = _parse_camera_frame(frame, 0)
+            if parsed:
+                x_cm, y_cm, label, target_detected = parsed
+                self._cam_last_data = time.ticks_ms()
+                self._cam_timeout_handled = False  # 收到新数据，重置看门狗标志
 
-                    self._cam_last_data = time.ticks_ms()
+                # P2-18: 滑动窗口目标确认（最近10帧有7帧有效即确认）
+                is_valid = target_detected and not (x_cm == 0 and y_cm == 0)
+                self._cam_window.append(1 if is_valid else 0)
+                if len(self._cam_window) > self._cam_window_size:
+                    self._cam_window.pop(0)  # 保持窗口大小
 
-                    # ── 目标确认：连续 N 帧检测到才信任（防 YOLO 误检）──
-                    if target_detected and not (x_cm == 0 and y_cm == 0):
-                        self._cam_confirm_count += 1
-                    else:
-                        self._cam_confirm_count = 0
+                # 计算窗口内有效帧数
+                valid_count = sum(self._cam_window)
+                self._cam_tracking = (valid_count >= self._cam_window_threshold
+                                      and len(self._cam_window) >= self._cam_window_size)
 
-                    self._cam_tracking = (self._cam_confirm_count >= self._cam_confirm_threshold)
-
-                    # 卡尔曼滤波: x_cm → ex, y_cm → dist, roll=0（协议无此字段）
+                # 卡尔曼滤波: 仅在确认跟踪时更新，否则仅预测
+                if self._cam_tracking:
                     ex_f, dist_f, roll_f = self._cam_kf.update(x_cm, y_cm, 0.0)
+                else:
+                    ex_f = self._cam_kf.kf_ex.x_hat
+                    dist_f = self._cam_kf.kf_dist.x_hat
+                    roll_f = 0.0
+                    self._cam_kf.predict_only()
 
-                    # 级联 PID 控制
-                    vx_out, vy_out, wz_out, actual_speeds, dt = self._cam_ctrl.step(
-                        ex_f, dist_f, roll_f, self._cam_tracking)
+                # 级联 PID 控制
+                vx_out, vy_out, wz_out, actual_speeds, dt = self._cam_ctrl.step(
+                    ex_f, dist_f, roll_f, self._cam_tracking)
 
-                    # 打印遥测
+                # 打印遥测（每10帧打印一次，减少控制循环阻塞）
+                self._print_counter += 1
+                if self._print_counter >= 10:
+                    self._print_counter = 0
                     state = "TRACK" if self._cam_tracking else "WAIT"
-                    spd_lf, spd_rf, spd_lb, spd_rb = actual_speeds
                     print("[{:s}] id:{:d} X:{:+6.1f} Y:{:5.1f} | "
                           "filt ex:{:+5.1f} dist:{:5.1f} | "
                           "vx:{:.3f} vy:{:.3f} wz:{:.3f} | dt:{:.0f}ms".format(
                               state, label, x_cm, y_cm,
                               ex_f, dist_f,
                               vx_out, vy_out, wz_out, dt * 1000))
+        else:
+            # P0-1: 无有效数据时输出零速度，防止电机保持上次速度
+            if self._cam_ctrl and not self._emergency_stopped:
+                self._cam_ctrl.step(0.0, 0.0, 0.0, False)
 
-        # ── 看门狗：数据超时 500ms 则紧急停车 ──
-        if time.ticks_diff(time.ticks_ms(), self._cam_last_data) > 500:
-            if self._cam_ctrl:
-                self._cam_ctrl.emergency_stop()
-            if self._cam_tracking:
-                self._cam_tracking = False
-                self._cam_confirm_count = 0
+        # ── 看门狗：数据超时 500ms 则紧急停车（仅触发一次）──
+        if not self._cam_timeout_handled:
+            if time.ticks_diff(time.ticks_ms(), self._cam_last_data) > 500:
+                self._cam_timeout_handled = True
+                stop_all()  # P0-3: 直接调用 stop_all() 作为兜底
+                if self._cam_ctrl:
+                    self._cam_ctrl.emergency_stop()
+                if self._cam_tracking:
+                    self._cam_tracking = False
+                    self._cam_window.clear()
                 print("[LOST] Connection timeout.")
 
     # ============================================================
@@ -892,7 +1121,11 @@ class Robot:
         if self._uwb:
             self._uwb.stop()
         self._uwb = None
-        self._cam_confirm_count = 0
+        try:
+            self._cam_uart.deinit()
+        except AttributeError:
+            pass
+        self._cam_uart = None
 
     def _mode_uwb_follow(self):
         """UWB 跟随单次迭代。闭环控制 + 轮询摄像头中断。"""
@@ -902,44 +1135,50 @@ class Robot:
         # 闭环步进（内部处理 UART 读取 + 滤波 + IMU 航向纠偏 + 驱动）
         self._uwb.step()
 
-        # 轮询摄像头中断检测
-        self._poll_camera_interrupt()
+        # 轮询摄像头中断检测（降频：每 5 次迭代 1 次，减少主循环抖动）
+        if self._loop_cnt % 5 == 0:
+            self._poll_camera_interrupt()
 
     # ── 摄像头中断检测 ──
 
     def _poll_camera_interrupt(self):
         """非阻塞检查摄像头 UART7 是否检测到有效目标。
-        连续 N 帧检测到才切换到 VISUAL_APPROACH（防单帧误检）。"""
+        滑动窗口内累计目标帧数达阈值才切换到 VISUAL_APPROACH。"""
         if self._mode != self.MODE_UWB_FOLLOW:
             return
         if not self._cam_uart:
             return
-        if self._cam_uart.any() < 10:
+
+        # P1-13: 使用环形缓冲区处理粘包/断包
+        frame = None
+        if self._cam_uart.any() > 0:
+            raw = self._cam_uart.read()
+            if raw:
+                self._cam_ring.feed(raw)
+                frame = self._cam_ring.get_frame()
+
+        if not frame:
             return
 
-        buf = self._cam_uart.read()
-        if not buf:
+        parsed = _parse_camera_frame(frame, 0)
+        if not parsed:
             return
 
-        idx = buf.find(b'\xAA')
-        if idx != -1 and len(buf) >= idx + 10 and buf[idx + 9] == 0xBB:
-            raw_status = (buf[idx + 7] << 8) | buf[idx + 8]
-            raw_x = (buf[idx + 1] << 8) | buf[idx + 2]
-            raw_y = (buf[idx + 3] << 8) | buf[idx + 4]
+        x_cm, y_cm, label, target_detected = parsed
 
-            # 检查是否为有效目标（status=1 且坐标非零）
-            if raw_status == 1 and not (raw_x == 0 and raw_y == 0):
-                self._cam_confirm_count += 1
-                if self._cam_confirm_count >= self._cam_confirm_threshold:
-                    print("[CAM INTERRUPT] Confirmed {:d}/{:d}! → VISUAL_APPROACH".format(
-                        self._cam_confirm_count, self._cam_confirm_threshold))
-                    self._cam_confirm_count = 0
-                    self.set_mode(self.MODE_VISUAL_APPROACH)
-                else:
-                    print("[CAM] Confirming... {:d}/{:d}".format(
-                        self._cam_confirm_count, self._cam_confirm_threshold))
-            else:
-                self._cam_confirm_count = 0
+        # 检查是否为有效目标（status=1 且坐标非零）
+        hit = 1 if (target_detected and not (x_cm == 0 and y_cm == 0)) else 0
+        self._cam_window.append(hit)
+
+        # P2-18: 滑动窗口判定
+        hits = sum(self._cam_window)
+        if hits >= self._cam_window_threshold:
+            print("[CAM INTERRUPT] window {}/{} → VISUAL_APPROACH".format(
+                hits, len(self._cam_window)))
+            self._cam_window.clear()
+            self.set_mode(self.MODE_VISUAL_APPROACH)
+        elif hit:
+            print("[CAM] confirming... {}/{}".format(hits, len(self._cam_window)))
 
     # ============================================================
     #  MODE UART_REMOTE（蓝牙遥控）
@@ -959,6 +1198,10 @@ class Robot:
     def _exit_uart_remote(self):
         """蓝牙遥控清理。"""
         stop_all()
+        try:
+            self._remote_uart.deinit()
+        except AttributeError:
+            pass
         self._remote_uart = None
 
     def _mode_uart_remote(self):
@@ -1038,23 +1281,54 @@ class Robot:
     def _enter_slave_cmd(self):
         """初始化蓝牙通信。"""
         self._master_bt = MasterBT(uart_id=5, baudrate=9600)
+        self._slave_cmd_state    = "IDLE"   # 状态机初始化为就绪态
+        self._slave_cmd_attempt  = 0
+        self._slave_cmd_deadline = 0
         print("SLAVE_CMD: waiting for slave...")
 
     def _mode_slave_cmd(self):
-        """发送 POS_ADJ 给从车，等待 POS_OK。"""
+        """发送 POS_ADJ 给从车（非阻塞，状态机每帧 poll 应答）。"""
         if not self._master_bt:
             return
 
-        ok = self._master_bt.send_pos_adjust(0.0, 0.0, 0.0)
-        if ok:
-            print("[SLAVE_CMD] POS_OK received → SYNC_DRIVE")
-            self.set_mode(self.MODE_SYNC_DRIVE)
-        else:
-            print("[SLAVE_CMD] No response from slave")
-            self.emergency_stop()
+        if self._slave_cmd_state == "IDLE":
+            # 发起新的一轮握手
+            self._master_bt.send_pos_adjust_async(0.0, 0.0, 0.0)
+            self._slave_cmd_deadline = time.ticks_ms() + 3000
+            self._slave_cmd_state = "SEND"
+
+        elif self._slave_cmd_state == "SEND":
+            if self._master_bt.read_response_ok():
+                print("[SLAVE_CMD] POS_OK → SYNC_DRIVE")
+                self.set_mode(self.MODE_SYNC_DRIVE)
+                self._slave_cmd_state = "IDLE"
+                return
+
+            # 超时检查
+            if time.ticks_diff(time.ticks_ms(), self._slave_cmd_deadline) > 0:
+                self._slave_cmd_attempt += 1
+                if self._slave_cmd_attempt < 3:
+                    # P1-15: 重试前清空 UART 缓冲区（循环读取直到为空）
+                    try:
+                        while self._master_bt._uart.any():
+                            self._master_bt._uart.read()
+                    except Exception:
+                        pass
+                    print("[SLAVE_CMD] timeout, retry {}/2".format(self._slave_cmd_attempt))
+                    self._master_bt.send_pos_adjust_async(0.0, 0.0, 0.0)
+                    self._slave_cmd_deadline = time.ticks_ms() + 3000
+                    # 保持 SEND 状态
+                else:
+                    print("[SLAVE_CMD] No response from slave (3 attempts)")
+                    self.emergency_stop()
+                    self._slave_cmd_state = "IDLE"
+                    self._slave_cmd_attempt = 0
 
     def _exit_slave_cmd(self):
         """SLAVE_CMD 清理。"""
+        self._slave_cmd_state    = "IDLE"
+        self._slave_cmd_attempt  = 0
+        self._slave_cmd_deadline = 0
         self._master_bt = None
 
     # ============================================================
@@ -1063,10 +1337,21 @@ class Robot:
 
     def _enter_sync_drive(self):
         """同步驾驶初始化。"""
+        self._sync_drive_start = time.ticks_ms()  # P3-27: 记录启动时间
         print("SYNC_DRIVE: master + slave synchronized")
 
     def _mode_sync_drive(self):
-        """同步驾驶：计算控制量 → 发送 SYNC_MOVE → 自身执行。"""
+        """同步驾驶：计算控制量 → 发送 SYNC_MOVE → 自身执行。
+        P3-27: 增加运行时间限制（10秒后自动停止），防止无限前进。
+        """
+        SYNC_DRIVE_MAX_RUNTIME_MS = 10000  # 最大运行时间 10 秒
+
+        # 检查是否超时
+        if time.ticks_diff(time.ticks_ms(), self._sync_drive_start) > SYNC_DRIVE_MAX_RUNTIME_MS:
+            print("[SYNC_DRIVE] Max runtime reached, stopping")
+            self.emergency_stop()
+            return
+
         vx = 0.5
         vy = 0.0
         wz = 0.0

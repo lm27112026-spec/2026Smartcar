@@ -30,7 +30,8 @@ def _ticker_handler(t):
         print("[key] ticker running (PIT1)")
 
 _pit = ticker(1)  # PIT1: 与 motor.py enc_ticker 共用同一 PIT，运行时永不停机
-_pit.capture_list(key)
+# 注意：不将 key 加入 capture_list — robot.py 主循环手动 capture() 是唯一数据源
+# 消除 ticker + 手工双重 capture() 冲击 KEY_HANDLER 内部状态机的根因
 _pit.callback(_ticker_handler)
 _pit.start(SCAN_PERIOD_MS)
 

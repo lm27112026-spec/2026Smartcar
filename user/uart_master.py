@@ -55,6 +55,19 @@ class MasterBT:
         print("MasterBT: POS_ADJ failed after 3 attempts")
         return False
 
+    def read_response_ok(self):
+        """非阻塞检查从机是否回复 POS_OK（使用 read() 避免 readline 阻塞）。
+
+        返回:
+            True  - 收到 POS_OK
+            False - 尚无有效应答（调用方应稍后重试）
+        """
+        while self._uart.any():
+            data = self._uart.read()
+            if data and b"POS_OK" in data:
+                return True
+        return False
+
     def send_pos_adjust_async(self, vx, vy, wz):
         """发送 POS_ADJ 但不等待应答（测试用，发送后即忘）。"""
         cmd = "POS_ADJ:{:.3f},{:.3f},{:.3f}\r\n".format(vx, vy, wz)
