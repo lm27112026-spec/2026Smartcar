@@ -40,7 +40,8 @@ class CascadeController:
         self._last_time = time.ticks_ms()
         _ = get_encoder_counts()
         # IMU 角速度闭环初始化（确保 update_angle 首次调用建立基准）
-        d = imu.read()
+        # 使用 imu.get() 读取 Ticker 自动采集的缓冲区（非阻塞）
+        d = imu.get()
         update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
         reset_ang_vel_pid()
 
@@ -54,11 +55,12 @@ class CascadeController:
         now_ms = time.ticks_ms()
         dt = time.ticks_diff(now_ms, self._last_time) * 0.001
         self._last_time = now_ms
-        if dt > DT_CLAMP:
+        if dt > DT_CLAMP or dt <= 0:
             dt = DT_FALLBACK
 
         # ── IMU 角速度更新（供内环角速度闭环使用）──
-        d = imu.read()
+        # 使用 imu.get() 读取 Ticker 自动采集的缓冲区（非阻塞，不会卡死）
+        d = imu.get()
         update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
         actual_wz_dps = get_angular_velocity()
 

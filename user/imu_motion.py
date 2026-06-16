@@ -62,6 +62,15 @@ print("gyro offset: gx={:.2f}  gy={:.2f}  gz={:.2f}".format(
     gyro_offset_x, gyro_offset_y, gyro_offset_z))
 
 # ============================================================
+#  IMU Ticker 自动采集（PIT3，不与 key/enc/watchdog 冲突）
+#  文档推荐方式：Ticker 绑定 capture_list，主循环用 imu.get() 读缓冲区
+# ============================================================
+from smartcar import ticker as _imu_ticker_cls
+_imu_pit = _imu_ticker_cls(3)   # PIT3：不与 key(PIT0)/enc(PIT1)/wdg(PIT2) 冲突
+_imu_pit.capture_list(imu)
+_imu_pit.start(10)               # 10ms 采集周期 = 100Hz
+
+# ============================================================
 #  二、姿态角解算（互补滤波）
 # ============================================================
 

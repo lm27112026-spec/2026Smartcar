@@ -14,35 +14,58 @@ key.py - 按键驱动模块
 
 from smartcar import ticker
 from seekfree import KEY_HANDLER
+import machine
 
 SCAN_PERIOD_MS = 10
 
 key = KEY_HANDLER(SCAN_PERIOD_MS)
 
-ticker_flag = False
-_ticker_once = False
+# 按键采集由主循环直接调用 key.capture() 驱动（详见 robot.py run()），
+# 不再依赖 PIT ISR，因为 PIT0 被 MicroPython 系统定时器占用，
+# PIT1 被 enc_ticker 共享，均不适宜独占。
+#
+# KEY_HANDLER 消抖在 3-10ms 的主循环周期下稳定工作。清除 debug 打印后
+# 主循环迭代足够快，不存在消抖超时问题。
 
-def _ticker_handler(t):
-    global ticker_flag, _ticker_once
-    ticker_flag = True
-    if not _ticker_once:
-        _ticker_once = True
-        print("[key] ticker running (PIT1)")
+# ════════════════════════════════════════════════════════
+#  PIT2 — 独立硬件看门狗（不与任何模块共用）
+# ════════════════════════════════════════════════════════
+# 当主循环挂死时，PIT1 可能被 enc_ticker 接管，所以看门狗
+# 不能依赖 PIT1。
+# PIT0: MicroPython 系统定时器
+# PIT1: motor.py enc_ticker
+# PIT2: 本看门狗独占
+# PIT3: imu_motion.py IMU 自动采集 ticker
+#
+# 连续 3 秒未喂狗 → machine.reset() 硬复位 MCU。
+# ISR 中调用 machine.reset() 只是写硬件复位寄存器，安全无分配。
+_WWDG_CNT = 0
+_WWDG_THRESHOLD = 300   # 300 ticks × 10ms = 3s
 
-_pit = ticker(1)  # PIT1: 与 motor.py enc_ticker 共用同一 PIT，运行时永不停机
-# 注意：不将 key 加入 capture_list — robot.py 主循环手动 capture() 是唯一数据源
-# 消除 ticker + 手工双重 capture() 冲击 KEY_HANDLER 内部状态机的根因
-_pit.callback(_ticker_handler)
-_pit.start(SCAN_PERIOD_MS)
+def _wwdg_isr(t):
+    global _WWDG_CNT
+    _WWDG_CNT += 1
+    if _WWDG_CNT >= _WWDG_THRESHOLD:
+        machine.reset()
+
+_WWDG_PIT = ticker(2)  # PIT2：仅供看门狗专用
+_WWDG_PIT.callback(_wwdg_isr)
+_WWDG_PIT.start(SCAN_PERIOD_MS)
+
+
+def pet_watchdog():
+    """主循环喂狗 — 每帧调用一次。
+    若主循环（含 _dispatch_mode）卡住超过 3 秒，PIT3 ISR 触发 hard reset。"""
+    global _WWDG_CNT
+    _WWDG_CNT = 0
 
 KEY_NAMES = ["KEY1", "KEY2", "KEY3", "KEY4"]
 
 
 def capture():
-    if ticker_flag:
-        key.capture()
-        return True
-    return False
+    """采集按键状态。由主循环或独立脚本调用，驱动 KEY_HANDLER 消抖状态机。"""
+    key.capture()
+    return True
 
 
 def read_keys():
@@ -84,5 +107,5 @@ def wait_any_key(timeout_ms=0):
 
 
 def stop():
-    """停止按键扫描 ticker（程序退出时调用，解除对 REPL 的干扰）。"""
-    _pit.stop()
+    """停止按键扫描（无 PIT ticker 需要停止，保留兼容 main.py 调用）。"""
+    pass
