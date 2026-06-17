@@ -1,12 +1,19 @@
 """
-main.py — UWB跟随 + 视觉追踪集成
+main.py — UWB跟随 + LED双灯视觉追踪集成（按键控制版）
 【流程】
   1. 默认启动 UWB 跟随（uwb_tracker.UWBFollower）— 闭环航向纠偏
-  2. 后台轮询摄像头 UART7 → 滑动窗口检测到物品 → 切换视觉追踪
-  3. 视觉追踪（Kalman + 级联 PID）逼近至 10cm 自动停车
+  2. 后台轮询摄像头 UART7 → 滑动窗口检测到双灯 → 切换视觉追踪
+  3. 视觉追踪（Kalman + 级联 PID）逼近至目标像素距离 → 自动停车
   4. SW2 (D9) 拨码开关全程可强制退出
-【依赖】uwb_tracker.py, kalman_filter.py, control.py, motor.py, imu_motion.py
-【注意】不依赖 key.py（避免 PIT3 与 IMU ticker 冲突，SW2 轮询替代看门狗）
+【摄像头协议】LED.py 双灯追踪（UART7, 115200）
+  AA [EX_H EX_L] [EY_H EY_L] [DIST_H DIST_L] [ROLL_H ROLL_L] BB
+  int16 大端序 ×10，丢失目标时全零帧
+【按键控制】
+  KEY1 (C8) → UWB 模式         LED 常亮
+  KEY2 (C9) → 视觉追踪模式       LED 快闪 (~2.5Hz)
+  KEY3 (C14)→ 停车状态          LED 慢闪 (~1Hz)
+【依赖】uwb_tracker.py, kalman_filter.py, control.py, motor.py, imu_motion.py, key.py
+【PIT 分配】PIT0=系统, PIT1=编码器(motor), PIT2=看门狗(key), PIT3=IMU
 """
 
 import gc, time, math
@@ -15,6 +22,7 @@ from motor import (stop_all, enc_ticker,
                    get_encoder_counts, reset_encoder_filter, reset_wheel_pi)
 import imu_motion
 from imu_motion import update_angle, reset_ang_vel_pid
+from key import capture, key_triggered, pet_watchdog
 
 # ═══════════════════════════════════════════════════════════════
 #  常量
@@ -30,7 +38,7 @@ CAM_FRAME_TAIL  = 0xBB
 CAM_FRAME_LEN   = 10
 CAM_TIMEOUT_MS  = 500     # 视觉追踪数据超时（ms）
 
-TARGET_DIST_CM  = 10      # 视觉追踪停车距离（cm）
+TARGET_DIST_PX  = 100     # 视觉追踪停车像素距离 — LED.py 协议用（越大=越近，需实车标定）
 WINDOW_SIZE     = 8       # 摄像头中断判定滑动窗口大小
 WINDOW_THRESHOLD = 5      # 窗口内有效帧数阈值
 
@@ -139,29 +147,35 @@ class CamRingBuffer:
 # ═══════════════════════════════════════════════════════════════
 
 def parse_camera_frame(buf):
-    """解析 AA..BB 10 字节帧。返回 (x_cm, y_cm, label, detected) 或 None。
+    """解析 AA..BB 10 字节帧（LED.py 双灯追踪协议）。
+    返回 (ex, ey, dist, roll) 或 None。
 
-    协议: AA [X_H X_L] [Y_H Y_L] [LABEL_H LABEL_L] [STATUS_H STATUS_L] BB
-          int16 大端序，÷10 恢复实际 cm 值
+    协议: AA [EX_H EX_L] [EY_H EY_L] [DIST_H DIST_L] [ROLL_H ROLL_L] BB
+          int16 大端序，÷10 恢复实际值
+          ex   = 双灯中心横向像素偏移
+          ey   = 双灯中心纵向像素偏移
+          dist = 双灯间像素距离（表征远近）
+          roll = 面积比推算倾角（°）
     """
     if len(buf) < 10 or buf[0] != 0xAA or buf[9] != 0xBB:
         return None
 
-    raw_x      = (buf[1] << 8) | buf[2]
-    raw_y      = (buf[3] << 8) | buf[4]
-    raw_label  = (buf[5] << 8) | buf[6]
-    raw_status = (buf[7] << 8) | buf[8]
+    raw_ex   = (buf[1] << 8) | buf[2]
+    raw_ey   = (buf[3] << 8) | buf[4]
+    raw_dist = (buf[5] << 8) | buf[6]
+    raw_roll = (buf[7] << 8) | buf[8]
 
-    x_cm     = (raw_x if raw_x < 32768 else raw_x - 65536) / 10.0
-    y_cm     = (raw_y if raw_y < 32768 else raw_y - 65536) / 10.0
-    detected = (raw_status == 1)
+    ex   = (raw_ex   if raw_ex   < 32768 else raw_ex   - 65536) / 10.0
+    ey   = (raw_ey   if raw_ey   < 32768 else raw_ey   - 65536) / 10.0
+    dist = (raw_dist if raw_dist < 32768 else raw_dist - 65536) / 10.0
+    roll = (raw_roll if raw_roll < 32768 else raw_roll - 65536) / 10.0
 
-    return (x_cm, y_cm, raw_label, detected)
+    return (ex, ey, dist, roll)
 
 
-def is_valid_target(x_cm, y_cm, detected):
-    """有效目标条件：status=1 且坐标不全为零。"""
-    return detected and not (x_cm == 0.0 and y_cm == 0.0)
+def is_valid_target(ex, ey, dist, roll):
+    """有效目标：数据不全为零（LED.py 丢失目标时发送全零帧）。"""
+    return not (ex == 0.0 and ey == 0.0 and dist == 0.0 and roll == 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -245,11 +259,15 @@ def _create_mode_manager():
     # ── 停车模式 ──────────────────────────────────────────
 
     def enter_stopped():
-        print("\n>>> MODE: STOPPED (target reached {:d}cm) <<<".format(TARGET_DIST_CM))
+        print("\n>>> MODE: STOPPED (target reached) <<<")
         stop_all()
         led.value(1)
 
-    return enter_uwb, exit_uwb, enter_visual, exit_visual, enter_stopped, res
+    def exit_stopped():
+        """离开停车模式（当前无需清理，仅保持架构对称）。"""
+        pass
+
+    return enter_uwb, exit_uwb, enter_visual, exit_visual, enter_stopped, exit_stopped, res
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -259,7 +277,8 @@ def _create_mode_manager():
 def main():
     (enter_uwb, exit_uwb,
      enter_visual, exit_visual,
-     enter_stopped, res) = _create_mode_manager()
+     enter_stopped, exit_stopped,
+     res) = _create_mode_manager()
 
     state    = STATE_UWB
     loop_cnt = 0
@@ -269,9 +288,10 @@ def main():
     enter_uwb()
 
     print("=" * 50)
-    print("RT1021 — UWB Follow + Visual Track")
+    print("RT1021 — UWB Follow + LED Visual Track")
     print("  UART0 : UWB 基站数据 (115200)")
-    print("  UART7 : 摄像头检测数据 (115200)")
+    print("  UART7 : LED.py 双灯追踪 (115200)")
+    print("  KEY1/2/3 : UWB / VISUAL / STOP")
     print("  SW2   : 强制退出")
     print("=" * 50)
 
@@ -279,9 +299,48 @@ def main():
         while True:
             now = time.ticks_ms()
 
+            # ─── 看门狗喂狗 + 按键扫描 ───
+            capture()
+            pet_watchdog()
+
+            # ─── 按键模式切换（集中处理，任意状态可触发）───
+            if key_triggered(1):           # KEY1 (C8) → UWB
+                if state != STATE_UWB:
+                    print("\n[KEY1] → UWB_FOLLOW")
+                    if state == STATE_VISUAL:
+                        exit_visual()
+                    enter_uwb()
+                    state = STATE_UWB
+                    loop_cnt = 0
+                    continue
+            if key_triggered(2):           # KEY2 (C9) → VISUAL
+                if state != STATE_VISUAL:
+                    print("\n[KEY2] → VISUAL_TRACK")
+                    if state == STATE_UWB:
+                        exit_uwb()
+                    enter_visual()
+                    state = STATE_VISUAL
+                    loop_cnt = 0
+                    continue
+            if key_triggered(3):           # KEY3 (C14) → STOPPED
+                if state != STATE_STOPPED:
+                    print("\n[KEY3] → STOPPED")
+                    if state == STATE_UWB:
+                        exit_uwb()
+                    elif state == STATE_VISUAL:
+                        exit_visual()
+                    enter_stopped()
+                    state = STATE_STOPPED
+                    loop_cnt = 0
+                    continue
+
             # ─── SW2 检测（每次迭代）───
             if check_sw2():
                 print("\n[SW2] Exit requested")
+                if state == STATE_UWB:
+                    exit_uwb()
+                elif state == STATE_VISUAL:
+                    exit_visual()
                 break
 
             # ════════════════════════════════════════════════
@@ -306,8 +365,8 @@ def main():
                     if frame:
                         parsed = parse_camera_frame(frame)
                         if parsed:
-                            x_cm, y_cm, label, detected = parsed
-                            hit = 1 if is_valid_target(x_cm, y_cm, detected) else 0
+                            ex, ey, dist, roll = parsed
+                            hit = 1 if is_valid_target(ex, ey, dist, roll) else 0
                             res['window'].append(hit)
                             if len(res['window']) > WINDOW_SIZE:
                                 res['window'].pop(0)
@@ -335,6 +394,7 @@ def main():
                     exit_visual()
                     enter_uwb()
                     state = STATE_UWB
+                    loop_cnt = 0
                     continue
 
                 # 读取摄像头 UART7
@@ -348,11 +408,11 @@ def main():
                 if frame:
                     parsed = parse_camera_frame(frame)
                     if parsed:
-                        x_cm, y_cm, label, detected = parsed
+                        ex, ey, dist, roll = parsed
                         res['last_data']    = now
                         res['timeout_done'] = False
 
-                        is_valid = is_valid_target(x_cm, y_cm, detected)
+                        is_valid = is_valid_target(ex, ey, dist, roll)
                         res['window'].append(1 if is_valid else 0)
                         if len(res['window']) > WINDOW_SIZE:
                             res['window'].pop(0)
@@ -363,7 +423,7 @@ def main():
 
                         if res['tracking']:
                             # 卡尔曼滤波 → 级联 PID → 驱动电机
-                            ex_f, dist_f, roll_f = res['cam_kf'].update(x_cm, y_cm, 0.0)
+                            ex_f, dist_f, roll_f = res['cam_kf'].update(ex, dist, roll)
                             vx_out, vy_out, wz_out, speeds, dt = res['cam_ctrl'].step(
                                 ex_f, dist_f, roll_f, True)
 
@@ -371,15 +431,17 @@ def main():
                             print_cnt += 1
                             if print_cnt >= 10:
                                 print_cnt = 0
-                                print("[VISUAL] dist={:.1f}cm | vx={:.3f} vy={:.3f} wz={:.3f} dt={:.0f}ms".format(
-                                    dist_f, vx_out, vy_out, wz_out, dt * 1000))
+                                print("[VISUAL] ex={:.1f} dist={:.1f}px roll={:.1f}° | vx={:.3f} vy={:.3f} wz={:.3f} dt={:.0f}ms".format(
+                                    ex_f, dist_f, roll_f, vx_out, vy_out, wz_out, dt * 1000))
 
-                            # 到达 10cm → 停车
-                            if not math.isnan(dist_f) and dist_f <= TARGET_DIST_CM:
-                                print("[VISUAL] Target reached! dist={:.1f}cm → STOPPED".format(dist_f))
+                            # 到达目标 → 停车（LED.py 协议：dist 像素距离越大 = 越近）
+                            # TODO: 需实车标定停车阈值，当前用 TARGET_DIST_PX 占位
+                            if not math.isnan(dist_f) and dist_f >= TARGET_DIST_PX:
+                                print("[VISUAL] Target reached! dist={:.1f}px → STOPPED".format(dist_f))
                                 exit_visual()
                                 enter_stopped()
                                 state = STATE_STOPPED
+                                loop_cnt = 0
                                 continue
                         else:
                             # 无跟踪，输出零速度
@@ -390,8 +452,8 @@ def main():
                     if res['cam_ctrl']:
                         res['cam_ctrl'].step(0.0, 0.0, 0.0, False)
 
-                # 超时 500ms 无数据 → 退回 UWB
-                if not res['timeout_done']:
+                # 超时 500ms 无数据 → 退回 UWB（仅在已建立跟踪后生效，按键手动进入时不会误触发）
+                if not res['timeout_done'] and res['tracking']:
                     if time.ticks_diff(now, res['last_data']) > CAM_TIMEOUT_MS:
                         res['timeout_done'] = True
                         stop_all()
@@ -415,7 +477,9 @@ def main():
             #  状态 ③ — 停车
             # ════════════════════════════════════════════════
             elif state == STATE_STOPPED:
-                pass   # 仅等待 SW2 退出
+                # LED 慢闪（~1Hz，区别于 UWB 常亮 / VISUAL 快闪）
+                if loop_cnt % 50 == 0:
+                    led.toggle()
 
             loop_cnt += 1
             time.sleep_ms(10)
@@ -451,7 +515,7 @@ def main():
         # 停止编码器 ticker（PIT1），防止 ISR 干扰 REPL
         pause_encoder_ticker()
 
-        # NOTE：不导入 key.py，故无 key ticker 需停止
+        # NOTE：key.py 看门狗(PIT2) 由 machine.reset() 回收，无需手动停止
         # imu_motion.py 的 PIT3 ticker 由 REPL 复位自动回收
 
         time.sleep_ms(50)
@@ -475,3 +539,4 @@ def pause_encoder_ticker():
 # ═══════════════════════════════════════════════════════════════
 
 main()
+
