@@ -4,9 +4,9 @@ from machine import UART
 # ==========================================
 # 1. 空间标定参数 (必须根据机械结构实际测量)
 # ==========================================
-H = 15.0                  # 摄像头镜头中心距离地面的垂直高度 (cm)
-Y_OFFSET = 5.0            # 摄像头距离推杆中点的物理纵向距离 (cm)
-PITCH_ANGLE = 20.0        # 摄像头向下的俯角 (度)
+H = 20.3# 摄像头镜头中心距离地面的垂直高度 (cm)
+Y_OFFSET = 4.0            # 摄像头距离推杆中点的物理纵向距离 (cm)
+PITCH_ANGLE = 15.0        # 摄像头向下的俯角 (度)
 theta = math.radians(PITCH_ANGLE) # 转换为弧度
 
 # ==========================================
@@ -22,7 +22,7 @@ sensor.set_auto_gain(False)
 sensor.set_auto_whitebal(False)
 
 # --- 串口初始化 ---
-uart = UART(2, baudrate=115200)
+uart = UART(7, baudrate=115200)
 SCALE = 10  # 串口精度：乘以10保留1位小数
 
 # 加载模型到帧缓冲区(加速)

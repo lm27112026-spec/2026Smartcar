@@ -65,11 +65,71 @@ print("gyro offset: gx={:.2f}  gy={:.2f}  gz={:.2f}".format(
 # ============================================================
 #  IMU Ticker 自动采集（PIT3，不与 key/enc/watchdog 冲突）
 #  文档推荐方式：Ticker 绑定 capture_list，主循环用 imu.get() 读缓冲区
+#  注意：imu.get() 在 ticker 停止/缓冲区过期时可能回退到 SPI 直读，
+#        而 SPI 驱动在事务期间屏蔽全局中断。详见 main.py 的 ticker 管理。
 # ============================================================
 from smartcar import ticker as _imu_ticker_cls
-_imu_pit = _imu_ticker_cls(3)   # PIT3：不与 key(PIT0)/enc(PIT1)/wdg(PIT2) 冲突
+_imu_pit = _imu_ticker_cls(3)   # PIT3：不与 PIT0(系统)/PIT1(编码器) 冲突
+                                  # 看门狗已改用 machine.WDT()，不占用 PIT
 _imu_pit.capture_list(imu)
 _imu_pit.start(10)               # 10ms 采集周期 = 100Hz
+
+
+def stop_imu_ticker():
+    """停止 PIT3 IMU 自动采集 — 在 VISUAL_TRACK 等模式下切换到手动 imu.read()"""
+    global _imu_pit
+    try:
+        _imu_pit.stop()
+    except Exception:
+        pass
+
+
+def start_imu_ticker():
+    """恢复 PIT3 IMU 自动采集（10ms 周期）"""
+    global _imu_pit
+    try:
+        _imu_pit.start(10)
+    except Exception:
+        pass
+
+
+def imu_read_safe():
+    """安全读取 IMU 原始数据。
+    封装 imu.read() 的 try-except，返回 None 表示读取失败。
+    注意：imu.read() 内部做 SPI 事务。若 SPI 被电机噪声破坏，
+          smartcar 库驱动在 __disable_irq() 后陷入轮询死等，
+          此 try-except 无法捕获。此时由 key.py 的 machine.WDT()
+          硬件看门狗在 3s 后强制复位 MCU（不受全局中断关闭影响）。
+    """
+    try:
+        d = imu.read()
+        if d is None or len(d) < 6:
+            return None
+        # 检查是否有无效值
+        for v in d:
+            if v is None:
+                return None
+        return d
+    except Exception:
+        return None
+
+
+def imu_get_safe():
+    """安全读取 IMU 缓冲区数据。
+    封装 imu.get() 的 try-except，返回 None 表示读取失败。
+    注意：imu.get() 在 ticker 停止时可能回退到 SPI 直读（同 imu.read()），
+          此时同样可能触发 __disable_irq() 后挂死。由 machine.WDT() 恢复。
+    """
+    try:
+        d = imu.get()
+        if d is None or len(d) < 6:
+            return None
+        for v in d:
+            if v is None:
+                return None
+        return d
+    except Exception:
+        return None
 
 # ============================================================
 #  二、姿态角解算（互补滤波）
@@ -216,11 +276,11 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
     # 清空残余值
     for _ in range(5):
         encoder_rf.get(); encoder_lf.get(); encoder_lb.get(); encoder_rb.get()
-        d = imu.read()
+        imu.get()
         time.sleep_ms(5)
 
     # 锁定起始航向
-    d = imu.read()
+    d = imu.get()
     update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
     target_heading = yaw
 
@@ -254,7 +314,7 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
             return True
 
         # IMU 更新航向
-        d = imu.read()
+        d = imu.get()
         update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
         # P 控制
@@ -276,5 +336,7 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
     pit_enc.stop()
     omni_drive(0, 0, 0)
     return False
+
+
 
 
