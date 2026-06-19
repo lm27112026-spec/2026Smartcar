@@ -1,8 +1,9 @@
 # RT1021 UWB 跟随 + 视觉追踪系统技术文档
 
-> **版本**：v1.0  
+> **版本**：v2.0  
 > **平台**：RT1021 (NXP i.MX RT1021) + MicroPython  
-> **日期**：2026-06-16  
+> **日期**：2026-06-19  
+> **主要变更**：视觉追踪子系统更新为 `cam_follow.py` 的 PID 双通道 + 三态状态机架构  
 
 ---
 
@@ -34,7 +35,7 @@
 | **UWB 跟随** | 通过 UART0 接收基站 TWR 数据，跟随指定锚点（ID="8834"）移动，边走边实时航向纠偏 |
 | **摄像头后台轮询** | 在 UWB 跟随期间，后台持续读取 UART7 的 OpenMV 摄像头数据，滑动窗口判定是否检测到目标物品 |
 | **模式切换** | 摄像头连续确认检测到物品后，立即中断 UWB 跟随，切换为视觉追踪模式 |
-| **视觉逼近停车** | 视觉追踪通过卡尔曼滤波 + 级联 PID 控制，逼近物品至 **10cm** 时自动停车 |
+| **视觉逼近停车** | 视觉追踪通过双通道 PID 控制（横向居中 + 距离保持），逼近物品至 **10cm** 时自动停车 |
 | **SW2 安全退出** | 全程通过拨码开关 SW2 (D9) 可实现强制退出，所有电机停转、外设释放 |
 
 ### 1.2 核心文件依赖关系
@@ -42,8 +43,8 @@
 ```
 main.py (主控，状态机)
 ├── uwb_tracker.py     ← UWB 跟随控制器（类 UWBFollower，重写自 uwb_following.py）
-├── kalman_filter.py   ← 卡尔曼滤波器（视觉数据平滑）
-├── control.py         ← 级联 PID 控制器（视觉追踪闭环）
+├── cam_data.py        ← 摄像头数据接收与协议解析（CamDataReceiver）
+├── cam_follow.py      ← 视觉追踪独立实现（PID 控制，状态机）
 ├── motor.py           ← 电机/编码器硬件抽象层
 ├── imu_motion.py      ← IMU 姿态解算 + 角速度闭环
 ├── pid.py             ← PID 控制器基类
@@ -110,12 +111,12 @@ main.py (主控，状态机)
 ├──────────────────────────────────────────┤
 │  控制层                                   │
 │  - uwb_tracker.py (UWBFollower 类)       │
-│  - control.py (CascadeController 级联PID) │
-│  - kalman_filter.py (三通道卡尔曼滤波)     │
+│  - cam_follow.py (PID 视觉追踪 + 状态机)  │
 ├──────────────────────────────────────────┤
 │  信号处理层                               │
 │  - imu_motion.py (互补滤波 + 角速度闭环)   │
 │  - pid.py (PID 基类含积分抗饱和)          │
+│  - cam_data.py (摄像头数据接收与解析)     │
 ├──────────────────────────────────────────┤
 │  硬件抽象层                               │
 │  - motor.py (PWM/编码器/闭环驱动)         │
@@ -131,18 +132,19 @@ main.py (主控，状态机)
 | `main.py` | `main()`, `_create_mode_manager()` | 主入口、状态机、模式切换 |
 | `main.py` | `CamRingBuffer` | 环形缓冲区，处理 UART 粘包/断包 |
 | `main.py` | `parse_camera_frame()` | 解析 AA..BB 10 字节帧 |
-| `main.py` | `is_valid_target()` | 判定有效目标 |
+| `main.py` | `is_valid_target()` | 判定有效目标（非全零帧 = 有效） |
 | `main.py` | `check_sw2()` | SW2 消抖检测 |
 | `uwb_tracker.py` | `UWBFollower` | UWB 跟随完整控制器 |
 | `uwb_following.py` | (独立脚本) | 旧版 UWB 跟随，可独立运行 |
-| `kalman_filter.py` | `KalmanFilter1D` | 一维卡尔曼滤波器 |
-| `kalman_filter.py` | `CameraKalmanFilter` | 三通道视觉滤波 (ex/dist/roll) |
-| `control.py` | `CascadeController` | 级联 PID (3 位置环 → 内环速度) |
+| `cam_data.py` | `CamDataReceiver` | 摄像头数据接收器（字节缓冲 + AA..BB 帧解析） |
+| `cam_data.py` | `x_to_cm()` | 横向偏移 mm → cm 转换 |
+| `cam_data.py` | `y_to_distance()` | 纵向坐标 → 实际距离转换（Y=0→29cm 参考） |
+| `cam_follow.py` | (独立脚本) | 视觉追踪独立运行版（PID 双通道 + 三态状态机） |
 | `motor.py` | `omni_drive_closed_loop()` | 四轮全向闭环驱动（前馈+PI反馈） |
 | `motor.py` | `stop_all()` | 急停 |
 | `imu_motion.py` | `update_angle()` | 互补滤波姿态解算 |
 | `imu_motion.py` | `angular_velocity_control()` | 角速度 PID 闭环 |
-| `pid.py` | `PID` | 增量式 PID（含积分抗饱和） |
+| `pid.py` | `PID` | 增量式 PID（含积分抗饱和、输出限幅、微分低通） |
 
 ---
 
@@ -203,19 +205,29 @@ while True:
     #  状态 ② — 视觉追踪
     # ═══════════════════════════════════
     elif state == STATE_VISUAL:
-        frame = read_camera()
-        if frame and valid:
-            # 卡尔曼滤波 → 级联 PID → 电机驱动
-            ex_f, dist_f, roll_f = kf.update(x, y, 0)
-            vx, vy, wz = ctrl.step(ex_f, dist_f, roll_f, True)
-            if dist_f <= 10cm:
+        data = recv.read()              # CamDataReceiver 非阻塞读取
+        if data and data['is_target']:
+            # 坐标转换 → 误差计算
+            x_cm = x_to_cm(data['x'])
+            dist = y_to_distance(data['y'])
+            x_error = x_cm
+            y_error = dist - TARGET_DIST_CM
+            # 双通道 PID
+            fwd = PID_Y.compute(y_error, 0, DT)
+            lat = PID_X.compute(x_error, 0, DT)
+            fwd, lat = clamp_speed(fwd, lat)
+            # 到达判定 → 停车
+            if abs(y_error) < STOP_DIST_CM and abs(x_cm) < 10:
                 exit_visual()
                 enter_stopped()
                 state = STATE_STOPPED
-        # 超时 500ms 无数据 → 退回 UWB
-        if timeout > 500ms:
+            else:
+                # 编码器闭环驱动
+                omni_drive_closed_loop(fwd, lat, 0, actual_speeds, DT)
+        # 目标丢失 > 500ms → LOST 状态
+        elif timeout_ms > 500:
             exit_visual()
-            enter_uwb()
+            enter_uwb()                 # 退回 UWB 跟随
             state = STATE_UWB
 
     # ═══════════════════════════════════
@@ -244,8 +256,8 @@ while True:
                     │          │   或丢失目标
                     └─────┬─────┘
                           │
-                  距离 ≤ 10cm
-                          │
+      距离 < 10cm±5cm
+                           │
                           ↓
                     ┌──────────┐
                     │  停车     │
@@ -338,38 +350,63 @@ speed
 
 ### 6.1 摄像头帧协议
 
-OpenMV 摄像头通过 UART7 发送固定的 10 字节数据帧：
+OpenMV 摄像头通过 UART7 发送固定的 10 字节数据帧，由 `cam_data.py` 的 `CamDataReceiver` 负责接收与解析：
 
 ```
 ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
-│  AA  │ X_H  │ X_L  │ Y_H  │ Y_L  │LB_H  │LB_L  │ST_H  │ST_L  │  BB  │
+│  AA  │ X_H  │ X_L  │ Y_H  │ Y_L  │ FLAG │  ID  │  B6  │  B7  │  BB  │
 │(0xAA)│      │      │      │      │      │      │      │      │(0xBB)│
 └──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
-│      │← int16 大端序 →│← int16 大端序 →│← 目标ID →│← 状态 →│      │
-│      帧头   X(cm)×10    Y(cm)×10       Label      Status   帧尾  │
-│                                           Status: 1=识别成功     │
-│                                                    0=识别失败     │
-│                                           接收端 ÷10 恢复 cm     │
-└─────────────────────────────────────────────────────────────────┘
+│      │← int16 大端序 →│← int16 大端序 →│ 标志 │ 标识 │← 附加 →│      │
+│      帧头   X (mm)×10    Y (cm)×10     FLAG   ID    B6 B7   帧尾  │
+│                                                                     │
+│  X 字段：横向偏移，单位 mm，÷10 后为 mm，再 ×0.1 → cm              │
+│  Y 字段：纵向坐标，单位 cm，Y=0 对应实际距离 29cm（参考原点）        │
+│           Y>0 表示更近，Y<0 表示更远                                 │
+│  FLAG：0x02 或 0x03 = 检测到目标，0x00 = 目标丢失                   │
+│  ID：  目标标识符（单字节）                                          │
+│  B6/B7：附加数据字段（待定）                                         │
+│                                                                     │
+│  接收端转换：                                                        │
+│    x_cm = x_to_cm(x)           # mm → cm (÷10)                     │
+│    dist = y_to_distance(y)     # y → 实际距离 = 29.0 - y            │
+│    is_target = (flag != 0) and not (x==0 and y==0)                  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 环形缓冲区 (CamRingBuffer)
+### 6.2 数据接收器 (CamDataReceiver)
 
-为处理 UART 通信中常见的粘包/断包问题，设计了 256 字节的环形缓冲区：
+`cam_data.py` 中的 `CamDataReceiver` 类负责 UART7 数据的接收与帧解析。与 `main.py` 中仅用于后台轮询的 `CamRingBuffer` 不同，`CamDataReceiver` 是一个完整的帧级解析器：
 
 ```python
-class CamRingBuffer:
-    def feed(data):      # 追加原始字节
-    def get_frame():     # 提取第一个完整 AA..BB 帧 → bytes(10) 或 None
-    def clear():         # 清空缓冲区
+class CamDataReceiver:
+    # 初始化 UART7 (115200 bps)
+    recv = CamDataReceiver(uart_id=7)
+
+    # 内部使用动态 bytearray 缓冲 → find(0xAA) → 校验 0xBB 帧尾
+    # 非阻塞读取返回完整帧 dict 或 None
+    data = recv.read()
+    # data = {'x': -12.5, 'y': 15.0, 'flag': 0x02, 'id': 1, 'is_target': True}
+
+    # 阻塞读取（含超时）
+    data = recv.read_block(timeout_ms=100)
 ```
 
 **工作原理**：
-1. 主循环每 5 次迭代 (~50ms) 从 UART7 批量读取数据
-2. 每次最多消费 4 次 `UART.read()`，防止数据积压
-3. 将字节喂入 `CamRingBuffer.feed()`
-4. 调用 `get_frame()` 查找 `0xAA` 起始、`0xBB` 结尾的完整帧
-5. 假帧头（AA 后第 9 字节不是 BB）自动跳过
+1. 调用 `read()` 时，先从 `UART.read()` 读取原始字节追加到内部 `bytearray` 缓冲区
+2. 在缓冲区中查找 `0xAA` 帧头，校验第 9 字节是否为 `0xBB`
+3. 假帧头（第 9 字节 ≠ 0xBB）自动跳过，继续搜索
+4. 解析通过 `_parse_frame()` 完成：提取 X/Y int16、FLAG、ID、B6、B7
+5. 返回标准字典 `{x, y, flag, id, b6, b7, is_target}`，或 `None`（无完整帧）
+
+**CamRingBuffer vs CamDataReceiver 对比**：
+| 特性 | CamRingBuffer (main.py 后台轮询) | CamDataReceiver (cam_follow.py) |
+|---|---|---|
+| 缓冲方式 | 256 字节固定环形缓冲区 (head/tail) | 动态 bytearray（自动扩缩） |
+| 帧解析 | 外部调用 `parse_camera_frame()` | 内置 `_parse_frame()`，返回 dict |
+| 目标判定 | 外部调用 `is_valid_target()` | 内置 `is_target` 字段（FLAG + 非零检测） |
+| 统计 | 无 | 内置 `frame_count` / `target_count` / `lost_count` / `error_count` |
+| 阻塞读取 | 不支持 | `read_block(timeout_ms)` |
 
 ### 6.3 滑动窗口判定机制
 
@@ -388,9 +425,9 @@ WINDOW_THRESHOLD = 5    # 确认阈值（≥5 帧有效才切换）
                      有效帧数 = 5 ≥ 阈值5 → 触发切换
 ```
 
-**有效帧条件**（`is_valid_target()`）：
-- `status == 1`（摄像头识别成功）
-- `x_cm ≠ 0` 或 `y_cm ≠ 0`（非全零无效帧）
+**有效帧条件**（`is_target` 字段，源自 `cam_data.py`）：
+- `FLAG != 0x00`（0x02 或 0x03，表示摄像头检测到目标）
+- 且非全零帧（`x ≠ 0` 或 `y ≠ 0`，排除无效数据）
 
 ### 6.4 模式切换时序
 
@@ -418,10 +455,10 @@ UWB 跟随运行中...
   │              │
   │              ▼
   │         enter_visual()
-  │           ├─ IMU 预热 (×5 帧)
-  │           ├─ CameraKalmanFilter() — 三通道卡尔曼
-  │           ├─ CascadeController() — 级联 PID
-  │           └─ 重置滑动窗口 + 计时器
+  │           ├─ IMU 预热 (×5 帧，从 PIT3 ticker 缓冲区读取)
+  │           ├─ PID_X / PID_Y 初始化（复用 pid.py 的 PID 类，设定增益与限幅）
+  │           ├─ 编码器接管（手动管理，enc_ticker 已停止）
+  │           └─ 重置滑动窗口 + 计时器 + 状态标志
   │              │
   │              ▼
   │         state = STATE_VISUAL
@@ -434,68 +471,190 @@ UWB 跟随运行中...
 
 ## 7. 视觉追踪子系统
 
-### 7.1 控制架构（级联 PID）
+视觉追踪由 `cam_follow.py` 实现，采用**双通道 PID 控制 + 三态状态机**架构。核心思想：横向保持目标居中（PID_X），纵向保持目标在设定距离（PID_Y），三态状态机处理正常跟随、到达停车、目标丢失三种场景。
+
+### 7.1 三态状态机
 
 ```
-摄像头原始数据 (x_cm, y_cm)
+                    ┌──────────┐
+         启动 ──────→│  LOST    │←─────────────────────┐
+                    │ (停车等待) │                      │
+                    └─────┬─────┘                      │
+                          │ 检测到目标 (is_target)       │
+                          ▼                             │
+                    ┌──────────┐   到达 10cm±5cm        │
+                    │ FOLLOW   │─────────────┐          │
+                    │ (PID控制) │              │          │
+                    └─────┬─────┘              ▼          │
+                          │ 目标丢失      ┌──────────┐    │
+                          │ > 500ms       │ STOPPED  │    │
+                          └─────────────→│ (停车等待) │    │
+                                         └─────┬─────┘    │
+                                               │ 目标移开  │
+                                               │ > 10cm    │
+                                               └───────────┘
+```
+
+| 状态 | 常量 | 行为 | 触发条件 |
+|---|---|---|---|
+| **FOLLOW** | `STATE_FOLLOW` | PID 控制跟随，实时纠偏 | 检测到目标（`is_target`） |
+| **STOPPED** | `STATE_STOPPED` | 停车等待 | `abs(y_error) < STOP_DIST_CM` 且 `abs(x_cm) < 10cm` |
+| **LOST** | `STATE_LOST` | 停车等待重新捕获 | `is_target == False` 持续 ≥ 500ms |
+
+### 7.2 数据流与坐标转换
+
+```
+CamDataReceiver.read()
         │
         ▼
-┌─────────────────────────────────┐
-│  三通道卡尔曼滤波                 │
-│  kf_ex   (横向偏差滤波)          │
-│  kf_dist (距离滤波)              │
-│  kf_roll (倾角滤波)              │
-│  输出: ex_f, dist_f, roll_f      │
-└──────────────┬──────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│  外环位置 PID (control.py)        │
-│  pid_ex   → vx (横向速度)        │
-│  pid_dist → vy (纵向速度)        │
-│  pid_roll → wz (旋转)            │
-│  限幅: vx/vy=±0.8, wz=±0.6      │
-└──────────────┬──────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│  内环速度闭环 (motor.py)          │
-│  omni_drive_closed_loop()        │
-│  前馈 + PI 反馈 → PWM 输出       │
-│  死区补偿: MIN_PWM_POS/NEG=5000 │
-└──────────────────────────────────┘
-               │
-               ▼
-      4 路电机 PWM 输出
+  data = {'x': mm, 'y': cm, 'is_target': bool, ...}
+        │
+        ▼
+  ┌─────────────────────────────────────┐
+  │ x_cm = x_to_cm(data['x'])          │  ← 横向偏移 mm → cm (÷10)
+  │ actual_dist = y_to_distance(data['y'])│  ← 纵向坐标 → 实际距离 (29.0 - y)
+  │                                     │
+  │ x_error = x_cm                       │  ← 横向误差（左负右正）
+  │ y_error = actual_dist - TARGET_DIST  │  ← 距离误差（正=太远，负=太近）
+  └─────────────────────────────────────┘
 ```
 
-### 7.2 目标停车判定
+**坐标系统约定**：
+- X > 0 → 目标在右侧，需向右平移（横向速度 +lat）
+- Y > 0 → 目标比 29cm 参考点更近
+- 实际距离 = `Y_REF_DISTANCE - y` = `29.0 - y`（cm）
+- 目标距离 10cm 时：`y = 29.0 - 10.0 = 19.0`（摄像头 Y 坐标约 19.0）
+
+### 7.3 双通道 PID 控制器
+
+采用 `pid.py` 的 `PID` 类（增量式，含积分抗饱和、输出限幅、微分低通滤波）。
+
+| 通道 | 用途 | KP | KI | KD | 积分限幅 | 输出限幅 |
+|---|---|---|---|---|---|---|
+| **PID_X** | 横向居中 | 0.025 | 0.010 | 0.005 | ±50 | ±1.0 |
+| **PID_Y** | 距离保持 | 0.040 | 0.010 | 0.0025 | ±50 | ±1.0 |
 
 ```python
-TARGET_DIST_CM = 10  # 视觉追踪停车距离 (cm)
+from pid import PID
 
-# 在 main.py 主循环中:
-if not math.isnan(dist_f) and dist_f <= TARGET_DIST_CM:
-    print("[VISUAL] Target reached! dist={:.1f}cm → STOPPED")
-    exit_visual()    # 紧急停车 + PID 重置
-    enter_stopped()  # stop_all() + LED 亮
+PID_X = PID(kp=0.025, ki=0.010, kd=0.005,
+            integral_limit=50, output_limit=1.0)
+PID_Y = PID(kp=0.040, ki=0.010, kd=0.0025,
+            integral_limit=50, output_limit=1.0)
+
+# 控制周期 20ms
+DT = 0.02
+
+# PID 计算（setpoint=0, measurement=error）
+fwd_speed = PID_Y.compute(y_error, 0, DT)   # 前后方向速度
+lat_speed = PID_X.compute(x_error, 0, DT)   # 横向速度
+```
+
+**PID.compute(setpoint, measurement, dt) 内部逻辑**：
+- `error = setpoint - measurement`（当 measurement=x_error 时，PID 输出与 error 同向）
+- P 项：`kp × error`
+- I 项：条件积分（抗饱和）
+- D 项：低通滤波微分（`d_filter_alpha=0.6`）
+- 输出经 `output_limit` 限幅
+
+### 7.4 速度限幅与死区补偿
+
+```python
+MAX_VX = 0.4      # 最大横向速度 (m/s)
+MAX_VY = 0.5      # 最大前后速度 (m/s)
+MIN_SPEED = 0.15  # 最低速度（防电机死区）
+
+def clamp_speed(fwd, lat):
+    # 前后限幅
+    if abs(fwd) > MAX_VY: fwd = MAX_VY * sign(fwd)
+    # 横向限幅
+    if abs(lat) > MAX_VX: lat = MAX_VX * sign(lat)
+    # 最低速度（仅在有运动意图时生效）
+    if 0.01 < abs(fwd) < MIN_SPEED: fwd = MIN_SPEED * sign(fwd)
+    if 0.01 < abs(lat) < MIN_SPEED: lat = MIN_SPEED * sign(lat)
+    return fwd, lat
+```
+
+### 7.5 编码器闭环驱动
+
+PID 计算出目标速度后，通过 `motor.py` 的编码器闭环驱动四轮全向轮：
+
+```python
+# 读取编码器实际速度 (4 轮)
+rc = get_encoder_counts()
+rs = [rc[i] / ENC_SCALE[i] / DT for i in range(4)]
+
+# 闭环驱动: fwd_speed=前进, lat_speed=横向, rotate=0
+omni_drive_closed_loop(fwd_speed, lat_speed, 0, rs, DT)
+```
+
+`omni_drive_closed_loop()` 内部：前馈速度 → 逆运动学 → 各轮目标速度 → PI 反馈 → PWM 输出。
+
+### 7.6 停车判定与自动恢复
+
+```python
+TARGET_DIST_CM  = 10.0   # 目标跟随距离 (cm)
+STOP_DIST_CM    = 5.0    # 到达判定容差 (cm)
+
+# FOLLOW → STOPPED: 距离误差在容差内 且 横向居中
+if abs(y_error) < STOP_DIST_CM and abs(x_cm) < 10:
     state = STATE_STOPPED
+    stop_all()
+
+# STOPPED → FOLLOW: 目标移开超过 2 倍容差
+if abs(actual_dist - TARGET_DIST_CM) > STOP_DIST_CM * 2:
+    state = STATE_FOLLOW
+    reset_wheel_pi()
+    PID_X.reset()
+    PID_Y.reset()
 ```
 
-### 7.3 超时回退机制
-
-视觉追踪中如果 **连续 500ms** 未收到有效的摄像头帧：
+### 7.7 目标丢失与超时回退
 
 ```python
-CAM_TIMEOUT_MS = 500  # 视觉追踪数据超时
+LOST_TIMEOUT_MS = 500  # 丢失超时 (ms)
 
-# 超时后:
-stop_all()                     # 急停
-ctrl.emergency_stop()          # PID 重置
-exit_visual()                  # 清理视觉资源
-enter_uwb()                    # 重新进入 UWB 跟随
-state = STATE_UWB              # 退回 UWB 模式
+# FOLLOW → LOST: 连续 500ms 无有效目标
+if not is_target:
+    if time.ticks_diff(now, last_target_ms) > LOST_TIMEOUT_MS:
+        state = STATE_LOST
+        stop_all()
+
+# LOST → FOLLOW: 重新检测到目标
+if data['is_target']:
+    state = STATE_FOLLOW
+    reset_wheel_pi()
+    PID_X.reset()
+    PID_Y.reset()
 ```
+
+**与 UWB 模式的联动**（在 `main.py` 的上下文中）：
+- 视觉追踪丢失超过 500ms → LOST 状态 → 停车
+- `main.py` 中额外的 `CAM_TIMEOUT_MS` 机制可进一步退回 UWB 模式
+
+### 7.8 调试输出
+
+每 300ms 打印一行控制状态：
+
+```
+[#0123 FOLLOW] X: +5.2cm dist:12.3cm err:+2.3cm
+[#0456 STOPPED] X: +1.1cm dist:9.8cm err:-0.2cm
+[#0789 LOST] X: +0.0cm dist:29.0cm err:+19.0cm
+```
+
+输出字段：帧计数器、当前状态、横向偏移、实际距离、距离误差。
+
+### 7.9 SW2 安全退出
+
+与 `main.py` 一致，`cam_follow.py` 的主循环每次迭代检查 SW2（D9）拨码开关：
+```python
+if switch2.value() != state2:
+    stop_all()
+    enc_ticker.start(10)  # 恢复编码器定时器
+    break
+```
+
+退出后打印会话统计（总帧数）。
 
 ---
 
@@ -569,7 +728,7 @@ finally 清理块:
 | 当前状态 | 条件 | 目标状态 | 触发动作 |
 |---|---|---|---|
 | UWB | 摄像头滑动窗口 ≥5/8 确认 | VISUAL | `exit_uwb()` → `enter_visual()` |
-| VISUAL | `dist_f ≤ 10cm` | STOPPED | `exit_visual()` → `enter_stopped()` |
+| VISUAL | `距离误差 < 5cm 且 横向偏移 < 10cm` | STOPPED | `exit_visual()` → `enter_stopped()` |
 | VISUAL | 连续 500ms 无数据 | UWB | `exit_visual()` → `enter_uwb()` |
 | 任意 | SW2 拨动 | 程序退出 | `finally` 清理块 |
 | VISUAL | `cam_uart is None` (异常) | UWB | `exit_visual()` → `enter_uwb()` |
@@ -582,10 +741,9 @@ finally 清理块:
 | 编码器接管 | 停 ticker → 手动管理 | 停 ticker → 重启 ticker | - |
 | 编码器清空 | ✓ (×5 次空读) | - | - |
 | 滤波器重置 | ✓ | - | - |
-| PID 重置 | ✓ (wheel PI + ang vel) | - | ✓ (emergency_stop) |
+| PID 重置 | ✓ (wheel PI + ang vel + PID_X/Y) | - | ✓ (stop_all) |
 | IMU 预热 | ✓ (×5 帧) | - | - |
-| 卡尔曼创建 | ✓ | 释放为 None | 释放为 None |
-| 级联 PID 创建 | ✓ | 释放为 None | 释放为 None |
+| PID X/Y 创建 | ✓ | 释放为 None | 释放为 None |
 | 滑动窗口重置 | ✓ | ✓ (超时时) | - |
 | 环形缓冲区清空 | ✓ | - | - |
 
@@ -597,16 +755,28 @@ finally 清理块:
 
 ```
 字节偏移  | 0    | 1    | 2    | 3    | 4    | 5    | 6    | 7    | 8    | 9
-内容     | 0xAA | X_H  | X_L  | Y_H  | Y_L  | LB_H | LB_L | ST_H | ST_L | 0xBB
-数据类型  | 帧头  |      int16      |      int16      |      int16      |      int16      | 帧尾
-字段含义  |       X 横向偏移(cm)×10 | Y 纵向距离(cm)×10 | 目标标签ID       | 状态(1/0)        |
+内容     | 0xAA | X_H  | X_L  | Y_H  | Y_L  | FLAG |  ID  |  B6  |  B7  | 0xBB
+数据类型  | 帧头  |      int16      |      int16      | byte | byte | byte | byte | 帧尾
+字段含义  |       X 横向偏移(mm)×10  | Y 纵向坐标(cm)×10  | 检测标志 | 目标ID | 附加1 | 附加2 |
 ```
 
 **解码规则**：
-- 所有数值为大端序 int16
+- 所有数值为大端序 int16（X、Y 字段）
 - 接收端做有符号转换：`val if val < 32768 else val - 65536`
-- 最后除以 10 恢复实际 cm 值（精度 0.1cm）
-- Status: `1` = 识别成功, `0` = 识别失败
+- 除以 10 恢复实际值（精度 0.1 mm / 0.1 cm）
+- **FLAG**：`0x02` / `0x03` = 检测到目标，`0x00` = 目标丢失
+- **ID**：目标标识符（单字节）
+- **B6 / B7**：附加数据字段（待定用途）
+
+**坐标转换**（`cam_data.py`）：
+| 函数 | 输入 | 输出 | 公式 |
+|---|---|---|---|
+| `x_to_cm(x)` | X 原始值（mm） | 横向偏移（cm） | `x / 10.0` |
+| `y_to_distance(y)` | Y 原始值（cm） | 实际距离（cm） | `29.0 - y` |
+
+**有效目标判定**（`is_target`）：
+- `FLAG != 0x00` 且 非全零帧（x ≠ 0 或 y ≠ 0）
+- 全零帧 + FLAG=0x00 → 目标丢失
 
 ### 10.2 UWB TWR → RT1021 协议
 
@@ -648,30 +818,33 @@ UART0, 115200 bps, JSON 行协议
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `TARGET_DIST_CM` | 10 cm | 停车目标距离 |
-| `WINDOW_SIZE` | 8 | 滑动窗口大小 |
-| `WINDOW_THRESHOLD` | 5 | 窗口确认阈值 |
-| `CAM_TIMEOUT_MS` | 500 ms | 视觉数据超时 |
-| `DT_CLAMP` | 0.1 s | 控制周期上限 |
-| `DT_FALLBACK` | 0.02 s | 控制周期回退值 |
+| `TARGET_DIST_CM` | 10.0 cm | 目标跟随距离 |
+| `STOP_DIST_CM` | 5.0 cm | 到达判定容差（距离误差 < 此值 + 横向偏移 < 10cm → 停车） |
+| `LOST_TIMEOUT_MS` | 500 ms | 目标丢失超时（连续无有效帧 → LOST 状态） |
+| `CAM_TIMEOUT_MS` | 500 ms | 视觉追踪数据超时（main.py 层，退回 UWB 模式） |
+| `WINDOW_SIZE` | 8 | 滑动窗口大小（UWB→VISUAL 切换判定） |
+| `WINDOW_THRESHOLD` | 5 | 窗口确认阈值（≥5 帧有效才切换） |
+| `MAX_VX` | 0.4 m/s | 最大横向速度 |
+| `MAX_VY` | 0.5 m/s | 最大前后速度 |
+| `MIN_SPEED` | 0.15 m/s | 最低速度（防电机死区） |
+| `DT` | 0.02 s | 控制周期（20ms） |
+| `Y_REF_DISTANCE` | 29.0 cm | Y 坐标参考原点距离（Y=0 时对应实际距离） |
 
 ### 11.3 PID 增益
 
+**视觉追踪 PID**（`cam_follow.py`，使用 `pid.py` 的 `PID` 类）：
+
+| PID | 用途 | KP | KI | KD | 积分限幅 | 输出限幅 |
+|---|---|---|---|---|---|---|
+| **PID_X** | 横向居中控制 | 0.025 | 0.010 | 0.005 | ±50 | ±1.0 |
+| **PID_Y** | 距离保持控制 | 0.040 | 0.010 | 0.0025 | ±50 | ±1.0 |
+
+**UWB 跟随 PID / PI**（`uwb_tracker.py` / `motor.py`）：
+
 | PID | KP | KI | KD | 输出限幅 | 积分限幅 |
 |---|---|---|---|---|---|
-| pid_ex (横向) | 0.020 | 0 | 0 | ±0.4 | ±0.5 |
-| pid_dist (纵向) | 1.0 | 0 | 0 | ±0.4 | ±0.5 |
-| pid_roll (旋转) | 0.02 | 0.001 | 0 | ±0.4 | ±0.5 |
-| 角速度 PID | 0.6 | 0.6 | 0 | ±300 dps | ±150 |
-| 轮子 PI ×4 | 40000 | 0 | 0 | ±50000 PWM | ±5000 |
-
-### 11.4 卡尔曼滤波器参数
-
-| 通道 | Q (过程噪声) | R (量测噪声) | P_min (防过收敛) |
-|---|---|---|---|
-| ex (横向像素) | 1.5 | 12.0 | 0.3 |
-| dist (距离) | 1.0 | 8.0 | 0.3 |
-| roll (倾角) | 0.5 | 15.0 | 0.2 |
+| 角速度 PID (imu_motion) | 0.6 | 0.6 | 0 | ±300 dps | ±150 |
+| 轮子 PI ×4 (motor) | 40000 | 0 | 0 | ±50000 PWM | ±5000 |
 
 ---
 
@@ -703,9 +876,9 @@ RT1021 — UWB Follow + Visual Track
 
 [CAM] Target confirmed! 6/8 → VISUAL_TRACK    ← 摄像头检测到物品
 >>> MODE: VISUAL_TRACK <<<
-[VISUAL] dist=25.3cm | vx=0.120 vy=0.450 wz=0.002 dt=22ms   ← 视觉追踪中
-[VISUAL] Target reached! dist=9.8cm → STOPPED                ← 到达 10cm
->>> MODE: STOPPED (target reached 10cm) <<<
+[VISUAL] [#0123 FOLLOW] X:+5.2cm dist:12.3cm err:+2.3cm  ← 视觉追踪中 (PID 控制)
+[VISUAL] [#0456 STOPPED] X:+1.1cm dist:9.8cm err:-0.2cm  ← 到达 10cm±5cm，停车
+>>> MODE: STOPPED (target reached) <<<
 
 [SW2] Exit requested                                         ← SW2 强制退出
 Robot stopped. (you may now re-run or enter REPL)
@@ -719,6 +892,7 @@ Robot stopped. (you may now re-run or enter REPL)
 | `cam_diag.py` | 独立运行，dump UART7 所有原始字节（HEX + ASCII） |
 | `cam_diag_v2.py` | 第二代摄像头诊断工具 |
 | `cam_demo.py` | OpenMV 端程序（在 OpenMV 上运行，非 RT1021） |
+| `cam_follow.py` | 视觉追踪独立运行版（PID 控制 + 状态机，可脱离 main.py 单独测试） |
 | `uwb_following.py` | UWB 跟随独立运行版（可脱离 main.py 单独测试） |
 | `test_push.py` | 推杆控制测试 |
 | `test_p_rotate.py` | 旋转控制测试 |
@@ -731,7 +905,7 @@ Robot stopped. (you may now re-run or enter REPL)
 | UWB 无数据 | 基站未上电/ID 不匹配 | 运行 `uwb_following.py` 独立测试 |
 | 摄像头无数据 | 波特率/接线错误 | 运行 `cam_diag.py` 查看原始字节 |
 | 误切换视觉模式 | 滑动窗口阈值过低 | 调高 `WINDOW_THRESHOLD`（当前=5/8） |
-| 视觉追踪抖动 | PID 增益过大 | 降低 `PID_DIST_KP` 或增大卡尔曼 R 值 |
+| 视觉追踪抖动 | PID 增益过大 | 降低 `PID_X.kp` / `PID_Y.kp` 或增加 `STOP_DIST_CM` 容差 |
 | 停车距离不准 | 摄像头标定偏差 | 检查 `cam_demo.py` 中 H/Y_OFFSET/PITCH_ANGLE |
 | LED 不亮 | LED 引脚冲突 | 检查 C4 是否被其他模块占用 |
 
@@ -744,8 +918,8 @@ user/
 ├── main.py              # ★ 主入口，状态机核心
 ├── uwb_tracker.py       # ★ UWB 跟随控制器 (类 UWBFollower)
 ├── uwb_following.py     # UWB 跟随独立运行版
-├── kalman_filter.py     # ★ 卡尔曼滤波器 (三通道)
-├── control.py           # ★ 级联 PID 控制器 (CascadeController)
+├── cam_data.py          # ★ 摄像头数据接收与协议解析 (CamDataReceiver)
+├── cam_follow.py        # ★ 视觉追踪独立实现 (PID 控制 + 三态状态机)
 ├── motor.py             # 电机/编码器硬件抽象层
 ├── imu_motion.py        # IMU 姿态解算 + 角速度闭环
 ├── pid.py               # PID 控制器基类
@@ -759,6 +933,8 @@ user/
 ├── cam_diag.py          # UART7 原始字节诊断
 ├── cam_diag_v2.py       # 摄像头诊断 v2
 ├── cam_demo.py          # OpenMV 端目标检测程序
+├── kalman_filter.py     # (未使用) 卡尔曼滤波器 (旧版视觉追踪用)
+├── control.py           # (未使用) 级联 PID 控制器 (旧版视觉追踪用)
 ├── test/                # 测试脚本目录
 │   ├── motor_test.py
 │   ├── imu_test.py
