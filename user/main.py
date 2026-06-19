@@ -310,11 +310,20 @@ def main():
                     loop_cnt = 0
                     continue
 
-                # ── 驱动电机 ──
-                if ctrl['cmd_fwd'] is not None:
-                    rc = get_encoder_counts()
-                    rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
-                    omni_drive_closed_loop(ctrl['cmd_fwd'], ctrl['cmd_lat'], 0, rs, CAM_DT)
+                # ── 驱动电机（状态切换帧跳过，给编码器缓冲时间）──
+                if ctrl['cmd_fwd'] is not None and not ctrl.get('just_switched'):
+                    try:
+                        rc = get_encoder_counts()
+                        # 编码器数据合理性检查：全部为零说明未就绪
+                        if any(c != 0 for c in rc):
+                            rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
+                            omni_drive_closed_loop(
+                                ctrl['cmd_fwd'], ctrl['cmd_lat'], 0, rs, CAM_DT)
+                    except Exception as e:
+                        print("[MOTOR] drive error:", e)
+                elif ctrl.get('just_switched'):
+                    # 刚切换状态，仅停车等待一帧
+                    stop_all()
 
                 # ── 更新最后有效数据时间 ──
                 if data['is_target']:

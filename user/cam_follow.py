@@ -179,13 +179,14 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
         now_ms = time.ticks_ms()
 
     result = {
-        'cmd_fwd':     None,
-        'cmd_lat':     None,
-        'cmd_fwd_raw': 0.0,
-        'cmd_lat_raw': 0.0,
-        'state':       _state,
-        'arrived':     False,
-        'state_msg':   None,
+        'cmd_fwd':        None,
+        'cmd_lat':        None,
+        'cmd_fwd_raw':    0.0,
+        'cmd_lat_raw':    0.0,
+        'state':          _state,
+        'arrived':        False,
+        'state_msg':      None,
+        'just_switched':  False,
     }
 
     # ── 状态判断（与 backup 第176-195行完全一致）──
@@ -201,6 +202,7 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
             filt_fwd_sign = 0
             filt_lat_sign = 0
             result['state_msg'] = "[LOST -> FOLLOW] Captured!"
+            result['just_switched'] = True  # 标记刚切换，给硬件缓冲时间
     else:
         if _state == STATE_FOLLOW:
             if time.ticks_diff(now_ms, last_target_ms) > LOST_TIMEOUT_MS:
