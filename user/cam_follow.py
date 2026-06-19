@@ -84,14 +84,14 @@ class CascadePID:
 # ── 外环 PID（位置控制）──
 # Y 方向（前进后退）
 PID_FWD = CascadePID(
-    kp=0.012, ki=0.003, kd=0.004,
+    kp=0.012, ki=0.003, kd=0.005,
     out_limit=MAX_SPEED_FWD,
     accel_limit=ACCEL_LIMIT
 )
 
 # X 方向（横向）
 PID_LAT = CascadePID(
-    kp=0.010, ki=0.002, kd=0.003,
+    kp=0.010, ki=0.002, kd=0.006,
     out_limit=MAX_SPEED_LAT,
     accel_limit=ACCEL_LIMIT
 )
