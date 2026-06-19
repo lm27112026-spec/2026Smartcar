@@ -161,19 +161,19 @@ class CamDataReceiver:
             if len(self._buf) < idx + FRAME_LEN:
                 # 数据不完整，保留从帧头开始的部分
                 if idx > 0:
-                    self._buf = self._buf[idx:]
+                    self._buf = bytearray(self._buf[idx:])
                 return None
             
             # 检查帧尾
             if self._buf[idx + FRAME_LEN - 1] != FRAME_TAIL:
                 # 无效帧尾，跳过这个字节继续查找
-                self._buf = self._buf[idx + 1:]
+                self._buf = bytearray(self._buf[idx + 1:])
                 self._error_count += 1
                 continue
             
             # 提取有效帧
             frame = self._buf[idx:idx + FRAME_LEN]
-            self._buf = self._buf[idx + FRAME_LEN:]
+            self._buf = bytearray(self._buf[idx + FRAME_LEN:])
             
             # 解析数据
             return self._parse_frame(frame)
