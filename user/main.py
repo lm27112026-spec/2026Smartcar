@@ -130,8 +130,8 @@ def _create_mode_manager():
                 update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
             time.sleep_ms(10)
 
-        # 重置 cam_follow 控制状态
-        reset_control()
+        # 重置 cam_follow 控制状态（含状态机复位到 LOST）
+        reset_control(reset_state=True)
 
         res['window']       = []
         res['last_data']    = time.ticks_ms()

@@ -144,11 +144,15 @@ _ctrl_state = STATE_LOST
 _last_target_ms = 0
 
 
-def reset_control():
-    """重置所有控制状态（PID、滤波、状态机）"""
+def reset_control(reset_state=False):
+    """重置控制状态。
+    reset_state=True: 同时重置状态机到 LOST（模式切换时使用）
+    reset_state=False: 仅重置 PID 和滤波（跟踪中重捕获时使用）
+    """
     global _ctrl_state, _last_target_ms
-    _ctrl_state = STATE_LOST
-    _last_target_ms = 0
+    if reset_state:
+        _ctrl_state = STATE_LOST
+        _last_target_ms = 0
     _pid_fwd.reset()
     _pid_lat.reset()
     reset_speed_filter()
@@ -291,7 +295,7 @@ def init_hardware():
 def standalone_main():
     """独立运行 cam_follow.py 时的主循环"""
     init_hardware()
-    reset_control()
+    reset_control(reset_state=True)
 
     print("=" * 50)
     print("Camera Following (Cascade PID)")
