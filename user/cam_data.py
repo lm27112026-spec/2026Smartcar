@@ -1,23 +1,27 @@
 """
 cam_data.py - 摄像头数据接收与解析模块（适配实际协议）
 【协议】AA [X_H X_L] [Y_H Y_L] [FLAG] [ID] [B6] [B7] BB
-        X = 横向偏移(cm), Y = 纵向距离(cm)
+        X = 横向偏移 (原始值单位: mm, ÷10后仍为mm)
+        Y = 纵向距离 (原始值单位: cm, ÷10后为cm)
         FLAG: 0x02/0x03=检测到, 0x00=丢失
         ID = 目标标识 (单字节)
         B6, B7 = 附加数据 (待定)
         int16 大端序，÷10 精度
+【单位说明】
+        X 返回值单位是 mm，用 x_to_cm(x) 转为 cm
+        Y 返回值单位是 cm，用 y_to_distance(y) 转为实际距离
 【Y坐标说明】
         Y=0 对应实际距离 29cm
         Y>0 比 29cm 更近, Y<0 比 29cm 更远
-        用 y_to_distance(y) 转换为实际距离
 【使用】
-    from cam_data import CamDataReceiver, y_to_distance
+    from cam_data import CamDataReceiver, x_to_cm, y_to_distance
     recv = CamDataReceiver(uart_id=7)
     while True:
         data = recv.read()
         if data is not None:
-            dist = y_to_distance(data['y'])
-            print(f"距离: {dist:.1f}cm")
+            x_cm = x_to_cm(data['x'])      # 横向偏移 (cm)
+            dist = y_to_distance(data['y']) # 实际距离 (cm)
+            print(f"X:{x_cm:.1f}cm 距离:{dist:.1f}cm")
 """
 
 from machine import UART
@@ -54,6 +58,23 @@ def y_to_distance(y):
         Y<0 → 目标比 29cm 更远
     """
     return Y_REF_DISTANCE - y
+
+
+def x_to_cm(x):
+    """
+    将摄像头 X 坐标转换为 cm
+    
+    参数:
+        x: 摄像头返回的 X 值 (单位: mm)
+    
+    返回:
+        float: 横向偏移 (cm)
+    
+    说明:
+        X>0 → 目标在右侧
+        X<0 → 目标在左侧
+    """
+    return x / 10.0
 
 
 class CamDataReceiver:

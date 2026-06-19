@@ -12,7 +12,7 @@ cam_follow.py — 摄像头目标跟随
 
 import gc, time, math
 from machine import Pin
-from cam_data import CamDataReceiver, y_to_distance
+from cam_data import CamDataReceiver, x_to_cm, y_to_distance
 from motor import (stop_all, omni_drive_closed_loop,
                    get_encoder_counts, reset_encoder_filter, reset_wheel_pi,
                    enc_ticker, ENC_SCALE)
@@ -29,7 +29,7 @@ switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()
 
 # ── 跟随参数 ──
-TARGET_DIST_CM  = 30.0   # 目标跟随距离 (cm)
+TARGET_DIST_CM  = 10.0   # 目标跟随距离 (cm)
 STOP_DIST_CM    = 5.0    # 到达判定容差 (cm)
 LOST_TIMEOUT_MS = 500    # 丢失超时 (ms)
 
@@ -40,11 +40,11 @@ MIN_SPEED = 0.15         # 最低速度（防死区）
 
 # ── PID 参数 ──
 # X 方向（横向居中）
-PID_X = PID(kp=0.008, ki=0.001, kd=0.002,
+PID_X = PID(kp=0.025, ki=0.010, kd=0.005,
             integral_limit=50, output_limit=1.0)
 
 # Y 方向（距离保持）
-PID_Y = PID(kp=0.012, ki=0.002, kd=0.003,
+PID_Y = PID(kp=0.040, ki=0.010, kd=0.0025,
             integral_limit=50, output_limit=1.0)
 
 # ── 控制周期 ──
@@ -78,20 +78,20 @@ print("=" * 50)
 # ============================================================
 #  速度限幅
 # ============================================================
-def clamp_speed(vx, vy):
-    """限幅并确保最低速度"""
-    # X 限幅
-    if abs(vx) > MAX_VX:
-        vx = MAX_VX if vx > 0 else -MAX_VX
-    # Y 限幅
-    if abs(vy) > MAX_VY:
-        vy = MAX_VY if vy > 0 else -MAX_VY
+def clamp_speed(fwd, lat):
+    """限幅并确保最低速度 (fwd=前进, lat=横向)"""
+    # 前进限幅
+    if abs(fwd) > MAX_VY:
+        fwd = MAX_VY if fwd > 0 else -MAX_VY
+    # 横向限幅
+    if abs(lat) > MAX_VX:
+        lat = MAX_VX if lat > 0 else -MAX_VX
     # 最低速度（仅在有运动意图时）
-    if abs(vx) > 0.01 and abs(vx) < MIN_SPEED:
-        vx = MIN_SPEED if vx > 0 else -MIN_SPEED
-    if abs(vy) > 0.01 and abs(vy) < MIN_SPEED:
-        vy = MIN_SPEED if vy > 0 else -MIN_SPEED
-    return vx, vy
+    if abs(fwd) > 0.01 and abs(fwd) < MIN_SPEED:
+        fwd = MIN_SPEED if fwd > 0 else -MIN_SPEED
+    if abs(lat) > 0.01 and abs(lat) < MIN_SPEED:
+        lat = MIN_SPEED if lat > 0 else -MIN_SPEED
+    return fwd, lat
 
 
 # ============================================================
@@ -136,28 +136,33 @@ while True:
 
     # ── 跟随控制 ──
     if _state == STATE_FOLLOW:
-        # 计算误差
-        x_error = data['x']              # 横向偏移：目标在左为负，右为正
-        actual_dist = y_to_distance(data['y'])  # 实际距离
-        y_error = actual_dist - TARGET_DIST_CM  # 距离误差：正=太远，负=太近
+        # 计算误差（统一单位为 cm）
+        x_cm = x_to_cm(data['x'])               # 横向偏移 (cm)
+        actual_dist = y_to_distance(data['y'])   # 实际距离 (cm)
+        x_error = x_cm                           # 横向误差：目标在左为负，右为正
+        y_error = actual_dist - TARGET_DIST_CM   # 距离误差：正=太远，负=太近
 
         # PID 计算
-        vx = PID_X.compute(0, x_error, DT)   # 横向：目标居中时 vx=0
-        vy = PID_Y.compute(0, y_error, DT)   # 前后：距离目标时 vy=0
+        # 注意：motor.py 的 kinematics 是 vx=前进, vy=横向
+        # PID.compute(setpoint, measurement) → error = setpoint - measurement
+        # y_error > 0 表示目标太远，需要前进 (fwd > 0)
+        # x_error > 0 表示目标在右，需要右移 (lat > 0)
+        fwd_speed = PID_Y.compute(y_error, 0, DT)   # 前后：error = y_error
+        lat_speed = PID_X.compute(x_error, 0, DT)   # 横向：error = x_error
 
         # 限幅
-        vx, vy = clamp_speed(vx, vy)
+        fwd_speed, lat_speed = clamp_speed(fwd_speed, lat_speed)
 
         # 到达判定
-        if abs(y_error) < STOP_DIST_CM and abs(x_error) < 10:
+        if abs(y_error) < STOP_DIST_CM and abs(x_cm) < 10:
             _state = STATE_STOPPED
             stop_all()
             print("[FOLLOW -> STOPPED] Arrived! dist={:.1f}cm".format(actual_dist))
         else:
-            # 编码器闭环驱动
+            # 编码器闭环驱动 (vx=前进, vy=横向)
             rc = get_encoder_counts()
             rs = [rc[i] / ENC_SCALE[i] / DT for i in range(4)]
-            omni_drive_closed_loop(vx, vy, 0, rs, DT)
+            omni_drive_closed_loop(fwd_speed, lat_speed, 0, rs, DT)
 
     elif _state == STATE_STOPPED:
         # 等待目标移开
@@ -174,10 +179,11 @@ while True:
 
     # ── 调试输出 ──
     if time.ticks_diff(now, last_print_ms) >= 300:
+        x_cm = x_to_cm(data['x'])
         actual_dist = y_to_distance(data['y'])
         state_str = {0: "FOLLOW", 1: "STOP", 2: "LOST"}[_state]
-        print("[#{:04d} {:s}] X:{:+6.1f} dist:{:5.1f}cm err:{:+5.1f}".format(
-            recv.frame_count, state_str, data['x'], actual_dist,
+        print("[#{:04d} {:s}] X:{:+6.1f}cm dist:{:5.1f}cm err:{:+5.1f}cm".format(
+            recv.frame_count, state_str, x_cm, actual_dist,
             actual_dist - TARGET_DIST_CM))
         last_print_ms = now
 
