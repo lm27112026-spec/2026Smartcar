@@ -29,7 +29,7 @@ STATE_FOLLOW  = 0
 STATE_STOPPED = 1
 STATE_LOST    = 2
 
-TARGET_DIST_CM  = 30.0   # 目标跟随距离 (cm)
+TARGET_DIST_CM  = 10.0   # 目标跟随距离 (cm)
 STOP_DIST_CM    = 5.0    # 到达判定容差 (cm)
 LOST_TIMEOUT_MS = 500    # 丢失超时 (ms)
 
@@ -59,8 +59,8 @@ class CascadePID:
         返回: 速度指令 (m/s)
         """
         # 位置 PID → 目标速度
-        # compute(error, 0): error>0(太远) → 前进, error<0(太近) → 后退
-        target_speed = self.pid.compute(error, 0, dt)
+        # compute(0, error) 配合 y_to_distance() 坐标映射形成正确方向
+        target_speed = self.pid.compute(0, error, dt)
 
         # 加速度限幅（平滑速度变化）
         delta = target_speed - self.prev_output
@@ -294,6 +294,7 @@ def _standalone():
     print("=" * 50)
     print("Camera Following (Cascade PID)")
     print("Target: {:.0f}cm".format(TARGET_DIST_CM))
+    print("Build: 2026-06-19 23:30")
     print("SW2 = exit")
     print("=" * 50)
 

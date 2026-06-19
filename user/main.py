@@ -182,6 +182,7 @@ def main():
     print("  UART0 : UWB 基站数据 (115200)")
     print("  UART7 : cam_data.py 摄像头协议 (115200)")
     print("  Target: {:.0f}cm".format(TARGET_DIST_CM))
+    print("  Build: 2026-06-19 23:30")
     print("  KEY1/2/3 : UWB / VISUAL / STOP")
     print("  SW2   : 强制退出")
     print("=" * 50)
