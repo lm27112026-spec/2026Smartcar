@@ -1,9 +1,9 @@
 # RT1021 UWB 跟随 + 视觉追踪系统技术文档
 
-> **版本**：v2.1  
+> **版本**：v2.2  
 > **平台**：RT1021 (NXP i.MX RT1021) + MicroPython  
 > **日期**：2026-06-19  
-> **主要变更**：视觉追踪升级为级联 PID（CascadePID），新增按键控制章节，修正全部参数至源码对齐
+> **修复**：CascadePID.compute() 中 PID.compute() 参数顺序修正（setpoint=error, measurement=0）
 
 ---
 
@@ -538,7 +538,7 @@ class CascadePID:
 
     def compute(self, error, dt):
         # 1. 位置 PID → 目标速度
-        target_speed = self.pid.compute(0, error, dt)
+        target_speed = self.pid.compute(error, 0, dt)
         # 2. 加速度限幅（平滑速度变化）
         delta = target_speed - self.prev_output
         max_delta = self.accel_limit * dt
@@ -550,7 +550,7 @@ class CascadePID:
 ```
 
 **设计要点**：
-- `setpoint=0`，`measurement=error`：PID 内部 `error = setpoint − measurement = −error`，输出方向与位置误差反向，正好驱动小车向减小误差的方向运动
+- `setpoint=error`，`measurement=0`：PID 内部 `error = setpoint − measurement = error`，输出方向与位置误差同向——太远(>0)→前进(>0)，太近(<0)→后退(<0)
 - 加速度限幅保证速度变化平滑，避免急加速/急减速
 - 积分抗饱和（`integral_limit=50`）+ 微分低通（`d_filter_alpha=0.6`）继承自 `pid.PID`
 
