@@ -326,9 +326,11 @@ def main():
                 if print_cnt >= 15:
                     print_cnt = 0
                     state_str = {0: "FOLLOW", 1: "STOP", 2: "LOST"}[ctrl['state']]
-                    print("[#{:04d} {:s}] X:{:+5.1f}cm dist:{:5.1f}cm".format(
+                    print("[#{:04d} {:s}] X:{:+5.1f}cm dist:{:5.1f}cm "
+                          "fwd:{:+.3f} lat:{:+.3f}".format(
                         res['cam_recv'].frame_count, state_str,
-                        x_cm, actual_dist))
+                        x_cm, actual_dist,
+                        ctrl['cmd_fwd_raw'], ctrl['cmd_lat_raw']))
 
                 # ── 超时 500ms → 退回 UWB ──
                 if not res['timeout_done']:

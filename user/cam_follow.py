@@ -188,11 +188,13 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
         now_ms = time.ticks_ms()
 
     result = {
-        'cmd_fwd':   None,
-        'cmd_lat':   None,
-        'state':     _ctrl_state,
-        'arrived':   False,
-        'state_msg': None,
+        'cmd_fwd':     None,
+        'cmd_lat':     None,
+        'cmd_fwd_raw': 0.0,
+        'cmd_lat_raw': 0.0,
+        'state':       _ctrl_state,
+        'arrived':     False,
+        'state_msg':   None,
     }
 
     # ── 状态判断 ──
@@ -222,6 +224,10 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
         # 外环：位置 PID → 目标速度
         cmd_fwd = _pid_fwd.compute(y_error, DT)
         cmd_lat = _pid_lat.compute(x_error, DT)
+
+        # 保存滤波前原始 PID 输出（供外部调试用）
+        result['cmd_fwd_raw'] = cmd_fwd
+        result['cmd_lat_raw'] = cmd_lat
 
         # 速度滤波
         cmd_fwd, cmd_lat = speed_filter(cmd_fwd, cmd_lat)
