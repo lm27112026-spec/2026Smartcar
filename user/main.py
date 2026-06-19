@@ -90,6 +90,7 @@ def _create_mode_manager():
         'last_data':     0,
         'tracking':      False,
         'timeout_done':  False,
+        'first_frames':  0,
     }
 
     # ── UWB 模式 ──────────────────────────────────────────
@@ -137,6 +138,7 @@ def _create_mode_manager():
         res['last_data']    = time.ticks_ms()
         res['tracking']     = False
         res['timeout_done'] = False
+        res['first_frames'] = 3   # 前N帧跳过电机驱动，给编码器缓冲
 
         if res['cam_recv']:
             res['cam_recv'].flush()
@@ -310,20 +312,18 @@ def main():
                     loop_cnt = 0
                     continue
 
-                # ── 驱动电机（状态切换帧跳过，给编码器缓冲时间）──
-                if ctrl['cmd_fwd'] is not None and not ctrl.get('just_switched'):
+                # ── 驱动电机（前N帧跳过 + 编码器合理性检查）──
+                if ctrl['cmd_fwd'] is not None and res['first_frames'] <= 0:
                     try:
                         rc = get_encoder_counts()
-                        # 编码器数据合理性检查：全部为零说明未就绪
                         if any(c != 0 for c in rc):
                             rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
                             omni_drive_closed_loop(
                                 ctrl['cmd_fwd'], ctrl['cmd_lat'], 0, rs, CAM_DT)
                     except Exception as e:
                         print("[MOTOR] drive error:", e)
-                elif ctrl.get('just_switched'):
-                    # 刚切换状态，仅停车等待一帧
-                    stop_all()
+                elif res['first_frames'] > 0:
+                    res['first_frames'] -= 1
 
                 # ── 更新最后有效数据时间 ──
                 if data['is_target']:
