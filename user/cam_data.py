@@ -154,7 +154,7 @@ class CamDataReceiver:
             idx = self._buf.find(bytes([FRAME_HEAD]))
             if idx == -1:
                 # 没有找到帧头，清空缓冲区
-                self._buf.clear()
+                self._buf = bytearray()
                 return None
             
             # 检查是否有完整帧
@@ -245,7 +245,7 @@ class CamDataReceiver:
         """清空接收缓冲区"""
         while self._uart.any():
             self._uart.read()
-        self._buf.clear()
+        self._buf = bytearray()
 
 
 # ── 独立运行测试 ─────────────────────────────────────────────
