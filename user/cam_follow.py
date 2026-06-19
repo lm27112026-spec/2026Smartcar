@@ -61,9 +61,9 @@ class CascadePID:
         返回: 速度指令 (m/s)
         """
         # 位置 PID → 目标速度
-        # compute(setpoint, measurement): error = setpoint - measurement
-        # 当 error(位置误差)>0(太远) → PID输出>0 → 前进
-        target_speed = self.pid.compute(error, 0, dt)
+        # 注意：compute(0, error) 配合 y_to_distance() 的坐标映射形成正确方向
+        # 此处符号不可随意修改——已配合摄像头坐标系验证
+        target_speed = self.pid.compute(0, error, dt)
 
         # 加速度限幅（平滑速度变化）
         delta = target_speed - self.prev_output
@@ -85,13 +85,13 @@ class CascadePID:
 # ═══════════════════════════════════════════════════════════════
 
 _pid_fwd = CascadePID(
-    kp=0.012, ki=0.003, kd=0.005,
+    kp=0.012, ki=0.003, kd=0.004,
     out_limit=MAX_SPEED_FWD,
     accel_limit=ACCEL_LIMIT
 )
 
 _pid_lat = CascadePID(
-    kp=0.010, ki=0.002, kd=0.006,
+    kp=0.010, ki=0.002, kd=0.003,
     out_limit=MAX_SPEED_LAT,
     accel_limit=ACCEL_LIMIT
 )
