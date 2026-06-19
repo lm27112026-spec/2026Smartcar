@@ -27,7 +27,7 @@ from motor import (
 import imu_motion
 from imu_motion import (
     update_angle, get_angular_velocity, angular_velocity_control,
-    reset_ang_vel_pid,
+    reset_ang_vel_pid, imu_get_safe,
 )
 
 
@@ -77,10 +77,11 @@ class UWBFollower:
         reset_wheel_pi()
 
         # ── IMU 热身（建立 yaw 初始基准） ──
-        # 使用 imu.get() 从 PIT3 ticker 缓冲区读取，避免与 ISR 的 I2C 总线冲突
+        # 使用 imu_get_safe() 从 PIT3 ticker 缓冲区读取，避免 SPI 总线冲突挂死
         for _ in range(10):
-            d = imu_motion.imu.get()
-            update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+            d = imu_get_safe()
+            if d is not None:
+                update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
             time.sleep_ms(10)
 
         # ── 状态变量 ──
@@ -232,11 +233,15 @@ class UWBFollower:
             self._last_control_ms = now
 
             # ── IMU 更新（从 PIT3 ticker 缓冲区读取，非阻塞，无 I2C 竞态） ──
-            d = imu_motion.imu.get()
+            d = imu_get_safe()
+            if d is None:
+                return  # IMU 读取失败，跳过本次控制周期
             update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
-            # ── 航向偏差（_angle_filt 已是相对角，atan2 保证 [-180,180] 范围）──
-            yaw_err = self._angle_filt
+            # ── 航向偏差 ──
+            # _angle_filt = atan2(-x, y): 正=目标在左，负=目标在右
+            # 航向纠偏需要取反：目标在左(yaw_err>0) → 向左转(wz>0)
+            yaw_err = -self._angle_filt
 
             # ── 航向纠偏（角速度闭环） ──
             if abs(yaw_err) > self.ROT_DEADBAND:
@@ -300,10 +305,9 @@ class UWBFollower:
     #  清理
     # ============================================================
     def stop(self):
-        """停止 UART + 停电机 + 恢复编码器 ticker。"""
+        """停止 UART + 停电机（编码器 ticker 由调用者管理）。"""
         print("UWBFollower: stopping...")
         stop_all()
-        enc_ticker.start(10)
         if self._uart is not None:
             try:
                 self._uart.deinit()

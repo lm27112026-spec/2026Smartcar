@@ -29,7 +29,7 @@ STATE_FOLLOW  = 0
 STATE_STOPPED = 1
 STATE_LOST    = 2
 
-TARGET_DIST_CM  = 30.0   # 目标跟随距离 (cm)
+TARGET_DIST_CM  = 10.0   # 目标跟随距离 (cm)
 STOP_DIST_CM    = 5.0    # 到达判定容差 (cm)
 LOST_TIMEOUT_MS = 500    # 丢失超时 (ms)
 
