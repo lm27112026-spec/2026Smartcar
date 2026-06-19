@@ -44,7 +44,7 @@ def _to_signed16(v):
 
 def y_to_distance(y):
     """
-    将摄像头 Y 坐标转换为实际距离
+    返回摄像头 Y 坐标对应的实际距离
     
     参数:
         y: 摄像头返回的 Y 坐标 (cm)
@@ -53,11 +53,10 @@ def y_to_distance(y):
         float: 目标到摄像头的实际距离 (cm)
     
     说明:
-        Y=0 → 实际距离 29cm (原点)
-        Y>0 → 目标比 29cm 更近
-        Y<0 → 目标比 29cm 更远
+        摄像头协议: Y = 纵向距离 (单位: cm)
+        Y 已经是距离值，直接返回即可
     """
-    return Y_REF_DISTANCE - y
+    return y
 
 
 def x_to_cm(x):
