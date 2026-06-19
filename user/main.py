@@ -106,7 +106,9 @@ class CascadePID:
         返回: 速度指令 (m/s)
         """
         # 位置 PID → 目标速度
-        target_speed = self.pid.compute(0, error, dt)
+        # compute(setpoint, measurement): error = setpoint - measurement
+        # 当 error(位置误差)>0(太远) → PID输出>0 → 前进
+        target_speed = self.pid.compute(error, 0, dt)
 
         # 加速度限幅（平滑速度变化）
         delta = target_speed - self.prev_output
