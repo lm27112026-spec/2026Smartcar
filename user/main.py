@@ -194,6 +194,11 @@ def main():
             capture()
             pet_watchdog()
 
+            # ─── 定期 GC（必须在所有 continue 之前）───
+            loop_cnt += 1
+            if loop_cnt % 200 == 0:
+                gc.collect()
+
             # ─── 按键模式切换 ───
             if key_triggered(1):           # KEY1 (C8) → UWB
                 if state != STATE_UWB:
@@ -282,7 +287,6 @@ def main():
                 data = res['cam_recv'].read()
                 if data is None:
                     time.sleep_ms(1)
-                    loop_cnt += 1
                     continue
 
                 now = time.ticks_ms()
@@ -366,11 +370,7 @@ def main():
                 if loop_cnt % 50 == 0:
                     led.toggle()
 
-            loop_cnt += 1
             time.sleep_ms(10)
-
-            if loop_cnt % 200 == 0:
-                gc.collect()
 
     except Exception as e:
         print("[FATAL] Exception in main loop:")
