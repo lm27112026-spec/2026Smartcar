@@ -1,9 +1,9 @@
 # RT1021 UWB 跟随 + 视觉追踪系统技术文档
 
-> **版本**：v2.2  
+> **版本**：v2.3  
 > **平台**：RT1021 (NXP i.MX RT1021) + MicroPython  
 > **日期**：2026-06-19  
-> **修复**：CascadePID.compute() 中 PID.compute() 参数顺序修正（setpoint=error, measurement=0）
+> **修复**：回退 PID 符号和 KD 值，对齐 cam_follow_backup.py 已验证参数
 
 ---
 
@@ -538,7 +538,7 @@ class CascadePID:
 
     def compute(self, error, dt):
         # 1. 位置 PID → 目标速度
-        target_speed = self.pid.compute(error, 0, dt)
+        target_speed = self.pid.compute(0, error, dt)
         # 2. 加速度限幅（平滑速度变化）
         delta = target_speed - self.prev_output
         max_delta = self.accel_limit * dt
@@ -550,7 +550,7 @@ class CascadePID:
 ```
 
 **设计要点**：
-- `setpoint=error`，`measurement=0`：PID 内部 `error = setpoint − measurement = error`，输出方向与位置误差同向——太远(>0)→前进(>0)，太近(<0)→后退(<0)
+- `setpoint=0`，`measurement=error`：PID 内部 `error = setpoint − measurement = −error`，与 `y_to_distance()` 坐标映射形成双重反转恰好抵消。此符号已配合摄像头坐标系验证，不可随意修改
 - 加速度限幅保证速度变化平滑，避免急加速/急减速
 - 积分抗饱和（`integral_limit=50`）+ 微分低通（`d_filter_alpha=0.6`）继承自 `pid.PID`
 
@@ -911,8 +911,8 @@ UART0, 115200 bps, JSON 行协议
 
 | PID | 用途 | KP | KI | KD | 积分限幅 | 输出限幅 | 加速度限幅 |
 |---|---|---|---|---|---|---|---|
-| **PID_FWD** | 前进/后退 | 0.012 | 0.003 | 0.005 | ±50 | 0.50 m/s | 3.0 m/s² |
-| **PID_LAT** | 横向平移 | 0.010 | 0.002 | 0.006 | ±50 | 0.45 m/s | 3.0 m/s² |
+| **PID_FWD** | 前进/后退 | 0.012 | 0.003 | 0.004 | ±50 | 0.50 m/s | 3.0 m/s² |
+| **PID_LAT** | 横向平移 | 0.010 | 0.002 | 0.003 | ±50 | 0.45 m/s | 3.0 m/s² |
 
 **UWB 跟随 PID / PI**（`uwb_tracker.py` / `imu_motion.py` / `motor.py`）：
 
