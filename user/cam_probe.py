@@ -164,7 +164,7 @@ while True:
     while len(buf) >= FRAME_LEN:
         idx = buf.find(bytes([FRAME_HEAD]))
         if idx == -1:
-            buf.clear()
+            buf = bytearray()
             break
 
         if idx > 0:
