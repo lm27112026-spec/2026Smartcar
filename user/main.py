@@ -31,6 +31,7 @@ from cam_follow import (
     compute_control, reset_control,
     STATE_FOLLOW, STATE_STOPPED as CAM_STOP, STATE_LOST,
     TARGET_DIST_CM, STOP_DIST_CM, DT as CAM_DT,
+    PID_FWD, PID_LAT,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -111,6 +112,7 @@ def _create_mode_manager():
         if res['uwb']:
             res['uwb'].stop()
         res['uwb'] = None
+        stop_all()                       # 先断电电机（与 cam_follow.py 独立运行完全一致）
         enc_ticker.stop()
         for _ in range(5):
             _ = get_encoder_counts()
@@ -131,22 +133,23 @@ def _create_mode_manager():
                 update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
             time.sleep_ms(10)
 
-        # 重置 cam_follow 控制状态（含状态机复位到 LOST）
+        # 重置 cam_follow 控制状态（含状态机复位到 LOST + 触发软启动）
         reset_control(reset_state=True)
 
         res['window']       = []
         res['last_data']    = time.ticks_ms()
         res['tracking']     = False
         res['timeout_done'] = False
-        res['first_frames'] = 3   # 前N帧跳过电机驱动，给编码器缓冲
+        res['first_frames'] = 3    # 前3帧跳过电机驱动，给编码器/硬件缓冲窗口
 
         if res['cam_recv']:
             res['cam_recv'].flush()
         led.value(0)
 
     def exit_visual():
-        # cam_follow 状态在下次 enter_visual 时由 reset_control() 重置
-        pass
+        # 断电电机，确保下次模式切换时从洁净状态启动
+        stop_all()
+        # cam_follow 控制状态在下次 enter_visual 时由 reset_control() 重置
 
     # ── 停车模式 ──────────────────────────────────────────
 
@@ -197,7 +200,7 @@ def main():
 
             # ─── 定期 GC（必须在所有 continue 之前）───
             loop_cnt += 1
-            if loop_cnt % 200 == 0:
+            if loop_cnt % 50 == 0:
                 gc.collect()
 
             # ─── 按键模式切换 ───
@@ -279,8 +282,8 @@ def main():
             elif state == STATE_VISUAL:
                 if res['cam_recv'] is None:
                     exit_visual()
-                    enter_uwb()
-                    state = STATE_UWB
+                    enter_stopped()
+                    state = STATE_STOPPED
                     loop_cnt = 0
                     continue
 
@@ -317,14 +320,13 @@ def main():
                     loop_cnt = 0
                     continue
 
-                # ── 驱动电机（前N帧跳过 + 编码器合理性检查）──
+                # ── 驱动电机（与 cam_follow.py 一致；first_frames 仅作硬件缓冲）──
                 if ctrl['cmd_fwd'] is not None and res['first_frames'] <= 0:
                     try:
                         rc = get_encoder_counts()
-                        if any(c != 0 for c in rc):
-                            rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
-                            omni_drive_closed_loop(
-                                ctrl['cmd_fwd'], ctrl['cmd_lat'], 0, rs, CAM_DT)
+                        rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
+                        omni_drive_closed_loop(
+                            ctrl['cmd_fwd'], ctrl['cmd_lat'], 0, rs, CAM_DT)
                     except Exception as e:
                         print("[MOTOR] drive error:", e)
                 elif res['first_frames'] > 0:
@@ -344,19 +346,19 @@ def main():
                           "fwd:{:+.3f} lat:{:+.3f}".format(
                         res['cam_recv'].frame_count, state_str,
                         x_cm, actual_dist,
-                        ctrl['cmd_fwd_raw'], ctrl['cmd_lat_raw']))
+                        PID_FWD.prev_output, PID_LAT.prev_output))
 
-                # ── 超时 500ms → 退回 UWB ──
+                # ── 超时 500ms → 停车 ──
                 if not res['timeout_done']:
                     if time.ticks_diff(now, res['last_data']) > CAM_TIMEOUT_MS:
                         res['timeout_done'] = True
                         stop_all()
                         res['tracking'] = False
                         res['window'] = []
-                        print("[VISUAL] Timeout {}ms → UWB_FOLLOW".format(CAM_TIMEOUT_MS))
+                        print("[VISUAL] Timeout {}ms → STOPPED".format(CAM_TIMEOUT_MS))
                         exit_visual()
-                        enter_uwb()
-                        state = STATE_UWB
+                        enter_stopped()
+                        state = STATE_STOPPED
                         loop_cnt = 0
                         continue
 
