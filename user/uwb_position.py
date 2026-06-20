@@ -31,13 +31,41 @@ import gc, time, math, json
 from machine import UART, Pin
 
 
+class MedianFilter:
+    """滑动窗口中值滤波器 — 去除尖刺噪声，MicroPython 友好。"""
+
+    def __init__(self, window_size=5):
+        self._buf = []
+        self._window = window_size
+
+    def update(self, value):
+        """加入新值，返回中值。"""
+        self._buf.append(value)
+        if len(self._buf) > self._window:
+            self._buf.pop(0)
+        # 拷贝排序取中值（避免改原数组）
+        tmp = sorted(self._buf)
+        n = len(tmp)
+        return tmp[n // 2]
+
+    def reset(self):
+        self._buf.clear()
+
+
 class UWBPosition:
     """UWB 定位器 — 连续接收 UWB 数据，提供坐标输出和条件存储。"""
 
     # ── 滤波系数 ──
-    D_FILT_ALPHA = 0.15      # 距离低通
-    XY_FILT_ALPHA = 0.10     # 坐标低通
-    ANGLE_FILT_ALPHA = 0.10  # 角度低通
+    D_FILT_ALPHA = 0.20       # 距离低通（加快响应）
+    XY_FILT_ALPHA = 0.15      # 坐标低通（加快响应）
+    ANGLE_FILT_ALPHA = 0.15   # 角度低通（加快响应）
+
+    # ── 中值滤波 ──
+    MEDIAN_WINDOW = 5         # 中值滤波窗口大小（奇数）
+
+    # ── 异常值检测 ──
+    OUTLIER_DIST_CM = 30.0    # 距离跳变超过此值视为异常
+    OUTLIER_XY_CM = 25.0      # XY 跳变超过此值视为异常
 
     # ── 超时 ──
     TIMEOUT_MS = 800
@@ -66,6 +94,7 @@ class UWBPosition:
         # ── SW2 按键初始化 ──
         self._switch2 = Pin(self.SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
         self._switch2_state = self._switch2.value()  # 记录初始状态
+        self._switch2_synced = False  # 首次 step() 时同步
         self._switch2_pressed = False
 
         # ── 滤波状态变量 ──
@@ -73,6 +102,16 @@ class UWBPosition:
         self._x_filt = None
         self._y_filt = None
         self._angle_filt = None
+
+        # ── 中值滤波器（每通道独立） ──
+        self._med_d = MedianFilter(self.MEDIAN_WINDOW)
+        self._med_x = MedianFilter(self.MEDIAN_WINDOW)
+        self._med_y = MedianFilter(self.MEDIAN_WINDOW)
+
+        # ── 异常值检测：上一次有效值 ──
+        self._last_valid_d = None
+        self._last_valid_x = None
+        self._last_valid_y = None
 
         # ── 时间管理 ──
         self._last_data_ticks = time.ticks_ms()
@@ -128,12 +167,16 @@ class UWBPosition:
             bool: True 表示程序应继续运行，False 表示 SW2 被按下应退出
         """
         # ── SW2 按键检测（边沿触发） ──
-        current_switch = self._switch2.value()
-        if current_switch != self._switch2_state:
-            self._switch2_state = current_switch
-            self._switch2_pressed = True
-            print("SW2 pressed - program will exit")
-            return False
+        # 前 5 帧跳过检测，避免上电/初始化时误触发
+        if self._frame_count < 5:
+            self._switch2_state = self._switch2.value()
+        else:
+            current_switch = self._switch2.value()
+            if current_switch != self._switch2_state:
+                self._switch2_state = current_switch
+                self._switch2_pressed = True
+                print("SW2 pressed - program will exit")
+                return False
 
         # ── 超时保护 ──
         if time.ticks_diff(time.ticks_ms(), self._last_data_ticks) > self.TIMEOUT_MS:
@@ -162,20 +205,25 @@ class UWBPosition:
                     if len(self._rx_line) > 200:
                         self._rx_line = bytearray()
 
+        return True
+
     # ============================================================
     #  内部：处理一行 UWB 数据（滤波 + 条件存储）
     # ============================================================
     def _process_line(self, line_str):
-        """处理一行 UWB 数据。"""
+        """处理一行 UWB 数据（三层滤波：中值 → 异常值剔除 → 低通）。"""
         data = self._parse_json_line(line_str)
         if data is None or 'TWR' not in data:
             return
 
         twr = data['TWR']
         anchor = twr.get('a16', '?')
-        d_cm = twr.get('D', 0)
-        x_cm = twr.get('Xcm', 0)
-        y_cm = twr.get('Ycm', 0)
+        try:
+            d_cm = float(twr.get('D', 0))
+            x_cm = float(twr.get('Xcm', 0))
+            y_cm = float(twr.get('Ycm', 0))
+        except (ValueError, TypeError):
+            return  # 数据格式异常，丢弃本帧
 
         # ── 跳过非目标锚点 ──
         if self._target_anchor is not None and str(anchor) != self._target_anchor:
@@ -188,14 +236,30 @@ class UWBPosition:
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
 
-        # ── 低通滤波 ──
-        if self._x_filt is None:
-            self._x_filt = float(x_cm)
-            self._y_filt = float(y_cm)
-        else:
-            self._x_filt = self.XY_FILT_ALPHA * x_cm + (1 - self.XY_FILT_ALPHA) * self._x_filt
-            self._y_filt = self.XY_FILT_ALPHA * y_cm + (1 - self.XY_FILT_ALPHA) * self._y_filt
+        # ── 第 1 层：中值滤波（去尖刺） ──
+        d_med = self._med_d.update(d_cm)
+        x_med = self._med_x.update(x_cm)
+        y_med = self._med_y.update(y_cm)
 
+        # ── 第 2 层：异常值检测（跳变过大则丢弃） ──
+        if self._last_valid_d is not None:
+            if abs(d_med - self._last_valid_d) > self.OUTLIER_DIST_CM:
+                return  # 丢弃本帧
+            if abs(x_med - self._last_valid_x) > self.OUTLIER_XY_CM or \
+               abs(y_med - self._last_valid_y) > self.OUTLIER_XY_CM:
+                return  # 丢弃本帧
+
+        # ── 第 3 层：低通滤波（平滑输出） ──
+        if self._x_filt is None:
+            self._x_filt = float(x_med)
+            self._y_filt = float(y_med)
+            self._d_filt = float(d_med)
+        else:
+            self._x_filt = self.XY_FILT_ALPHA * x_med + (1 - self.XY_FILT_ALPHA) * self._x_filt
+            self._y_filt = self.XY_FILT_ALPHA * y_med + (1 - self.XY_FILT_ALPHA) * self._y_filt
+            self._d_filt = self.D_FILT_ALPHA * d_med + (1 - self.D_FILT_ALPHA) * self._d_filt
+
+        # ── 角度滤波（基于已滤波坐标计算） ──
         angle_to_target = math.atan2(-self._x_filt, self._y_filt) * 180.0 / math.pi
         if self._angle_filt is None:
             self._angle_filt = angle_to_target
@@ -203,10 +267,10 @@ class UWBPosition:
             self._angle_filt = self.ANGLE_FILT_ALPHA * angle_to_target + (
                 1 - self.ANGLE_FILT_ALPHA) * self._angle_filt
 
-        if self._d_filt is None:
-            self._d_filt = float(d_cm)
-        else:
-            self._d_filt = self.D_FILT_ALPHA * d_cm + (1 - self.D_FILT_ALPHA) * self._d_filt
+        # ── 更新异常值参考值 ──
+        self._last_valid_d = d_med
+        self._last_valid_x = x_med
+        self._last_valid_y = y_med
 
         # ── 更新当前坐标 ──
         self._current_x = self._x_filt
@@ -218,7 +282,7 @@ class UWBPosition:
         self._check_and_store()
 
         # ── Debug 打印 ──
-        if self._frame_count % 10 == 0:  # 每10帧打印一次，减少输出
+        if self._frame_count % 10 == 0:
             print("[{}] a={} D={:.1f} X={:.1f} Y={:.1f} ang={:+.0f}° loc_cnt={}".format(
                 self._frame_count, anchor, self._d_filt,
                 self._x_filt, self._y_filt, self._angle_filt,

@@ -40,10 +40,10 @@ PHASE_TIMEOUT_S = 20
 PRINT_MS = 300
 
 # ── 位置 PID ──
-POS_KP = 0.015      # 位置增益
+POS_KP = 0.014      # 位置增益
 POS_KI = 0.0        # 积分增益（UWB 有噪声，不用积分）
 POS_DB = 0.5        # 到位死区 (cm)
-MAX_SPEED = 0.3    # 最大速度 (m/s)
+MAX_SPEED = 0.4    # 最大速度 (m/s)
 
 # ── 航向 PID ──
 HDG_KP = 1.5        # 航向偏差(°) → 目标 dps
@@ -248,8 +248,11 @@ state = 0  # 0=等待数据, 1=移动中, 2=到达
 retry_count = 0
 MAX_RETRIES = 3
 
+loop_count = 0
 while True:
-    if switch2.value() != state2:
+    loop_count += 1
+    # 前 10 次循环跳过 SW2 检测，避免上电误触发
+    if loop_count > 10 and switch2.value() != state2:
         print("\n=== SW2 STOP ===")
         break
     
