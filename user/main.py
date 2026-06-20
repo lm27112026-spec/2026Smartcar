@@ -17,7 +17,7 @@ from motor import (stop_all, omni_drive_closed_loop,
                    enc_ticker, ENC_SCALE)
 import imu_motion
 from imu_motion import (update_angle, get_angular_velocity,
-                        reset_ang_vel_pid, imu_get_safe, yaw)
+                        reset_ang_vel_pid, imu_get_safe)
 from key import capture, key_triggered, pet_watchdog
 from cam_data import CamDataReceiver, x_to_cm, y_to_distance
 
@@ -50,32 +50,36 @@ STATE_RETURN_DEPART = 6   # 返回发车区（方案待定，占位）
 STATE_DONE          = 7   # 任务完成，停车退出
 
 # ── 摄像头 FLAG 占位值（待摄像头团队确认）──
-# TODO: 确认黄线、发车区的实际 FLAG 值
-FLAG_YELLOW    = 0xC0
-FLAG_DEPARTURE = 0xC1
+# TODO: 黄线 FLAG 值待摄像头团队定义后填入
+FLAG_YELLOW    = 0xC0    # 占位（0x02/03=物品, 0x04≠黄线）
+FLAG_DEPARTURE = 0xC1    # 占位
 
 # ── 左前盲走参数 ──
-LEFT_FWD_SPEED  = 0.30    # 合速度 (m/s)
+LEFT_FWD_SPEED  = 0.40    # 合速度 (m/s)
 LEFT_FWD_ANGLE  = 45.0    # 左前方角度 (deg)
-YAW_KP          = 0.08    # 航向纠偏 P 增益 (rad/s per deg)
-YAW_WZ_LIMIT    = 0.4     # 最大纠偏角速度 (rad/s)
-_ref_yaw        = 0.0     # 参考航向（模块级，供 drive_left_forward 使用）
+YAW_KP          = 0.03    # 航向纠偏 P 增益（降低防振动触发）
+YAW_KI          = 0.002   # 航向纠偏 I 增益
+YAW_WZ_LIMIT    = 0.15    # 最大纠偏角速度 (rad/s)
+YAW_INT_LIMIT   = 0.5     # 积分抗饱和上限
+YAW_DEADBAND    = 2.0     # 死区 (deg)：<2° 不纠偏
+_ref_yaw        = 0.0     # 参考航向
+_yaw_integral   = 0.0     # 航向积分项
 
 # ── 物品区扫描参数 ──
 SCAN_EMPTY_FRAMES = 15    # 连续 N 帧无目标 → 判定为空
 
 # ── 左前盲走 级联 PID（速度环 + 加速度限幅 + 软启动）──
 PID_LF_FWD = CascadePID(
-    kp=1.5, ki=0.05, kd=0.0,
-    out_limit=0.50,           # 最大前进速度 (m/s)
-    accel_limit=1.0,          # 缓加速 (m/s²)
-    soft_start_ms=400,
+    kp=2.0, ki=0.5, kd=0.0,
+    out_limit=0.50,
+    accel_limit=2.0,
+    soft_start_ms=150,        # 快速软启动
 )
 PID_LF_LAT = CascadePID(
-    kp=1.5, ki=0.05, kd=0.0,
-    out_limit=0.45,           # 最大横向速度 (m/s)
-    accel_limit=1.0,
-    soft_start_ms=400,
+    kp=2.0, ki=0.5, kd=0.0,
+    out_limit=0.45,
+    accel_limit=2.0,
+    soft_start_ms=150,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -111,9 +115,9 @@ def check_sw2():
 _lftfwd_debug_cnt = 0
 
 def drive_left_forward(debug=False):
-    """级联 PID 闭环 + IMU 航向纠偏
+    """级联 PID 闭环 + IMU 航向 PI 纠偏（撞击后自动回正）
     运动学: vx=+0.212m/s vy=-0.212m/s → 45°左前"""
-    global _lftfwd_debug_cnt
+    global _lftfwd_debug_cnt, _yaw_integral
     VX_TARGET = 0.212
     VY_TARGET = -0.212
     try:
@@ -123,18 +127,27 @@ def drive_left_forward(debug=False):
         actual_vy = (-rs[0] - rs[1] + rs[2] + rs[3]) / 4.0
         cmd_vx = PID_LF_FWD.compute(VX_TARGET - actual_vx, CAM_DT)
         cmd_vy = PID_LF_LAT.compute(VY_TARGET - actual_vy, CAM_DT)
-        # IMU 航向纠偏
+        # IMU 航向 PI 纠偏
         d = imu_get_safe()
         if d is not None:
             update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-        yaw_err = _wrap_180(_ref_yaw - yaw)
-        wz = max(-YAW_WZ_LIMIT, min(YAW_KP * yaw_err, YAW_WZ_LIMIT))
+        yaw_err = _wrap_180(_ref_yaw - imu_motion.yaw)
+        # 死区：小偏差不纠偏（过滤电机振动引起的虚假偏航）
+        if abs(yaw_err) < YAW_DEADBAND:
+            _yaw_integral = 0.0
+            wz = 0.0
+        else:
+            _yaw_integral += yaw_err * CAM_DT
+            _yaw_integral = max(-YAW_INT_LIMIT, min(_yaw_integral, YAW_INT_LIMIT))
+            wz = max(-YAW_WZ_LIMIT, min(YAW_KP * yaw_err + YAW_KI * _yaw_integral, YAW_WZ_LIMIT))
         omni_drive_closed_loop(cmd_vx, cmd_vy, wz, rs, CAM_DT)
         if debug:
             _lftfwd_debug_cnt += 1
             if _lftfwd_debug_cnt % 10 == 0:
-                print("[DBG] LFTFWD raw=({:.3f},{:.3f}) cmd=({:.3f},{:.3f}) yaw={:.1f} err={:.1f} wz={:.3f}".format(
-                    actual_vx, actual_vy, cmd_vx, cmd_vy, yaw, yaw_err, wz))
+                print("[DBG] LFTFWD raw=({:.3f},{:.3f}) cmd=({:.3f},{:.3f}) "
+                      "yaw={:.1f} err={:.1f} wz={:.3f}".format(
+                    actual_vx, actual_vy, cmd_vx, cmd_vy,
+                    imu_motion.yaw, yaw_err, wz))
     except Exception as e:
         print("[LEFT_FWD] drive error:", e)
 
@@ -156,7 +169,7 @@ def do_180_turn():
         return False
     update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
-    current_yaw = yaw  # 当前航向角 (deg, 全局变量)
+    current_yaw = imu_motion.yaw  # 当前航向角 (deg, 全局变量)
     target_yaw = current_yaw + 180.0
     if target_yaw > 180.0:
         target_yaw -= 360.0
@@ -293,10 +306,11 @@ def _create_mode_manager():
             if d is not None:
                 update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
             time.sleep_ms(10)
-        res['ref_yaw'] = yaw   # 锁定当前航向为参考方向
-        global _ref_yaw
-        _ref_yaw = yaw
-        print("[LEFT_FWD] ref_yaw = {:.1f} deg".format(yaw))
+        res['ref_yaw'] = imu_motion.yaw   # 锁定当前航向为参考方向
+        global _ref_yaw, _yaw_integral
+        _ref_yaw = imu_motion.yaw
+        _yaw_integral = 0.0    # 重置积分（新一轮盲走）
+        print("[LEFT_FWD] ref_yaw = {:.1f} deg".format(imu_motion.yaw))
         # 编码器
         enc_ticker.start(10)
         time.sleep_ms(50)
