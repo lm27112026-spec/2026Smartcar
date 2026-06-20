@@ -44,25 +44,47 @@ DT             = 0.02    # 控制周期 (s)
 # ═══════════════════════════════════════════════════════════════
 
 class CascadePID:
-    """级联 PID: 位置环 → 速度限幅 → 输出"""
+    """级联 PID: 位置环 → 速度限幅 → 输出（带软启动 + 软停止）"""
 
-    def __init__(self, kp, ki, kd, out_limit, accel_limit):
+    def __init__(self, kp, ki, kd, out_limit, accel_limit,
+                 soft_start_ms=300, soft_stop_ms=200):
         self.pid = PID(kp=kp, ki=ki, kd=kd,
                        integral_limit=50, output_limit=out_limit)
         self.accel_limit = accel_limit
         self.prev_output = 0.0
+        # ── 软启动 ──
+        self.soft_start_ms = soft_start_ms   # 爬升时间 (ms)
+        self.soft_start_t0 = 0               # 本次 reset 时间戳
+        self.soft_start_active = False       # 是否正在爬升
+        # ── 软停止 ──
+        self.soft_stop_ms = soft_stop_ms     # 减速时间 (ms)
+        self.soft_stop_t0 = 0                # 开始减速的时间戳
+        self.soft_stop_active = False        # 是否正在减速
 
     def compute(self, error, dt):
         """
-        计算输出，带加速度限幅
+        计算输出，带软启动 + 软停止 + 加速度限幅
         error: 位置误差 (cm)
         返回: 速度指令 (m/s)
         """
         # 位置 PID → 目标速度
-        # compute(error, 0): error>0(太远)→前进, error<0(太近)→后退
         target_speed = self.pid.compute(error, 0, dt)
 
-        # 加速度限幅（平滑速度变化）
+        # ── 软启动：输出 = PID值 × ramp(0→1) ──
+        if self.soft_start_active:
+            elapsed = time.ticks_diff(time.ticks_ms(), self.soft_start_t0)
+            if elapsed >= self.soft_start_ms:
+                self.soft_start_active = False
+                ramp = 1.0
+            else:
+                ramp = elapsed / self.soft_start_ms
+            target_speed *= ramp
+
+        # ── 软停止：目标归零，由加速度限幅自然减速 ──
+        if self.soft_stop_active:
+            target_speed = 0.0
+
+        # 加速度限幅（在软启/停基础上做二次平滑）
         delta = target_speed - self.prev_output
         max_delta = self.accel_limit * dt
         if abs(delta) > max_delta:
@@ -72,9 +94,27 @@ class CascadePID:
 
         return output
 
+    # ── 软停止 API ──
+
+    def begin_soft_stop(self):
+        """触发软停止：输出从当前值由加速度限幅自然降到 0"""
+        self.soft_stop_active = True
+
+    @property
+    def stop_done(self):
+        """软停止是否完成（输出已接近 0）"""
+        return abs(self.prev_output) < 0.005
+
     def reset(self):
         self.pid.reset()
-        self.prev_output = 0.0
+        # 软停止进行中（电机还在转）→ 保留 prev_output 以保持平滑过渡
+        if not self.soft_stop_active:
+            self.prev_output = 0.0
+        # ── 触发软启动 ──
+        self.soft_start_t0 = time.ticks_ms()
+        self.soft_start_active = True
+        # ── 取消软停止 ──
+        self.soft_stop_active = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -82,13 +122,13 @@ class CascadePID:
 # ═══════════════════════════════════════════════════════════════
 
 PID_FWD = CascadePID(
-    kp=0.012, ki=0.003, kd=0.010,
+    kp=0.02, ki=0.00, kd=0.0,
     out_limit=MAX_SPEED_FWD,
     accel_limit=ACCEL_LIMIT
 )
 
 PID_LAT = CascadePID(
-    kp=0.010, ki=0.002, kd=0.012,
+    kp=0.0, ki=0.00, kd=0.0,
     out_limit=MAX_SPEED_LAT,
     accel_limit=ACCEL_LIMIT
 )
@@ -189,32 +229,39 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
         'just_switched':  False,
     }
 
-    # ── 状态判断（与 backup 第176-195行完全一致）──
+    # ── 状态判断 ──
     if is_target:
         last_target_ms = now_ms
         if _state == STATE_LOST:
             _state = STATE_FOLLOW
             reset_wheel_pi()
-            PID_FWD.reset()
+            PID_FWD.reset()   # 取消软停止 + 触发软启动
             PID_LAT.reset()
             filt_fwd = 0.0
             filt_lat = 0.0
             filt_fwd_sign = 0
             filt_lat_sign = 0
             result['state_msg'] = "[LOST -> FOLLOW] Captured!"
-            result['just_switched'] = True  # 标记刚切换，给硬件缓冲时间
+            result['just_switched'] = True
     else:
         if _state == STATE_FOLLOW:
             if time.ticks_diff(now_ms, last_target_ms) > LOST_TIMEOUT_MS:
                 _state = STATE_LOST
-                stop_all()
+                # ── 软停止：不急停，让加速度限幅自然减速 ──
+                PID_FWD.begin_soft_stop()
+                PID_LAT.begin_soft_stop()
                 result['state_msg'] = "[FOLLOW -> LOST] Lost!"
                 result['state'] = _state
+                # 计算软停止第一帧输出，避免断帧
+                cmd_fwd = PID_FWD.compute(0, DT)
+                cmd_lat = PID_LAT.compute(0, DT)
+                result['cmd_fwd'] = cmd_fwd
+                result['cmd_lat'] = cmd_lat
                 return result
 
     result['state'] = _state
 
-    # ── FOLLOW 状态：级联 PID 控制（与 backup 第198-227行完全一致）──
+    # ── FOLLOW 状态：级联 PID 控制 ──
     if _state == STATE_FOLLOW:
         x_error = x_cm
         y_error = actual_dist - TARGET_DIST_CM
@@ -229,26 +276,37 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
         # 速度滤波
         cmd_fwd, cmd_lat = speed_filter(cmd_fwd, cmd_lat)
 
+        # fwd 永远为正：不后退，只前进或停
+        if cmd_fwd < 0:
+            cmd_fwd = 0.0
+
         # 最低速度防死区
-        if abs(cmd_fwd) > 0.01 and abs(cmd_fwd) < MIN_SPEED:
-            cmd_fwd = MIN_SPEED if cmd_fwd > 0 else -MIN_SPEED
+        if cmd_fwd > 0.01 and cmd_fwd < MIN_SPEED:
+            cmd_fwd = MIN_SPEED
         if abs(cmd_lat) > 0.01 and abs(cmd_lat) < MIN_SPEED:
             cmd_lat = MIN_SPEED if cmd_lat > 0 else -MIN_SPEED
 
-        # 到达判定
+        # 到达判定 → 软停止
         if abs(y_error) < STOP_DIST_CM and abs(x_cm) < 10:
             _state = STATE_STOPPED
-            stop_all()
+            PID_FWD.begin_soft_stop()
+            PID_LAT.begin_soft_stop()
             result['arrived'] = True
             result['state_msg'] = "[FOLLOW -> STOPPED] dist={:.1f}cm".format(actual_dist)
             result['state'] = _state
+            # 计算软停止第一帧输出
+            cmd_fwd = PID_FWD.compute(0, DT)
+            cmd_lat = PID_LAT.compute(0, DT)
+            result['cmd_fwd'] = cmd_fwd
+            result['cmd_lat'] = cmd_lat
             return result
 
         result['cmd_fwd'] = cmd_fwd
         result['cmd_lat'] = cmd_lat
 
-    # ── STOPPED 状态（与 backup 第229-240行完全一致）──
+    # ── STOPPED 状态 ──
     elif _state == STATE_STOPPED:
+        # 优先：目标偏移过大 → 恢复跟随（reset 会取消软停止 + 触发软启动）
         if abs(actual_dist - TARGET_DIST_CM) > STOP_DIST_CM * 2:
             _state = STATE_FOLLOW
             reset_wheel_pi()
@@ -260,10 +318,27 @@ def compute_control(x_cm, actual_dist, is_target, now_ms=None):
             filt_lat_sign = 0
             result['state_msg'] = "[STOPPED -> FOLLOW] Resuming."
             result['state'] = _state
+        # 软停止进行中 → 继续输出减速指令
+        elif not PID_FWD.stop_done or not PID_LAT.stop_done:
+            cmd_fwd = PID_FWD.compute(0, DT)
+            cmd_lat = PID_LAT.compute(0, DT)
+            result['cmd_fwd'] = cmd_fwd
+            result['cmd_lat'] = cmd_lat
+        # 软停止完成 → 真正断电
+        else:
+            stop_all()
 
-    # ── LOST 状态（与 backup 第242-243行完全一致）──
+    # ── LOST 状态 ──
     elif _state == STATE_LOST:
-        stop_all()
+        # 软停止进行中 → 继续输出减速指令
+        if not PID_FWD.stop_done or not PID_LAT.stop_done:
+            cmd_fwd = PID_FWD.compute(0, DT)
+            cmd_lat = PID_LAT.compute(0, DT)
+            result['cmd_fwd'] = cmd_fwd
+            result['cmd_lat'] = cmd_lat
+        # 软停止完成 → 真正断电
+        else:
+            stop_all()
 
     return result
 
