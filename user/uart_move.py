@@ -36,7 +36,7 @@ DIST_KP = 1.0
 DIST_KI = 0.5
 DIST_OUT_LIMIT = 0.30
 MIN_SPEED = 0.08
-
+    
 # 航向 PID（外环：航向偏差 → 目标 dps，内环由 imu_motion 角速度闭环处理）
 HDG_KP = 0.08     # 航向偏差 (°) → 目标 dps：1° → 30dps，5° → 150dps
 HDG_DB = 0.5      # 航向死区（度）
