@@ -42,8 +42,11 @@ PRINT_MS = 300
 # ── 位置 PID ──
 POS_KP = 0.014      # 位置增益
 POS_KI = 0.0        # 积分增益（UWB 有噪声，不用积分）
-POS_DB = 0.5        # 到位死区 (cm)
-MAX_SPEED = 0.4    # 最大速度 (m/s)
+POS_DB = 5.0        # 到位死区 (cm) — 需大于 UWB ±5cm 噪声，防止噪声导致反复调整
+POS_HYSTERESIS = 15.0   # 迟滞阈值 (cm) — 到达后超出此值才重新判定为"未到达"
+ARRIVAL_CONFIRM_FRAMES = 5  # 连续 N 帧在死区内才算真正到达（防单次噪声误触发）
+SLOW_DIST = 15.0     # 距离目标 <15cm 开始线性减速，防止过冲
+MAX_SPEED = 0.4     # 最大速度 (m/s)
 
 # ── 航向 PID ──
 HDG_KP = 1.5        # 航向偏差(°) → 目标 dps
@@ -127,6 +130,7 @@ def move_to_target_xy(target_x, target_y, label):
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     last_uwb_update_ms = start_ms
+    arrival_count = 0  # 连续 N 帧在死区内的计数器
     
     # 锁定当前航向
     target_heading = imu_motion.yaw
@@ -158,9 +162,13 @@ def move_to_target_xy(target_x, target_y, label):
         error_y = target_y - curr_y
         dist = math.sqrt(error_x * error_x + error_y * error_y)
         
-        # 到位判定
+        # 到位判定（连续 N 帧在死区内才 break，防止单次 UWB 噪声误触发）
         if dist < POS_DB:
-            break
+            arrival_count += 1
+            if arrival_count >= ARRIVAL_CONFIRM_FRAMES:
+                break
+        else:
+            arrival_count = 0
         
         # IMU 读取 + 航向保持
         wz = 0.0
@@ -196,6 +204,13 @@ def move_to_target_xy(target_x, target_y, label):
         vx_cmd = body_fwd * POS_KP
         vy_cmd = body_right * POS_KP
         
+        # 速度衰减：距离 < SLOW_DIST 时线性减速，防止过冲
+        if dist < SLOW_DIST:
+            decay = (dist - POS_DB) / (SLOW_DIST - POS_DB)
+            decay = max(0.0, min(1.0, decay))
+            vx_cmd *= decay
+            vy_cmd *= decay
+        
         # 限幅
         speed = math.sqrt(vx_cmd * vx_cmd + vy_cmd * vy_cmd)
         if speed > MAX_SPEED:
@@ -228,7 +243,7 @@ def move_to_target_xy(target_x, target_y, label):
     curr_x, curr_y = uwb.get_position()
     final_dist = calc_distance(curr_x, curr_y, target_x, target_y)
     
-    if final_dist < POS_DB * 2:  # 允许 2 倍死区
+    if final_dist < POS_HYSTERESIS:  # 迟滞阈值：到达后需大幅偏离才重新判定
         print("  >>> [{:s}] done: ({:.1f}, {:.1f}) err={:.1f}cm <<<".format(
             label, curr_x, curr_y, final_dist))
         return True

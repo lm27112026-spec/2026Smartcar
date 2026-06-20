@@ -29,6 +29,7 @@ uwb_position.py — UWB 定位模块
 
 import gc, time, math, json
 from machine import UART, Pin
+from kalman_filter import KalmanFilter1D
 
 
 class MedianFilter:
@@ -57,11 +58,11 @@ class UWBPosition:
 
     # ── 滤波系数 ──
     D_FILT_ALPHA = 0.20       # 距离低通（加快响应）
-    XY_FILT_ALPHA = 0.15      # 坐标低通（加快响应）
+    XY_FILT_ALPHA = 0.10      # 坐标低通（加快响应）
     ANGLE_FILT_ALPHA = 0.15   # 角度低通（加快响应）
 
     # ── 中值滤波 ──
-    MEDIAN_WINDOW = 5         # 中值滤波窗口大小（奇数）
+    MEDIAN_WINDOW = 7         # 中值滤波窗口大小（奇数，7帧 ≈ 700ms 平滑）
 
     # ── 异常值检测 ──
     OUTLIER_DIST_CM = 30.0    # 距离跳变超过此值视为异常
@@ -113,10 +114,18 @@ class UWBPosition:
         self._last_valid_x = None
         self._last_valid_y = None
 
+        # ── 卡尔曼滤波器（替代低通滤波，自适应降噪） ──
+        # UWB 噪声 ±5cm → R≈25；小车运动适中 → Q≈1.0
+        self._kf_x = KalmanFilter1D(Q=1.0, R=25.0, P_min=0.5, name='uwb_x')
+        self._kf_y = KalmanFilter1D(Q=1.0, R=25.0, P_min=0.5, name='uwb_y')
+        self._kf_d = KalmanFilter1D(Q=1.5, R=20.0, P_min=0.5, name='uwb_d')
+        self._kf_angle = KalmanFilter1D(Q=2.0, R=15.0, P_min=0.5, name='uwb_ang')
+
         # ── 时间管理 ──
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
         self._frame_count = 0
+        self._uart_rx_count = 0  # UART 总接收字节数（诊断用）
 
         # ── 位置存储 ──
         self.location = []  # 位置历史数组
@@ -182,12 +191,15 @@ class UWBPosition:
         if time.ticks_diff(time.ticks_ms(), self._last_data_ticks) > self.TIMEOUT_MS:
             if not self._timeout_stopped:
                 self._timeout_stopped = True
-                print("UWBPosition: timeout — no data for {}ms".format(self.TIMEOUT_MS))
+                uart_bytes = self._uart.any() if self._uart else -1
+                print("UWBPosition: timeout — uart_bytes={} frame={}".format(
+                    uart_bytes, self._frame_count))
 
         # ── 非阻塞读取 UART ──
         if self._uart is not None and self._uart.any():
             raw = self._uart.read(self._uart.any())
             if raw:
+                self._uart_rx_count += len(raw)
                 for i in range(len(raw)):
                     b = raw[i]
 
@@ -204,6 +216,13 @@ class UWBPosition:
                     self._rx_line.append(b)
                     if len(self._rx_line) > 200:
                         self._rx_line = bytearray()
+        else:
+            # 每 200 帧打印一次 UART 状态（诊断用）
+            if self._frame_count > 0 and self._frame_count % 200 == 0:
+                print("[diag] frame={} uart_bytes={} rx_total={}".format(
+                    self._frame_count,
+                    self._uart.any() if self._uart else -1,
+                    self._uart_rx_count))
 
         return True
 
@@ -249,23 +268,27 @@ class UWBPosition:
                abs(y_med - self._last_valid_y) > self.OUTLIER_XY_CM:
                 return  # 丢弃本帧
 
-        # ── 第 3 层：低通滤波（平滑输出） ──
+        # ── 第 3 层：卡尔曼滤波（自适应降噪，替代固定低通） ──
         if self._x_filt is None:
+            # 首帧：初始化卡尔曼状态
+            self._kf_x.reset(x0=x_med, P0=10.0)
+            self._kf_y.reset(x0=y_med, P0=10.0)
+            self._kf_d.reset(x0=d_med, P0=10.0)
             self._x_filt = float(x_med)
             self._y_filt = float(y_med)
             self._d_filt = float(d_med)
         else:
-            self._x_filt = self.XY_FILT_ALPHA * x_med + (1 - self.XY_FILT_ALPHA) * self._x_filt
-            self._y_filt = self.XY_FILT_ALPHA * y_med + (1 - self.XY_FILT_ALPHA) * self._y_filt
-            self._d_filt = self.D_FILT_ALPHA * d_med + (1 - self.D_FILT_ALPHA) * self._d_filt
+            self._x_filt = self._kf_x.update(x_med)
+            self._y_filt = self._kf_y.update(y_med)
+            self._d_filt = self._kf_d.update(d_med)
 
-        # ── 角度滤波（基于已滤波坐标计算） ──
+        # ── 角度卡尔曼滤波（基于已滤波坐标计算） ──
         angle_to_target = math.atan2(-self._x_filt, self._y_filt) * 180.0 / math.pi
         if self._angle_filt is None:
+            self._kf_angle.reset(x0=angle_to_target, P0=10.0)
             self._angle_filt = angle_to_target
         else:
-            self._angle_filt = self.ANGLE_FILT_ALPHA * angle_to_target + (
-                1 - self.ANGLE_FILT_ALPHA) * self._angle_filt
+            self._angle_filt = self._kf_angle.update(angle_to_target)
 
         # ── 更新异常值参考值 ──
         self._last_valid_d = d_med
