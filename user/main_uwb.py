@@ -40,13 +40,14 @@ PHASE_TIMEOUT_S = 20
 PRINT_MS = 300
 
 # ── 位置 PID ──
-POS_KP = 0.008      # 位置增益 (cm → m/s)
-POS_DB = 3.0        # 到位死区 (cm)
-MAX_SPEED = 0.25    # 最大速度 (m/s)
+POS_KP = 0.015      # 位置增益
+POS_KI = 0.0        # 积分增益（UWB 有噪声，不用积分）
+POS_DB = 0.5        # 到位死区 (cm)
+MAX_SPEED = 0.3    # 最大速度 (m/s)
 
 # ── 航向 PID ──
 HDG_KP = 1.5        # 航向偏差(°) → 目标 dps
-HDG_DB = 2.0        # 航向死区 (度)
+HDG_DB = 1.0        # 航向死区 (度)
 
 # ── UWB ──
 UWB_TARGET_ANCHOR = "8834"
@@ -120,13 +121,12 @@ def move_to_target_xy(target_x, target_y, label):
         _ = get_encoder_counts()
         time.sleep_ms(10)
     
-    pid_x = PID(kp=POS_KP, ki=0.01, kd=0.0, integral_limit=0.1, output_limit=MAX_SPEED)
-    pid_y = PID(kp=POS_KP, ki=0.01, kd=0.0, integral_limit=0.1, output_limit=MAX_SPEED)
+    # P 控制器（简单比例控制，无积分）
     reset_ang_vel_pid()
     
-    total_counts = [0, 0, 0, 0]
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
+    last_uwb_update_ms = start_ms
     
     # 锁定当前航向
     target_heading = imu_motion.yaw
@@ -145,12 +145,18 @@ def move_to_target_xy(target_x, target_y, label):
             print("  SW2 stop")
             return False
         
-        # 获取当前 UWB 坐标（需要调用 step() 接收新数据）
-        uwb.step()
+        # 每 50ms 接收一次 UWB 数据
+        if time.ticks_diff(now_ms, last_uwb_update_ms) >= 50:
+            uwb.step()
+            last_uwb_update_ms = now_ms
+        
+        # 获取当前 UWB 坐标
         curr_x, curr_y = uwb.get_position()
         
-        # 计算到目标的距离和误差
-        dist = calc_distance(curr_x, curr_y, target_x, target_y)
+        # 计算到目标的误差
+        error_x = target_x - curr_x
+        error_y = target_y - curr_y
+        dist = math.sqrt(error_x * error_x + error_y * error_y)
         
         # 到位判定
         if dist < POS_DB:
@@ -168,16 +174,33 @@ def move_to_target_xy(target_x, target_y, label):
                 target_dps = max(-180, min(target_dps, 180))
                 wz = angular_velocity_control(target_dps, get_angular_velocity(), DT)
         
-        # 根据 UWB 坐标误差计算运动分量
-        # 运动学映射（实测）：
-        #   vx 对应 UWB Y 轴（负方向）：vx>0 → Y 减小
-        #   vy 对应 UWB X 轴（正方向）：vy>0 → X 增大
-        error_y = target_y - curr_y  # 目标 Y - 当前 Y
-        error_x = target_x - curr_x  # 目标 X - 当前 X
+        # 简单 P 控制：速度 = KP × 误差
+        # 误差在 UWB 世界坐标系，需要转换到车体坐标系
+        # UWB 坐标系：前进 = -Y，右移 = +X
+        # 车体坐标系：前进 = +vx，右移 = +vy
         
-        # PID 计算速度
-        vy_cmd = pid_x.compute(setpoint=0, measurement=-error_x, dt=DT)  # X 误差 → vy
-        vx_cmd = pid_y.compute(setpoint=0, measurement=error_y, dt=DT)   # Y 误差 → vx
+        # 世界坐标系误差
+        world_err_x = error_x  # UWB X 方向误差
+        world_err_y = error_y  # UWB Y 方向误差
+        
+        # 先旋转到车体坐标系（减去 yaw 角）
+        yaw_rad = math.radians(imu_motion.yaw)
+        rot_x = world_err_x * math.cos(yaw_rad) + world_err_y * math.sin(yaw_rad)
+        rot_y = -world_err_x * math.sin(yaw_rad) + world_err_y * math.cos(yaw_rad)
+        
+        # 再映射到车体运动方向（UWB: 前进=-Y, 右移=+X → 车体: 前进=+vx, 右移=+vy）
+        body_fwd = -rot_y   # UWB -Y 方向 = 车体前进 (+vx)
+        body_right = rot_x  # UWB +X 方向 = 车体右移 (+vy)
+        
+        # 车体坐标系速度
+        vx_cmd = body_fwd * POS_KP
+        vy_cmd = body_right * POS_KP
+        
+        # 限幅
+        speed = math.sqrt(vx_cmd * vx_cmd + vy_cmd * vy_cmd)
+        if speed > MAX_SPEED:
+            vx_cmd = vx_cmd / speed * MAX_SPEED
+            vy_cmd = vy_cmd / speed * MAX_SPEED
         
         # 限幅
         vx_cmd = max(-MAX_SPEED, min(vx_cmd, MAX_SPEED))
@@ -196,10 +219,23 @@ def move_to_target_xy(target_x, target_y, label):
         
         time.sleep_ms(10)
     
+    # 到位后停止并重新确认
     omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], DT)
+    time.sleep_ms(200)  # 停止 200ms 等待 UWB 稳定
+    
+    # 重新读取坐标确认
+    uwb.step()
     curr_x, curr_y = uwb.get_position()
-    print("  >>> [{:s}] done: ({:.1f}, {:.1f}) <<<".format(label, curr_x, curr_y))
-    return True
+    final_dist = calc_distance(curr_x, curr_y, target_x, target_y)
+    
+    if final_dist < POS_DB * 2:  # 允许 2 倍死区
+        print("  >>> [{:s}] done: ({:.1f}, {:.1f}) err={:.1f}cm <<<".format(
+            label, curr_x, curr_y, final_dist))
+        return True
+    else:
+        print("  >>> [{:s}] overshoot: ({:.1f}, {:.1f}) err={:.1f}cm, retrying... <<<".format(
+            label, curr_x, curr_y, final_dist))
+        return False
 
 
 # ============================================================
@@ -209,6 +245,8 @@ print("\nWaiting for UWB data...")
 print("Press SW2 to exit\n")
 
 state = 0  # 0=等待数据, 1=移动中, 2=到达
+retry_count = 0
+MAX_RETRIES = 3
 
 while True:
     if switch2.value() != state2:
@@ -238,13 +276,19 @@ while True:
             state = 1
     
     elif state == 1:
-        # 移动中
+        # 移动中（允许重试）
         if move_to_target_xy(TARGET_X, TARGET_Y, "MOVE"):
             print("\n=== TARGET REACHED ===")
             break
         else:
-            print("\n=== MOVE FAILED ===")
-            break
+            # 超调了，等待 UWB 更新后重试
+            retry_count += 1
+            if retry_count >= MAX_RETRIES:
+                print("\n=== MAX RETRIES REACHED ===")
+                break
+            print("  Retrying ({}/{}) in 500ms...".format(retry_count, MAX_RETRIES))
+            time.sleep_ms(500)
+            continue
     
     time.sleep_ms(10)
 

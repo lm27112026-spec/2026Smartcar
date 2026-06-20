@@ -5,19 +5,16 @@ uwb_position.py — UWB 定位模块
   - 解析 JSON 帧，提取距离和相对坐标
   - 互补滤波器平滑数据
   - 条件触发存储：当移动距离超过阈值时自动保存坐标到 location 数组
-  - SW2 按键退出：按下 SW2 时程序自动退出
   - 提供位置查询和历史记录管理接口
 【使用】
   pos = UWBPosition()
   while True:
-      if not pos.step():  # 返回 False 表示 SW2 被按下
-          break
+      pos.step()  # 内部处理 UART + 滤波 + 条件存储
       x, y = pos.get_position()
       dist, angle = pos.get_distance_angle()
       if pos.is_timeout():
           print("UWB timeout")
       time.sleep_ms(10)
-  pos.stop()
 【数据格式】
   location 数组中每个元素为字典：
   {
@@ -28,7 +25,6 @@ uwb_position.py — UWB 定位模块
       'timestamp': int   # 时间戳 (ms)
   }
 【依赖】无外部依赖，仅使用标准库
-【按键】SW2 (D9 引脚) - 边沿触发，按下后程序退出
 """
 
 import gc, time, math, json
@@ -165,8 +161,6 @@ class UWBPosition:
                     self._rx_line.append(b)
                     if len(self._rx_line) > 200:
                         self._rx_line = bytearray()
-
-        return True
 
     # ============================================================
     #  内部：处理一行 UWB 数据（滤波 + 条件存储）
@@ -312,20 +306,6 @@ class UWBPosition:
             return True
         return False
 
-    def is_switch2_pressed(self):
-        """
-        检查 SW2 按键是否被按下。
-        
-        返回:
-            bool: True 表示 SW2 被按下过，False 表示未按下
-        """
-        return self._switch2_pressed
-
-    def reset_switch2(self):
-        """重置 SW2 按键状态。"""
-        self._switch2_pressed = False
-        self._switch2_state = self._switch2.value()
-
     def get_frame_count(self):
         """返回已处理的帧数。"""
         return self._frame_count
@@ -411,14 +391,10 @@ if __name__ == '__main__':
     print("UWB Position Test Started")
     print("Move the tag to see coordinates change...")
     print("Location will be stored when tag moves > {} cm".format(pos.STORE_DISTANCE_CM))
-    print("Press SW2 to exit program")
     
     try:
         while True:
-            # step() 返回 False 表示 SW2 被按下
-            if not pos.step():
-                print("SW2 detected - exiting...")
-                break
+            pos.step()
             
             x, y = pos.get_position()
             dist, angle = pos.get_distance_angle()
@@ -432,7 +408,5 @@ if __name__ == '__main__':
     
     except KeyboardInterrupt:
         print("\nTest stopped by user")
-    
-    finally:
         print("Total stored positions: {}".format(pos.get_location_count()))
         pos.stop()

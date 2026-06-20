@@ -16,9 +16,8 @@ from motor import (stop_all, omni_drive_closed_loop,
                    get_encoder_counts, reset_encoder_filter, reset_wheel_pi,
                    enc_ticker, ENC_SCALE)
 import imu_motion
-from imu_motion import (update_angle, get_angular_velocity, angular_velocity_control,
-                        reset_ang_vel_pid, imu_get_safe, MAX_WZ_DPS)
-from pid import PID
+from imu_motion import (update_angle, get_angular_velocity,
+                        reset_ang_vel_pid, imu_get_safe, yaw)
 from key import capture, key_triggered, pet_watchdog
 from cam_data import CamDataReceiver, x_to_cm, y_to_distance
 
@@ -46,37 +45,18 @@ STATE_UWB           = 0   # UWB 跟随，后台轮询摄像头
 STATE_VISUAL        = 1   # 视觉追踪，靠近物品到 10cm
 STATE_LEFT_FWD      = 3   # 45°左前盲走，摄像头检测黄线
 STATE_YELLOW_RETURN = 4   # 180°掉头 + UWB 辅助回物品区
-STATE_BUMP_RETURN   = 5   # 碰撞→180°旋转→原路返回
-STATE_SCAN_ITEMS    = 6   # 扫描物品区判定是否清空
-STATE_RETURN_DEPART = 7   # 返回发车区（方案待定，占位）
-STATE_DONE          = 8   # 任务完成，停车退出
+STATE_SCAN_ITEMS    = 5   # 扫描物品区判定是否清空
+STATE_RETURN_DEPART = 6   # 返回发车区（方案待定，占位）
+STATE_DONE          = 7   # 任务完成，停车退出
 
 # ── 摄像头 FLAG 占位值（待摄像头团队确认）──
-# TODO: 黄线 FLAG 值待摄像头团队定义后填入
-FLAG_YELLOW    = 0xC0    # 占位（0x02/03=物品, 0x04≠黄线）
-FLAG_DEPARTURE = 0xC1    # 占位
+# TODO: 确认黄线、发车区的实际 FLAG 值
+FLAG_YELLOW    = 0xC0
+FLAG_DEPARTURE = 0xC1
 
 # ── 左前盲走参数 ──
-LEFT_FWD_SPEED  = 0.40    # 合速度 (m/s)
+LEFT_FWD_SPEED  = 0.50    # 合速度 (m/s)
 LEFT_FWD_ANGLE  = 45.0    # 左前方角度 (deg)
-
-# ── 碰撞检测 + 原路返回参数（参考 uart_move.py）──
-BUMP_ACCEL_THRESH = 1.5   # 加速度幅值阈值 (g)，超过视为碰撞
-DIST_KP = 1.0              # 距离 PID P 增益
-DIST_KI = 0.5              # 距离 PID I 增益
-DIST_OUT_LIMIT = 0.30      # 距离 PID 输出限幅 (m/s)
-MIN_SPEED = 0.08            # 最低速度防死区
-HDG_KP = 0.08               # 航向偏差→dps 增益
-HDG_DB = 0.5                # 航向死区 (deg)
-ROT_MAX_RATE = 150          # 旋转最大速率 (dps)
-ROT_MAX_ACCEL = 90          # 旋转最大加速度 (dps/s²)
-ROT_DEADBAND = 3.0          # 旋转到位判定 (deg)
-RETURN_DT = 0.01            # 返回段控制周期 (10ms)
-TIMEOUT_S = 30              # 超时 (s)
-
-# 里程计
-_lftfwd_total_m = 0.0       # LEFT_FWD 累计行进距离 (m)
-_lftfwd_total_counts = [0, 0, 0, 0]  # 各轮累计脉冲
 
 # ── 物品区扫描参数 ──
 SCAN_EMPTY_FRAMES = 15    # 连续 N 帧无目标 → 判定为空
@@ -108,168 +88,66 @@ def check_sw2():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  过渡动作 — 参考 uart_move.py
+#  过渡动作 — 辅助函数
 # ═══════════════════════════════════════════════════════════════
 
-def check_bump():
-    """IMU 加速度碰撞检测，返回 True 表示检测到碰撞"""
-    d = imu_get_safe()
-    if d is None:
-        return False
-    # 加速度幅值 (g) = sqrt(ax²+ay²+az²) / ACCEL_SENSITIVITY
-    accel_mag = (d[0]**2 + d[1]**2 + d[2]**2) ** 0.5 / imu_motion.ACCEL_SENSITIVITY
-    return accel_mag > BUMP_ACCEL_THRESH
-
-
-def drive_left_forward(debug=False):
-    """左前盲走 + 里程计累计距离 + 碰撞检测
-    返回: 0=正常, 1=碰撞"""
-    global _lftfwd_total_counts
-    VX = 0.283   # LEFT_FWD_SPEED * cos(45°)
-    VY = -0.283
+def drive_left_forward():
+    """以 45° 左前固定速度驱动（无视觉反馈）"""
+    rad = math.radians(LEFT_FWD_ANGLE)
+    vx = LEFT_FWD_SPEED * math.cos(rad)
+    vy = LEFT_FWD_SPEED * math.sin(rad)
     try:
         rc = get_encoder_counts()
         rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
-        for i in range(4):
-            _lftfwd_total_counts[i] += rc[i]
-        omni_drive_closed_loop(VX, VY, 0, rs, CAM_DT)
-        if check_bump():
-            return 1
-        return 0
+        omni_drive_closed_loop(vx, vy, 0, rs, CAM_DT)
     except Exception as e:
         print("[LEFT_FWD] drive error:", e)
-        return 0
 
 
-def _total_distance():
-    """从累计脉冲计算总行进距离 (m)"""
-    global _lftfwd_total_counts
-    wd = [abs(_lftfwd_total_counts[i]) / ENC_SCALE[i] for i in range(4)]
-    return sum(wd) / 4
+def do_180_turn():
+    """
+    原地 180° 掉头（IMU 陀螺仪闭环旋转）
+    返回: True=完成, False=进行中
+    """
+    # 读取当前航向角
+    d = imu_get_safe()
+    if d is None:
+        time.sleep_ms(5)
+        return False
+    update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
+    current_yaw = yaw  # 当前航向角 (deg, 全局变量)
+    target_yaw = current_yaw + 180.0
+    if target_yaw > 180.0:
+        target_yaw -= 360.0
 
-def _reset_odometry():
-    """重置里程计"""
-    global _lftfwd_total_counts, _lftfwd_total_m
-    _lftfwd_total_counts = [0, 0, 0, 0]
-    _lftfwd_total_m = 0.0
+    # 闭环旋转：P 控制 wz
+    MAX_WZ = 1.5  # 最大旋转角速度 (rad/s)
 
+    yaw_error = target_yaw - current_yaw
+    if yaw_error > 180:
+        yaw_error -= 360
+    elif yaw_error < -180:
+        yaw_error += 360
 
-def rotate_to(target_delta, label="ROT"):
-    """精确旋转 target_delta 度（梯形速度 + 角速度闭环）
-    返回 True=成功"""
-    reset_ang_vel_pid()
-    for _ in range(5):
-        d = imu_get_safe()
-        if d is not None:
-            update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-        time.sleep_ms(10)
+    if abs(yaw_error) < 5.0:
+        stop_all()
+        return True
 
-    start_yaw = imu_motion.yaw
-    target_yaw = start_yaw + target_delta
-    while target_yaw > 180: target_yaw -= 360
-    while target_yaw < -180: target_yaw += 360
+    # P 控制 wz
+    wz = 0.05 * yaw_error
+    wz = max(-MAX_WZ, min(wz, MAX_WZ))
+    if abs(wz) < 0.1:
+        wz = 0.1 if wz > 0 else -0.1
 
-    start_ms = time.ticks_ms()
-    print("\n  [{:s}] rotate {:+.0f} deg (start={:.1f})".format(
-        label, target_delta, start_yaw))
-
-    while True:
-        if time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0 > TIMEOUT_S:
-            print("  TIMEOUT"); return False
-
-        d = imu_get_safe()
-        if d is not None:
-            update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-        err = target_yaw - imu_motion.yaw
-        while err > 180: err -= 360
-        while err < -180: err += 360
-        if abs(err) <= ROT_DEADBAND:
-            break
-
-        ideal = (2 * ROT_MAX_ACCEL * abs(err)) ** 0.5
-        tgt_rate = min(ideal, ROT_MAX_RATE)
-        if err < 0: tgt_rate = -tgt_rate
-
-        actual_dps = get_angular_velocity()
-        wz = angular_velocity_control(tgt_rate, actual_dps, RETURN_DT)
-
+    try:
         rc = get_encoder_counts()
-        rs = [rc[i] / ENC_SCALE[i] / RETURN_DT for i in range(4)]
-        omni_drive_closed_loop(0, 0, wz, rs, RETURN_DT)
-        time.sleep_ms(int(RETURN_DT * 1000))
+        rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
+        omni_drive_closed_loop(0, 0, wz, rs, CAM_DT)
+    except Exception as e:
+        print("[180_TURN] drive error:", e)
 
-    omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], RETURN_DT)
-    _ = get_encoder_counts()
-    dlt = imu_motion.yaw - start_yaw
-    while dlt > 180: dlt -= 360
-    while dlt < -180: dlt += 360
-    print("  [{:s}] done: {:.1f} deg".format(label, dlt))
-    return True
-
-
-def move_distance(vx_dir, vy_dir, target_m, label="MOVE", use_heading=True):
-    """精确直线移动 target_m 米（距离 PID + 航向保持，参考 uart_move.py）
-    返回 True=成功"""
-    for _ in range(5):
-        _ = get_encoder_counts()
-        time.sleep_ms(10)
-
-    pid_dist = PID(kp=DIST_KP, ki=DIST_KI, kd=0.0,
-                   integral_limit=0.5, output_limit=DIST_OUT_LIMIT)
-    total_counts = [0, 0, 0, 0]
-    start_ms = time.ticks_ms()
-
-    target_heading = None
-    reset_ang_vel_pid()
-    if use_heading:
-        for _ in range(5):
-            d = imu_get_safe()
-            if d is not None:
-                update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-            time.sleep_ms(10)
-        target_heading = imu_motion.yaw
-
-    print("\n  [{:s}] move {:.1f} cm".format(label, target_m * 100))
-
-    while True:
-        if time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0 > TIMEOUT_S:
-            print("  TIMEOUT"); return False
-
-        wz = 0.0
-        if use_heading:
-            d = imu_get_safe()
-            if d is not None:
-                update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
-            hdg_err = target_heading - imu_motion.yaw
-            while hdg_err > 180: hdg_err -= 360
-            while hdg_err < -180: hdg_err += 360
-            if abs(hdg_err) > HDG_DB:
-                target_dps = hdg_err * HDG_KP * MAX_WZ_DPS
-                target_dps = max(-180, min(target_dps, 180))
-                wz = angular_velocity_control(target_dps, get_angular_velocity(), RETURN_DT)
-
-        rc = get_encoder_counts()
-        rs = [rc[i] / ENC_SCALE[i] / RETURN_DT for i in range(4)]
-        for i in range(4):
-            total_counts[i] += rc[i]
-
-        wd = [abs(total_counts[i]) / ENC_SCALE[i] for i in range(4)]
-        dist = sum(wd) / 4
-
-        speed_cmd = pid_dist.compute(setpoint=target_m, measurement=dist, dt=RETURN_DT)
-        if dist < target_m and speed_cmd < MIN_SPEED:
-            speed_cmd = MIN_SPEED
-
-        omni_drive_closed_loop(vx_dir * speed_cmd, vy_dir * speed_cmd, wz, rs, RETURN_DT)
-
-        if dist >= target_m:
-            break
-        time.sleep_ms(int(RETURN_DT * 1000))
-
-    omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], RETURN_DT)
-    print("  [{:s}] done: {:.1f} cm".format(label, dist * 100))
-    return True
+    return False
 
 
 def enter_uwb_nav(target_anchor="8834"):
@@ -310,9 +188,8 @@ def _create_mode_manager():
         'timeout_done':  False,
         'first_frames':  0,
         # ── 新增任务状态 ──
-        'turn_done':      False,
-        'scan_empty_cnt': 0,
-        'bump_distance':  0.0,       # 碰撞时记录的行进距离 (m)
+        'turn_done':     False,     # 180° 掉头完成标志
+        'scan_empty_cnt': 0,        # 连续无目标帧计数
     }
 
     # ── UWB 模式 ──────────────────────────────────────────
@@ -364,16 +241,13 @@ def _create_mode_manager():
     def exit_visual():
         stop_all()
 
-    # ── 左前盲走（找黄线 + 碰撞检测）────────────────────
+    # ── 左前盲走（找黄线）────────────────────────────────
 
     def enter_left_fwd():
-        print("\n>>> MODE: LEFT_FORWARD (bump detect active) <<<")
+        print("\n>>> MODE: LEFT_FORWARD (finding yellow line) <<<")
         stop_all()
-        _reset_odometry()
-        # 编码器
-        enc_ticker.start(10)
-        time.sleep_ms(50)
-        for _ in range(5):
+        enc_ticker.stop()
+        for _ in range(3):
             _ = get_encoder_counts()
             time.sleep_ms(10)
         reset_encoder_filter()
@@ -384,7 +258,6 @@ def _create_mode_manager():
 
     def exit_left_fwd():
         stop_all()
-        enc_ticker.stop()     # 退出时停止 ticker，由后续模式自行管理
 
     # ── 黄线→掉头+UWB回物品区 ────────────────────────────
 
@@ -404,22 +277,6 @@ def _create_mode_manager():
             time.sleep_ms(10)
         reset_encoder_filter()
         reset_wheel_pi()
-
-    # ── 碰撞返回（180°旋转 + 原路返回）────────────────────
-
-    def enter_bump_return():
-        print("\n>>> MODE: BUMP_RETURN (rotate 180 + go back) <<<")
-        stop_all()
-        enc_ticker.start(10)
-        time.sleep_ms(50)
-        for _ in range(5):
-            _ = get_encoder_counts()
-            time.sleep_ms(10)
-        led.value(0)
-
-    def exit_bump_return():
-        stop_all()
-        enc_ticker.stop()
 
     # ── 扫描物品区 ────────────────────────────────────────
 
@@ -454,7 +311,6 @@ def _create_mode_manager():
             enter_visual, exit_visual,
             enter_left_fwd, exit_left_fwd,
             enter_yellow_return, exit_yellow_return,
-            enter_bump_return, exit_bump_return,
             enter_scan_items, exit_scan_items,
             enter_return_depart, exit_return_depart,
             res)
@@ -469,7 +325,6 @@ def main():
      enter_visual, exit_visual,
      enter_left_fwd, exit_left_fwd,
      enter_yellow_return, exit_yellow_return,
-     enter_bump_return, exit_bump_return,
      enter_scan_items, exit_scan_items,
      enter_return_depart, exit_return_depart,
      res) = _create_mode_manager()
@@ -485,7 +340,7 @@ def main():
     print("  UART0 : UWB 基站 (115200)")
     print("  UART7 : Camera 视觉 (115200)")
     print("  Target dist: {:.0f}cm".format(TARGET_DIST_CM))
-    print("  States: UWB→VISUAL→LFTFWD→(BUMP|YELLOW)→RETURN→SCAN→DONE")
+    print("  States: UWB→VISUAL→LFTFWD→YLWRET→SCAN→RETDEP→DONE")
     print("  SW2   : force exit")
     print("=" * 50)
 
@@ -508,7 +363,6 @@ def main():
                     print("\n[KEY1] → UWB_FOLLOW")
                     _exit_state(state, exit_uwb, exit_visual,
                                 exit_left_fwd, exit_yellow_return,
-                                exit_bump_return,
                                 exit_scan_items, exit_return_depart)
                     enter_uwb()
                     state = STATE_UWB
@@ -519,7 +373,6 @@ def main():
                     print("\n[KEY2] → VISUAL_TRACK")
                     _exit_state(state, exit_uwb, exit_visual,
                                 exit_left_fwd, exit_yellow_return,
-                                exit_bump_return,
                                 exit_scan_items, exit_return_depart)
                     enter_visual()
                     state = STATE_VISUAL
@@ -643,7 +496,7 @@ def main():
                     led.toggle()
 
             # ════════════════════════════════════════════════
-            #  状态 3 — 45°左前盲走（碰撞检测→原路返回）
+            #  状态 3 — 45°左前盲走（检测黄线）
             # ════════════════════════════════════════════════
             elif state == STATE_LEFT_FWD:
                 data = res['cam_recv'].read()
@@ -653,61 +506,25 @@ def main():
 
                 # 检查黄线 FLAG
                 if data['flag'] == FLAG_YELLOW:
-                    print("[LEFT_FWD] Yellow line! (FLAG={:02X})".format(data['flag']))
+                    print("[LEFT_FWD] Yellow line detected! (FLAG={:02X})".format(data['flag']))
                     exit_left_fwd()
                     enter_yellow_return()
                     state = STATE_YELLOW_RETURN
-                    loop_cnt = 0; print_cnt = 0
+                    loop_cnt = 0
+                    print_cnt = 0
                     continue
 
-                # 驱动 + 碰撞检测
-                bumped = drive_left_forward()
-                if bumped:
-                    res['bump_distance'] = _total_distance()
-                    print("[LEFT_FWD] BUMP! dist={:.1f}cm → RETURN".format(
-                        res['bump_distance'] * 100))
-                    exit_left_fwd()
-                    enter_bump_return()
-                    state = STATE_BUMP_RETURN
-                    loop_cnt = 0; print_cnt = 0
-                    continue
+                # 45°左前驱动
+                drive_left_forward()
 
                 print_cnt += 1
                 if print_cnt >= 15:
                     print_cnt = 0
-                    print("[LEFT_FWD] X:{:+.1f}cm dist:{:5.1f}cm flag:{:02X} "
-                          "odom:{:.1f}cm".format(
-                        x_to_cm(data['x']), y_to_distance(data['y']),
-                        data['flag'], _total_distance() * 100))
+                    print("[LEFT_FWD] X:{:+.1f}cm dist:{:5.1f}cm flag:{:02X}".format(
+                        x_to_cm(data['x']), y_to_distance(data['y']), data['flag']))
 
                 if loop_cnt % 20 == 0:
                     led.toggle()
-
-            # ════════════════════════════════════════════════
-            #  状态 5 — 碰撞返回：180°旋转 + 原路距离 PID 返回
-            # ════════════════════════════════════════════════
-            elif state == STATE_BUMP_RETURN:
-                target_m = res['bump_distance']
-                # ① 旋转 180°
-                if not rotate_to(180, "BUMP ROT"):
-                    print("[BUMP_RET] rotate failed")
-                    exit_bump_return()
-                    state = STATE_DONE
-                    break
-                # ② 原路返回（vx 反向, vy 反向）
-                if not move_distance(-1, 1, target_m, "BUMP BACK 45°",
-                                     use_heading=True):
-                    print("[BUMP_RET] move failed")
-                    exit_bump_return()
-                    state = STATE_DONE
-                    break
-                # ③ 返回物品区 → 扫描
-                print("[BUMP_RET] returned → SCAN_ITEMS")
-                exit_bump_return()
-                enter_scan_items()
-                state = STATE_SCAN_ITEMS
-                loop_cnt = 0; print_cnt = 0
-                continue
 
             # ════════════════════════════════════════════════
             #  状态 4 — 180°掉头 + UWB 回物品区
@@ -841,7 +658,6 @@ def main():
 
 def _exit_state(state, exit_uwb, exit_visual,
                 exit_left_fwd, exit_yellow_return,
-                exit_bump_return,
                 exit_scan_items, exit_return_depart):
     """根据当前状态调用对应的 exit 函数"""
     _exit_map = {
@@ -849,7 +665,6 @@ def _exit_state(state, exit_uwb, exit_visual,
         STATE_VISUAL:        exit_visual,
         STATE_LEFT_FWD:      exit_left_fwd,
         STATE_YELLOW_RETURN: exit_yellow_return,
-        STATE_BUMP_RETURN:   exit_bump_return,
         STATE_SCAN_ITEMS:    exit_scan_items,
         STATE_RETURN_DEPART: exit_return_depart,
     }
