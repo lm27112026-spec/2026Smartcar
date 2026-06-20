@@ -25,7 +25,7 @@ from cam_follow import (
     compute_control, reset_control,
     STATE_FOLLOW, STATE_STOPPED as CAM_STOP, STATE_LOST,
     TARGET_DIST_CM, STOP_DIST_CM, DT as CAM_DT,
-    PID_FWD, PID_LAT,
+    PID_FWD, PID_LAT, CascadePID,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -55,11 +55,28 @@ FLAG_YELLOW    = 0xC0
 FLAG_DEPARTURE = 0xC1
 
 # ── 左前盲走参数 ──
-LEFT_FWD_SPEED  = 0.0    # 合速度 (m/s)
+LEFT_FWD_SPEED  = 0.30    # 合速度 (m/s)
 LEFT_FWD_ANGLE  = 45.0    # 左前方角度 (deg)
+YAW_KP          = 0.08    # 航向纠偏 P 增益 (rad/s per deg)
+YAW_WZ_LIMIT    = 0.4     # 最大纠偏角速度 (rad/s)
+_ref_yaw        = 0.0     # 参考航向（模块级，供 drive_left_forward 使用）
 
 # ── 物品区扫描参数 ──
 SCAN_EMPTY_FRAMES = 15    # 连续 N 帧无目标 → 判定为空
+
+# ── 左前盲走 级联 PID（速度环 + 加速度限幅 + 软启动）──
+PID_LF_FWD = CascadePID(
+    kp=1.5, ki=0.05, kd=0.0,
+    out_limit=0.50,           # 最大前进速度 (m/s)
+    accel_limit=1.0,          # 缓加速 (m/s²)
+    soft_start_ms=400,
+)
+PID_LF_LAT = CascadePID(
+    kp=1.5, ki=0.05, kd=0.0,
+    out_limit=0.45,           # 最大横向速度 (m/s)
+    accel_limit=1.0,
+    soft_start_ms=400,
+)
 
 # ═══════════════════════════════════════════════════════════════
 #  硬件初始化
@@ -91,21 +108,40 @@ def check_sw2():
 #  过渡动作 — 辅助函数
 # ═══════════════════════════════════════════════════════════════
 
+_lftfwd_debug_cnt = 0
+
 def drive_left_forward(debug=False):
-    """以 45° 左前固定速度 闭环驱动（编码器 PI 反馈）
-    vy<0 = 左移（与视觉跟随 cmd_lat 同坐标系）
-    运动学: vx=+0.212m/s vy=-0.212m/s → RF=+0.424 LB=-0.424 m/s"""
-    vx = 0.212   # LEFT_FWD_SPEED * cos(45°) — 硬编码绕过 MP 浮点 bug
-    vy = -0.212  # -LEFT_FWD_SPEED * sin(45°)
+    """级联 PID 闭环 + IMU 航向纠偏
+    运动学: vx=+0.212m/s vy=-0.212m/s → 45°左前"""
+    global _lftfwd_debug_cnt
+    VX_TARGET = 0.212
+    VY_TARGET = -0.212
     try:
         rc = get_encoder_counts()
         rs = [rc[i] / ENC_SCALE[i] / CAM_DT for i in range(4)]
-        omni_drive_closed_loop(vx, vy, 0, rs, CAM_DT)
+        actual_vx = (rs[0] - rs[1] - rs[2] + rs[3]) / 4.0
+        actual_vy = (-rs[0] - rs[1] + rs[2] + rs[3]) / 4.0
+        cmd_vx = PID_LF_FWD.compute(VX_TARGET - actual_vx, CAM_DT)
+        cmd_vy = PID_LF_LAT.compute(VY_TARGET - actual_vy, CAM_DT)
+        # IMU 航向纠偏
+        d = imu_get_safe()
+        if d is not None:
+            update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+        yaw_err = _wrap_180(_ref_yaw - yaw)
+        wz = max(-YAW_WZ_LIMIT, min(YAW_KP * yaw_err, YAW_WZ_LIMIT))
+        omni_drive_closed_loop(cmd_vx, cmd_vy, wz, rs, CAM_DT)
         if debug:
-            print("[DBG] LFTFWD vx={:.3f} vy={:.3f} enc={:d},{:d},{:d},{:d}".format(
-                vx, vy, rc[0], rc[1], rc[2], rc[3]))
+            _lftfwd_debug_cnt += 1
+            if _lftfwd_debug_cnt % 10 == 0:
+                print("[DBG] LFTFWD raw=({:.3f},{:.3f}) cmd=({:.3f},{:.3f}) yaw={:.1f} err={:.1f} wz={:.3f}".format(
+                    actual_vx, actual_vy, cmd_vx, cmd_vy, yaw, yaw_err, wz))
     except Exception as e:
         print("[LEFT_FWD] drive error:", e)
+
+
+def _wrap_180(angle):
+    """将角度包装到 [-180, 180]"""
+    return ((angle + 180) % 360) - 180
 
 
 def do_180_turn():
@@ -192,8 +228,9 @@ def _create_mode_manager():
         'timeout_done':  False,
         'first_frames':  0,
         # ── 新增任务状态 ──
-        'turn_done':     False,     # 180° 掉头完成标志
-        'scan_empty_cnt': 0,        # 连续无目标帧计数
+        'turn_done':      False,     # 180° 掉头完成标志
+        'scan_empty_cnt': 0,         # 连续无目标帧计数
+        'ref_yaw':        0.0,       # 参考航向角（左前盲走用）
     }
 
     # ── UWB 模式 ──────────────────────────────────────────
@@ -250,13 +287,26 @@ def _create_mode_manager():
     def enter_left_fwd():
         print("\n>>> MODE: LEFT_FORWARD (finding yellow line) <<<")
         stop_all()
+        # IMU 预热 + 记录参考航向
+        for _ in range(5):
+            d = imu_get_safe()
+            if d is not None:
+                update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+            time.sleep_ms(10)
+        res['ref_yaw'] = yaw   # 锁定当前航向为参考方向
+        global _ref_yaw
+        _ref_yaw = yaw
+        print("[LEFT_FWD] ref_yaw = {:.1f} deg".format(yaw))
+        # 编码器
         enc_ticker.start(10)
-        time.sleep_ms(50)              # 充裕时间等 ticker 首次捕获
-        for _ in range(5):             # 5 次排空缓冲（与 cam_follow 一致）
+        time.sleep_ms(50)
+        for _ in range(5):
             _ = get_encoder_counts()
             time.sleep_ms(10)
         reset_encoder_filter()
         reset_wheel_pi()
+        PID_LF_FWD.reset()
+        PID_LF_LAT.reset()
         res['cam_recv'].flush()
         res['window'] = []
         led.value(0)
