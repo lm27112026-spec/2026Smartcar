@@ -57,16 +57,17 @@ class UWBPosition:
     """UWB 定位器 — 连续接收 UWB 数据，提供坐标输出和条件存储。"""
 
     # ── 滤波系数 ──
-    D_FILT_ALPHA = 0.20       # 距离低通（加快响应）
-    XY_FILT_ALPHA = 0.10      # 坐标低通（加快响应）
-    ANGLE_FILT_ALPHA = 0.15   # 角度低通（加快响应）
+    D_FILT_ALPHA = 0.20       # 距离低通
+    XY_FILT_ALPHA = 0.15      # 坐标低通
+    ANGLE_FILT_ALPHA = 0.18   # 角度低通
 
     # ── 中值滤波 ──
-    MEDIAN_WINDOW = 7         # 中值滤波窗口大小（奇数，7帧 ≈ 700ms 平滑）
+    MEDIAN_WINDOW = 11        # 中值滤波窗口（11帧 ≈ 1.1s）
 
     # ── 异常值检测 ──
-    OUTLIER_DIST_CM = 30.0    # 距离跳变超过此值视为异常
-    OUTLIER_XY_CM = 25.0      # XY 跳变超过此值视为异常
+    OUTLIER_DIST_CM = 10.0    # 距离跳变阈值（收紧到10cm）
+    OUTLIER_XY_CM = 8.0       # XY 跳变阈值（收紧到8cm）
+    OUTLIER_RAW_XY_CM = 15.0  # 原始值跳变阈值（新增）
 
     # ── 超时 ──
     TIMEOUT_MS = 800
@@ -113,13 +114,15 @@ class UWBPosition:
         self._last_valid_d = None
         self._last_valid_x = None
         self._last_valid_y = None
+        self._last_raw_x = None  # 原始值记录
+        self._last_raw_y = None
 
-        # ── 卡尔曼滤波器（替代低通滤波，自适应降噪） ──
-        # UWB 噪声 ±5cm → R≈25；小车运动适中 → Q≈1.0
-        self._kf_x = KalmanFilter1D(Q=1.0, R=25.0, P_min=0.5, name='uwb_x')
-        self._kf_y = KalmanFilter1D(Q=1.0, R=25.0, P_min=0.5, name='uwb_y')
-        self._kf_d = KalmanFilter1D(Q=1.5, R=20.0, P_min=0.5, name='uwb_d')
-        self._kf_angle = KalmanFilter1D(Q=2.0, R=15.0, P_min=0.5, name='uwb_ang')
+        # ── 卡尔曼滤波器（轻度平滑，主要靠中值滤波去噪） ──
+        # Q大 → 跟踪快；R适中 → 不会冻结
+        self._kf_x = KalmanFilter1D(Q=2.0, R=15.0, P_min=2.0, name='uwb_x')
+        self._kf_y = KalmanFilter1D(Q=2.0, R=15.0, P_min=2.0, name='uwb_y')
+        self._kf_d = KalmanFilter1D(Q=2.5, R=12.0, P_min=2.0, name='uwb_d')
+        self._kf_angle = KalmanFilter1D(Q=3.0, R=10.0, P_min=2.0, name='uwb_ang')
 
         # ── 时间管理 ──
         self._last_data_ticks = time.ticks_ms()
@@ -255,12 +258,20 @@ class UWBPosition:
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
 
-        # ── 第 1 层：中值滤波（去尖刺） ──
+        # ── 第 1 层：原始值跳变检测（在中值滤波前，拦截大幅跳变） ──
+        if self._last_raw_x is not None:
+            if abs(x_cm - self._last_raw_x) > self.OUTLIER_RAW_XY_CM or \
+               abs(y_cm - self._last_raw_y) > self.OUTLIER_RAW_XY_CM:
+                return  # 原始值跳变过大，丢弃本帧
+        self._last_raw_x = x_cm
+        self._last_raw_y = y_cm
+
+        # ── 第 2 层：中值滤波（去尖刺） ──
         d_med = self._med_d.update(d_cm)
         x_med = self._med_x.update(x_cm)
         y_med = self._med_y.update(y_cm)
 
-        # ── 第 2 层：异常值检测（跳变过大则丢弃） ──
+        # ── 第 3 层：异常值检测（中值跳变过大则丢弃） ──
         if self._last_valid_d is not None:
             if abs(d_med - self._last_valid_d) > self.OUTLIER_DIST_CM:
                 return  # 丢弃本帧
@@ -268,27 +279,13 @@ class UWBPosition:
                abs(y_med - self._last_valid_y) > self.OUTLIER_XY_CM:
                 return  # 丢弃本帧
 
-        # ── 第 3 层：卡尔曼滤波（自适应降噪，替代固定低通） ──
-        if self._x_filt is None:
-            # 首帧：初始化卡尔曼状态
-            self._kf_x.reset(x0=x_med, P0=10.0)
-            self._kf_y.reset(x0=y_med, P0=10.0)
-            self._kf_d.reset(x0=d_med, P0=10.0)
-            self._x_filt = float(x_med)
-            self._y_filt = float(y_med)
-            self._d_filt = float(d_med)
-        else:
-            self._x_filt = self._kf_x.update(x_med)
-            self._y_filt = self._kf_y.update(y_med)
-            self._d_filt = self._kf_d.update(d_med)
+        # ── 第 3 层：直接使用中值滤波结果（去掉卡尔曼，避免位置冻结） ──
+        self._x_filt = float(x_med)
+        self._y_filt = float(y_med)
+        self._d_filt = float(d_med)
 
-        # ── 角度卡尔曼滤波（基于已滤波坐标计算） ──
-        angle_to_target = math.atan2(-self._x_filt, self._y_filt) * 180.0 / math.pi
-        if self._angle_filt is None:
-            self._kf_angle.reset(x0=angle_to_target, P0=10.0)
-            self._angle_filt = angle_to_target
-        else:
-            self._angle_filt = self._kf_angle.update(angle_to_target)
+        # ── 角度计算（基于已滤波坐标） ──
+        self._angle_filt = math.atan2(-self._x_filt, self._y_filt) * 180.0 / math.pi
 
         # ── 更新异常值参考值 ──
         self._last_valid_d = d_med
