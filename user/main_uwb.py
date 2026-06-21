@@ -30,7 +30,7 @@ switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2 = switch2.value()
 
 # ── 目标坐标 (cm，相对于 UWB 锚点) ──
-TARGET_X = 0.0
+TARGET_X = -20.0
 TARGET_Y = 40.0
 
 # ── 参数 ──
@@ -40,13 +40,14 @@ PHASE_TIMEOUT_S = 20
 PRINT_MS = 300
 
 # ── 位置 PID ──
-POS_KP = 0.014      # 位置增益
+POS_KP = 0.012      # 位置增益（稍微降低，减少过冲）
 POS_KI = 0.0        # 积分增益（UWB 有噪声，不用积分）
-POS_DB = 5.0        # 到位死区 (cm) — 需大于 UWB ±5cm 噪声，防止噪声导致反复调整
-POS_HYSTERESIS = 15.0   # 迟滞阈值 (cm) — 到达后超出此值才重新判定为"未到达"
-ARRIVAL_CONFIRM_FRAMES = 5  # 连续 N 帧在死区内才算真正到达（防单次噪声误触发）
-SLOW_DIST = 15.0     # 距离目标 <15cm 开始线性减速，防止过冲
-MAX_SPEED = 0.4     # 最大速度 (m/s)
+POS_DB = 8.0       # 到位死区 (cm) — 增大到10cm，大于UWB ±5cm噪声
+POS_HYSTERESIS = 30.0   # 迟滞阈值 (cm) — 增大到30cm，到达后需大幅偏离才重新移动
+ARRIVAL_CONFIRM_FRAMES = 8  # 连续 N 帧在死区内才算真正到达（增加到8帧防抖）
+SLOW_DIST = 20.0     # 距离目标 <25cm 开始线性减速，防止过冲
+MAX_SPEED = 0.3      # 降低最大速度 (m/s)，减少惯性
+STABLE_TIME_MS = 500  # 在死区内保持500ms才算真正稳定停车
 
 # ── 航向 PID ──
 HDG_KP = 1.5        # 航向偏差(°) → 目标 dps
@@ -131,6 +132,9 @@ def move_to_target_xy(target_x, target_y, label):
     last_print_ms = start_ms
     last_uwb_update_ms = start_ms
     arrival_count = 0  # 连续 N 帧在死区内的计数器
+    stable_start_ms = None  # 稳定计时器开始时间
+    stable_x, stable_y = 0.0, 0.0  # 进入死区时的位置
+    is_stopped = False  # 是否已完全停止
     
     # 锁定当前航向
     target_heading = imu_motion.yaw
@@ -162,14 +166,59 @@ def move_to_target_xy(target_x, target_y, label):
         error_y = target_y - curr_y
         dist = math.sqrt(error_x * error_x + error_y * error_y)
         
-        # 到位判定（连续 N 帧在死区内才 break，防止单次 UWB 噪声误触发）
+        # ── 稳定停车逻辑 ──
         if dist < POS_DB:
             arrival_count += 1
-            if arrival_count >= ARRIVAL_CONFIRM_FRAMES:
-                break
+            # 开始稳定计时
+            if stable_start_ms is None:
+                stable_start_ms = now_ms
+                # 记录进入死区时的位置（作为最终位置候选）
+                stable_x, stable_y = curr_x, curr_y
+                print("  >>> entering stable zone, timing...")
+            
+            # 检查是否稳定足够长时间（连续帧数 + 时间双重确认）
+            stable_elapsed = time.ticks_diff(now_ms, stable_start_ms)
+            if arrival_count >= ARRIVAL_CONFIRM_FRAMES and stable_elapsed >= STABLE_TIME_MS and not is_stopped:
+                # 完全停止 - 使用进入死区时的位置，不再读UWB
+                is_stopped = True
+                omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], DT)
+                final_dist = calc_distance(stable_x, stable_y, target_x, target_y)
+                print("  >>> STOPPED! pos=({:.1f},{:.1f}) err={:.1f}cm".format(
+                    stable_x, stable_y, final_dist))
+                
+                if final_dist < POS_HYSTERESIS:
+                    print("  >>> [{:s}] done: ({:.1f}, {:.1f}) err={:.1f}cm <<<".format(
+                        label, stable_x, stable_y, final_dist))
+                    return True
+                else:
+                    # 超出迟滞，继续移动
+                    is_stopped = False
+                    stable_start_ms = None
+                    arrival_count = 0
+                    print("  >>> final check failed: err={:.1f}cm, continuing".format(final_dist))
         else:
+            # 超出死区，重置稳定计时器
             arrival_count = 0
+            stable_start_ms = None
+            is_stopped = False
         
+        # 如果已完全停止，只做航向保持，不做位置移动
+        if is_stopped:
+            # IMU 读取 + 航向保持
+            wz = 0.0
+            d = imu_motion.imu.read()
+            if d is not None:
+                update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
+                hdg_err = normalize_angle(target_heading - imu_motion.yaw)
+                if abs(hdg_err) > HDG_DB:
+                    target_dps = hdg_err * HDG_KP
+                    target_dps = max(-180, min(target_dps, 180))
+                    wz = angular_velocity_control(target_dps, get_angular_velocity(), DT)
+            omni_drive_closed_loop(0, 0, wz, [0, 0, 0, 0], DT)
+            time.sleep_ms(10)
+            continue
+        
+        # ── 正常运动控制 ──
         # IMU 读取 + 航向保持
         wz = 0.0
         d = imu_motion.imu.read()
@@ -233,24 +282,6 @@ def move_to_target_xy(target_x, target_y, label):
                 elapsed_s, curr_x, curr_y, error_x, error_y, dist, imu_motion.yaw))
         
         time.sleep_ms(10)
-    
-    # 到位后停止并重新确认
-    omni_drive_closed_loop(0, 0, 0, [0, 0, 0, 0], DT)
-    time.sleep_ms(200)  # 停止 200ms 等待 UWB 稳定
-    
-    # 重新读取坐标确认
-    uwb.step()
-    curr_x, curr_y = uwb.get_position()
-    final_dist = calc_distance(curr_x, curr_y, target_x, target_y)
-    
-    if final_dist < POS_HYSTERESIS:  # 迟滞阈值：到达后需大幅偏离才重新判定
-        print("  >>> [{:s}] done: ({:.1f}, {:.1f}) err={:.1f}cm <<<".format(
-            label, curr_x, curr_y, final_dist))
-        return True
-    else:
-        print("  >>> [{:s}] overshoot: ({:.1f}, {:.1f}) err={:.1f}cm, retrying... <<<".format(
-            label, curr_x, curr_y, final_dist))
-        return False
 
 
 # ============================================================
