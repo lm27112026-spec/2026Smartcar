@@ -119,3 +119,54 @@ class MasterBT:
         )
         print("MasterBT: IMU ->", json_str)
         self._uart.write(json_str.encode())
+
+
+# ═══════════════════════════════════════════════════════════════
+#  独立运行模式：实时 IMU 数据蓝牙发送
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    from imu import IMU as BtIMU
+    from machine import Pin
+
+    SWITCH2_PIN = 'D9'
+    LED_PIN     = 'C4'
+
+    print("MasterBT standalone — IMU telemetry via Bluetooth (UART5, 9600)")
+    print("Toggle SWITCH2 to stop.")
+
+    bt     = MasterBT()
+    bt_imu = BtIMU(calibrate_on_init=True)
+
+    led     = Pin(LED_PIN, Pin.OUT, value=True)
+    switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
+    state2  = switch2.value()
+
+    last_send = 0
+
+    try:
+        while True:
+            if switch2.value() != state2:
+                print("MasterBT standalone: SWITCH2 exit.")
+                break
+
+            now = time.ticks_ms()
+            if time.ticks_diff(now, last_send) >= 100:   # 10Hz
+                d = bt_imu.get_safe()
+                if d:
+                    bt_imu.update(d)
+                    r, p, y = bt_imu.get_angles()
+                    wx, wy, wz = bt_imu.get_angular_velocity()
+                    bt.send_imu_data(r, p, y, wx, wy, wz)
+                last_send = now
+                led.toggle()
+
+            time.sleep_ms(10)
+    except Exception as e:
+        print("MasterBT standalone error:", e)
+    finally:
+        try:
+            bt_imu.stop()
+        except Exception:
+            pass
+        print("MasterBT standalone stopped.")

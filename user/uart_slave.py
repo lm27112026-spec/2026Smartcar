@@ -78,3 +78,40 @@ class SlaveBT:
         except (ValueError, TypeError, KeyError):
             pass
         return None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  独立运行模式：实时接收并打印主机指令
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    from machine import Pin
+    import time
+
+    SWITCH2_PIN = 'D9'
+    LED_PIN     = 'C4'
+
+    print("SlaveBT standalone — listening on UART5 (9600)")
+    print("Toggle SWITCH2 to stop.")
+
+    slave = SlaveBT()
+    led   = Pin(LED_PIN, Pin.OUT, value=True)
+    sw2   = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
+    sw2_last = sw2.value()
+
+    try:
+        while True:
+            if sw2.value() != sw2_last:
+                print("SlaveBT standalone: SWITCH2 exit.")
+                break
+
+            cmd = slave.read_command()
+            if cmd is not None:
+                print("[RECV]", cmd)
+                led.toggle()
+
+            time.sleep_ms(10)
+    except Exception as e:
+        print("SlaveBT standalone error:", e)
+    finally:
+        print("SlaveBT standalone stopped.")
