@@ -1,10 +1,43 @@
 """
 main.py — 按键驱动控制
 
-【按键功能】
-  C14 (KEY3): 前进 20cm → UWB 平移（航向保持）
-  C8  (KEY1): 通过蓝牙向从车发送消息
-  C9  (KEY2): 摄像头靠近（代码空置）
+【按键映射】
+  C14 (KEY3) → action_c14(): 前进 20cm → UWB 平移（航向保持）
+  C8  (KEY1) → action_c8():  通过蓝牙向从车发送消息
+  C9  (KEY2) → action_c9():  摄像头靠近（代码空置）
+
+【函数功能】
+
+  顶层函数:
+    main()                          — 主入口，初始化硬件 + 按键循环
+
+  启动流程（main 中依次执行）:
+    origin 记录                     — UWB 初始化，读取起点坐标
+    _action_startup_forward()       — 记录原点后前进 10cm（航向保持，5° 偏差自动回正）
+
+  按键动作:
+    action_c14()                    — KEY3: 前进 20cm 后 UWB 平移
+    action_c8()                     — KEY1: 向从车发送蓝牙指令
+    action_c9()                     — KEY2: 摄像头靠近动作（空置）
+    send_messages()                 — 蓝牙消息发送循环
+
+  底层辅助:
+    check_sw2()                     — SW2 消抖检测
+    _read_imu_update_yaw()          — 读取 IMU 并更新偏航角
+    _lock_yaw()                     — 锁定当前航向为目标
+    _heading_correction(target_yaw) — P 控制纠偏到目标航向（支持自定义 deadband）
+    _encoder_reset()                — 编码器复位 + PWM 清零
+    _abort_check()                  — SW2 + 超时退出检测
+    _action_startup_forward()       — 记录原点后前进 10cm（航向保持）
+    _action_forward_20cm()          — C14 步骤 1: 前进 20cm
+    _action_uwb_translate()         — C14 步骤 2: UWB 平移纠偏
+
+  参数常量（文件中部）:
+    全局常量定义见第 17-45 行（车速、距离、PID 参数等）
+
+  UWB 坐标记录:
+    origin                          — 起点坐标 (x, y)，在 main() 启动时通过 uwb_record() 记录
+    supplies                        — 物资点坐标 (x, y)，在特定时间通过 uwb_record() 记录
 
 【依赖】motor.py, imu_motion.py, key.py, uwb_position.py, uart_master.py, utils.py
 【PIT 分配】PIT0=系统, PIT1=编码器(motor), PIT2=看门狗(key), PIT3=IMU
@@ -19,6 +52,7 @@ from imu_motion import (update_angle, imu_get_safe, yaw,
                         reset_ang_vel_pid)
 from key import capture, key_triggered, pet_watchdog
 from utils import normalize_angle
+from uwb_position import UWBPosition
 
 # ═══════════════════════════════════════════════════════════════
 #  常量
@@ -46,8 +80,18 @@ HEADING_KP       = 0.15    # 航向偏差 → wz P 增益
 HEADING_DEADBAND = 2.0     # 航向死区 (度)
 WZ_LIMIT         = 0.3     # wz 限幅 (归一化值)
 
+# ── 启动: 记录原点后前进 10cm ──
+STARTUP_FORWARD_DIST_CM = 10.0   # 目标距离 (cm)
+STARTUP_FORWARD_SPEED   = 0.30   # 前进速度 (m/s)
+STARTUP_TIMEOUT_S      = 5.0     # 超时 (s)
+STARTUP_HEADING_DB     = 5.0     # 航向死区 (度)，偏差 5° 后自动回正
+
 # ── SW2 ──
 SW2_DEBOUNCE_MS  = 50
+
+# ── UWB 坐标记录 ──
+origin   = None    # 起点坐标 (x, y)，在特定时间通过 uwb_record() 记录
+supplies = None    # 物资点坐标 (x, y)，在特定时间通过 uwb_record() 记录
 
 # ═══════════════════════════════════════════════════════════════
 #  硬件初始化
@@ -107,13 +151,21 @@ def _lock_yaw():
     return yaw
 
 
-def _heading_correction(target_yaw):
+def _heading_correction(target_yaw, deadband=None):
     """
     计算航向纠偏 wz，使当前 yaw 趋近 target_yaw。
+    
+    参数:
+        target_yaw: 目标航向角 (度)
+        deadband:   航向死区 (度)，默认使用 HEADING_DEADBAND
+    
     返回: wz (归一化值，-1~1)
     """
     if not _read_imu_update_yaw():
         return 0.0
+
+    if deadband is None:
+        deadband = HEADING_DEADBAND
 
     error = target_yaw - yaw
     # 角度差归一化到 [-180, 180]
@@ -122,7 +174,7 @@ def _heading_correction(target_yaw):
     elif error < -180:
         error += 360
 
-    if abs(error) < HEADING_DEADBAND:
+    if abs(error) < deadband:
         return 0.0
 
     wz = error * HEADING_KP
@@ -233,6 +285,88 @@ def _action_forward_20cm():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  启动步骤: 记录原点后前进 10cm（航向保持，5° 偏差回正）
+# ═══════════════════════════════════════════════════════════════
+
+def _action_startup_forward():
+    """记录原点后前进 10cm，IMU 航向闭环保持（5° 偏差自动回正）。返回: True=正常完成, False=中断"""
+    dist_m = STARTUP_FORWARD_DIST_CM / 100.0
+    print("  [STARTUP] 前进 {:.0f}cm 开始...".format(STARTUP_FORWARD_DIST_CM))
+
+    # 锁定初始航向
+    target_heading = _lock_yaw()
+    print("  [STARTUP] 航向锁定: {:.1f}°  死区 {:.0f}° 偏差自动回正".format(
+        target_heading, STARTUP_HEADING_DB))
+
+    # 距离累计（4 轮脉冲绝对值和）
+    total_pulses = [0, 0, 0, 0]
+    start_ms = time.ticks_ms()
+    last_print_ms = start_ms
+    loop_cnt = 0
+
+    led.value(1)
+
+    while True:
+        # ── 超时 / 退出检查 ──
+        if _abort_check():
+            led.value(0)
+            return False
+
+        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+        if elapsed > STARTUP_TIMEOUT_S:
+            print("  [STARTUP] 超时 ({:.1f}s)".format(elapsed))
+            led.value(0)
+            return False
+
+        # ── 读取编码器（单次调用，共用脉冲数据） ──
+        counts = get_encoder_counts()
+        if counts is None or len(counts) < 4:
+            time.sleep_ms(5)
+            continue
+
+        # 累计距离 (m) — 用于到达判定
+        for i in range(4):
+            total_pulses[i] += abs(counts[i])
+
+        wheel_dists = []
+        for i in range(4):
+            if ENC_SCALE[i] != 0:
+                wheel_dists.append(total_pulses[i] / abs(ENC_SCALE[i]))
+        avg_dist = sum(wheel_dists) / len(wheel_dists) if wheel_dists else 0.0
+
+        # ── 到达判定 ──
+        if avg_dist >= dist_m:
+            print("  [STARTUP] 到达目标! dist={:.2f}m pulses={}".format(
+                avg_dist, total_pulses))
+            led.value(0)
+            return True
+
+        # ── 进度打印（每 500ms） ──
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_print_ms) >= 500:
+            last_print_ms = now
+            print("  [STARTUP] dist={:.2f}m / {:.2f}m  yaw={:.1f}°".format(
+                avg_dist, dist_m, yaw))
+
+        loop_cnt += 1
+        if loop_cnt % 50 == 0:
+            gc.collect()
+
+        # ── 航向纠偏（5° 死区内不动作，超过则自动回正） ──
+        wz = _heading_correction(target_heading, deadband=STARTUP_HEADING_DB)
+
+        # ── 闭环驱动: vx=前进速度, vy=0, wz=航向纠偏 ──
+        try:
+            rs = [counts[i] / ENC_SCALE[i] / FWD_CTRL_DT if ENC_SCALE[i] != 0 else 0
+                  for i in range(4)]
+            omni_drive_closed_loop(STARTUP_FORWARD_SPEED, 0, wz, rs, FWD_CTRL_DT)
+        except Exception as e:
+            print("  [STARTUP] 驱动错误:", e)
+
+        time.sleep_ms(int(FWD_CTRL_DT * 1000))
+
+
+# ═══════════════════════════════════════════════════════════════
 #  C14 步骤 2: UWB 平移（航向保持）
 # ═══════════════════════════════════════════════════════════════
 
@@ -245,7 +379,6 @@ def _action_uwb_translate():
     print("  [UWB] Heading locked: {:.1f}°".format(target_heading))
 
     # ── 初始化 UWB ──
-    from uwb_position import UWBPosition
     uwb = None
     try:
         uwb = UWBPosition(uart_id=0, baudrate=115200, target_anchor="8834")
@@ -268,6 +401,14 @@ def _action_uwb_translate():
         time.sleep_ms(10)
 
     print("  [UWB] Data acquired (frame {})".format(uwb.get_frame_count()))
+
+    # ── UWB 坐标记录：supplies（占位，待填写触发条件） ──
+    # global supplies
+    # TODO: 在特定时间调用 uwb_record() 记录 supplies 坐标
+    # if <supplies_触发条件>:
+    #     uwb.uwb_record()
+    #     supplies = uwb.get_position()
+    #     print("  [UWB] Supplies recorded:", supplies)
 
     # ── 平移主循环 ──
     start_ms = time.ticks_ms()
@@ -527,17 +668,51 @@ def main():
     print("")
     print("=" * 50)
     print("  RT1021 — 按键驱动控制")
+    print("  启动: 记录原点 → 前进 10cm（航向保持）")
     print("=" * 50)
     print("  C14 (KEY3): 前进 20cm → UWB 平移")
     print("  C8  (KEY1): 蓝牙发送从车消息")
     print("  C9  (KEY2): 摄像头靠近 (空置)")
     print("  SW2 (D9)  : 强制退出")
     print("=" * 50)
+    print("")
+    loop_cnt = 0
+
+    # ── UWB 初始化 & 记录起点坐标（小车运动前） ──
+    global origin
+    try:
+        uwb_origin = UWBPosition(uart_id=0, baudrate=115200, target_anchor="8834")
+        print("  [ORIGIN] 等待 UWB 数据记录起点...")
+        wait_start = time.ticks_ms()
+        while uwb_origin.get_frame_count() == 0:
+            uwb_origin.step()
+            if time.ticks_diff(time.ticks_ms(), wait_start) > 3000:
+                print("  [ORIGIN] 超时，跳过起点记录")
+                break
+            time.sleep_ms(10)
+        if uwb_origin.get_frame_count() > 0:
+            uwb_origin.uwb_record()
+            origin = uwb_origin.get_position()
+            print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
+                origin[0], origin[1]))
+        else:
+            origin = (0.0, 0.0)
+        uwb_origin.stop()
+    except Exception as e:
+        print("  [ORIGIN] UWB 初始化失败:", e)
+        origin = (0.0, 0.0)
+
+    # ── 记录原点后，前进 10cm（航向保持，5° 偏差自动回正） ──
+    pause_encoder_ticker()
+    _encoder_reset()
+    if not _action_startup_forward():
+        print("  [STARTUP] 前进中断，进入主循环")
+    stop_all()
+    _encoder_reset()
+    resume_encoder_ticker()
+    led.value(1)  # 就绪指示
     print("  等待按键...")
     print("")
-
-    led.value(1)  # 就绪指示
-    loop_cnt = 0
 
     try:
         while True:

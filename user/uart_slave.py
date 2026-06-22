@@ -28,6 +28,11 @@ class SlaveBT:
     def __init__(self, uart_id=5, baudrate=9600):
         self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1, timeout=10)
 
+
+    def send_ok(self):
+        """向主车发送 'ok' 应答"""
+        self.send("ok")
+
     def read_command(self):
         """非阻塞读取并解析一条指令。
         
@@ -57,6 +62,10 @@ class SlaveBT:
         # EMERGENCY_STOP
         if line == "EMERGENCY_STOP":
             return {"type": "emergency_stop"}
+
+        # rotate 指令
+        if line == "1":
+            return {"type": "rotate"}
 
         return None
 

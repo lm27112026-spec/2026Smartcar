@@ -435,7 +435,7 @@ class UWBPosition:
         self.STORE_DISTANCE_CM = distance_cm
         print("Store distance threshold set to {:.1f} cm".format(distance_cm))
 
-    def manual_store(self):
+    def uwb_record(self):
         """
         手动存储当前位置（不受距离阈值限制）。
         

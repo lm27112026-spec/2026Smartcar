@@ -25,80 +25,7 @@ class MasterBT:
     def __init__(self, uart_id=5, baudrate=9600):
         self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1)
 
-    def send_pos_adjust(self, vx, vy, wz):
-        """发送位置调整指令，等待从机应答 POS_OK
 
-        参数:
-            vx: X 轴速度/位置
-            vy: Y 轴速度/位置
-            wz: Z 轴（角速度）调整量
-
-        返回:
-            True   - 从机应答 POS_OK
-            False  - 超时无应答
-        """
-        cmd = "POS_ADJ:{:.3f},{:.3f},{:.3f}\r\n".format(vx, vy, wz)
-        cmd_bytes = cmd.encode()
-
-        for attempt in range(3):
-            print("MasterBT: send ->", cmd.strip())
-            self._uart.write(cmd_bytes)
-
-            deadline = time.ticks_ms() + 3000
-            ok = False
-            while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-                if self._uart.any():
-                    line = self._uart.readline()
-                    if line == b"POS_OK\r\n" or line == b"POS_OK":
-                        ok = True
-                        break
-                time.sleep_ms(10)
-
-            if ok:
-                return True
-
-            if attempt < 2:
-                print("MasterBT: retry {}/2 for POS_ADJ".format(attempt + 1))
-
-        print("MasterBT: POS_ADJ failed after 3 attempts")
-        return False
-
-    def read_response_ok(self):
-        """非阻塞检查从机是否回复 POS_OK（使用 read() 避免 readline 阻塞）。
-
-        返回:
-            True  - 收到 POS_OK
-            False - 尚无有效应答（调用方应稍后重试）
-        """
-        while self._uart.any():
-            data = self._uart.read()
-            if data and b"POS_OK" in data:
-                return True
-        return False
-
-    def send_pos_adjust_async(self, vx, vy, wz):
-        """发送 POS_ADJ 但不等待应答（测试用，发送后即忘）。"""
-        cmd = "POS_ADJ:{:.3f},{:.3f},{:.3f}\r\n".format(vx, vy, wz)
-        print("MasterBT: send ->", cmd.strip())
-        self._uart.write(cmd.encode())
-
-    def send_sync_move(self, vx, vy, wz):
-        """发送同步运动指令，不等待应答（发送后即忘）
-
-        参数:
-            vx: X 轴速度
-            vy: Y 轴速度
-            wz: Z 轴（角速度）
-        """
-        cmd = "SYNC_MOVE:{:.3f},{:.3f},{:.3f}\r\n".format(vx, vy, wz)
-        print("MasterBT: send ->", cmd.strip())
-        self._uart.write(cmd.encode())
-
-    def send_emergency_stop(self):
-        """发送紧急停止指令（发送后即忘）"""
-        cmd = b"EMERGENCY_STOP\r\n"
-        print("MasterBT: send -> EMERGENCY_STOP")
-        self._uart.write(cmd)
 
     def send_imu_data(self, roll, pitch, yaw, wx, wy, wz):
         """发送 IMU 姿态与角速度 JSON 数据，火抛不等待应答。
@@ -114,11 +41,76 @@ class MasterBT:
         JSON 格式: {"roll":R,"pitch":P,"yaw":Y,"wx":X,"wy":Y,"wz":Z}\\r\\n
         所有值使用 {:.1f} 格式化。
         """
-        json_str = '{{"roll":{:.1f},"pitch":{:.1f},"yaw":{:.1f},"wx":{:.1f},"wy":{:.1f},"wz":{:.1f}}}\r\n'.format(
-            roll, pitch, yaw, wx, wy, wz
+        json_str = '{{"roll":{:.1f},"yaw":{:.1f},"wx":{:.1f},"wy":{:.1f},"wz":{:.1f}}}\r\n'.format(
+            roll,yaw, wx, wy, wz
         )
         print("MasterBT: IMU ->", json_str)
         self._uart.write(json_str.encode())
+
+    def rotate(self):
+        """发送数字 1，火抛不等待应答。"""
+        print("MasterBT: rotate -> 1")
+        self._uart.write(b"1\r\n")
+
+    def will_move(self, direction, angle):
+        """发送转弯预告指令，火抛不等待应答。
+
+        参数:
+            direction: 转弯方向，字符串 "LEFT" 或 "RIGHT"
+            angle:     转动角度（度），正数
+
+        协议格式: WILL_MOVE:<direction>,<angle>\\r\\n
+        示例: WILL_MOVE:LEFT,90.0\\r\\n
+
+        从车收到后可知主车即将向指定方向转动指定角度，
+        可用于协同避让或同步转向。
+        """
+        # 参数校验
+        direction = str(direction).upper()
+        if direction not in ("LEFT", "RIGHT"):
+            print("MasterBT: will_move invalid direction '{}', use LEFT/RIGHT".format(direction))
+            return
+
+        cmd = "WILL_MOVE:{},{:.1f}\r\n".format(direction, float(angle))
+        print("MasterBT: will_move ->", cmd.strip())
+        self._uart.write(cmd.encode())
+
+    # ── 接收 ───────────────────────────────────────────
+
+    def read_response(self):
+        """非阻塞读取从车应答（一行，\\r\\n 终止）
+
+        返回:
+            str: 解码后的字符串（不含 \\r\\n）
+            None: 无数据
+        """
+        if not self._uart.any():
+            return None
+        raw = self._uart.readline()
+        if not raw:
+            return None
+        try:
+            line = raw.decode().strip()
+        except UnicodeError:
+            return None
+        return line if line else None
+
+    def wait_ok(self, timeout_ms=1000):
+        """阻塞等待从车发送 'ok' 应答
+
+        参数:
+            timeout_ms: 超时时间 (ms)
+
+        返回:
+            bool: True=收到 ok, False=超时
+        """
+        deadline = time.ticks_ms() + timeout_ms
+        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            resp = self.read_response()
+            if resp == "ok":
+                return True
+            time.sleep_ms(5)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
