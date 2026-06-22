@@ -4,6 +4,14 @@ MasterBT - 主控车蓝牙从机通信模块
 通过 HC-05 蓝牙模块（UART5, 9600 波特）与从控车建立串口通信。
 提供位置调整、同步运动、紧急停止等指令的发送与应答处理。
 
+协议说明:
+  - POS_ADJ:  发送位置调整，等待 POS_OK 应答（最多 3 次重试）
+  - SYNC_MOVE:发送同步运动，不等待应答
+  - EMERGENCY_STOP: 紧急停止
+  - IMU telemetry (JSON): 发送 IMU 姿态与角速度数据，纯火抛写入，
+    JSON 格式: {"roll":R,"pitch":P,"yaw":Y,"wx":X,"wy":Y,"wz":Z}\\r\\n
+    所有值使用 {:.1f} 格式化，末尾 \\r\\n 终止。
+
 作者: robot.py 依赖模块
 """
 
@@ -91,3 +99,23 @@ class MasterBT:
         cmd = b"EMERGENCY_STOP\r\n"
         print("MasterBT: send -> EMERGENCY_STOP")
         self._uart.write(cmd)
+
+    def send_imu_data(self, roll, pitch, yaw, wx, wy, wz):
+        """发送 IMU 姿态与角速度 JSON 数据，火抛不等待应答。
+
+        参数:
+            roll:  横滚角（度）
+            pitch: 俯仰角（度）
+            yaw:   偏航角（度）
+            wx:    X 轴角速度
+            wy:    Y 轴角速度
+            wz:    Z 轴角速度
+
+        JSON 格式: {"roll":R,"pitch":P,"yaw":Y,"wx":X,"wy":Y,"wz":Z}\\r\\n
+        所有值使用 {:.1f} 格式化。
+        """
+        json_str = '{{"roll":{:.1f},"pitch":{:.1f},"yaw":{:.1f},"wx":{:.1f},"wy":{:.1f},"wz":{:.1f}}}\r\n'.format(
+            roll, pitch, yaw, wx, wy, wz
+        )
+        print("MasterBT: IMU ->", json_str)
+        self._uart.write(json_str.encode())

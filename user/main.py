@@ -28,6 +28,9 @@ from cam_follow import (
     PID_FWD, PID_LAT,
 )
 
+from uart_master import MasterBT
+from imu import IMU as BtIMU
+
 # ═══════════════════════════════════════════════════════════════
 #  常量
 # ═══════════════════════════════════════════════════════════════
@@ -86,6 +89,15 @@ def check_sw2():
         return True
     return False
 
+
+# ═══════════════════════════════════════════════════════════════
+#  蓝牙 IMU 遥测初始化
+# ═══════════════════════════════════════════════════════════════
+
+bt = MasterBT()                         # 蓝牙通信 (UART5, 9600)
+bt_imu = BtIMU(calibrate_on_init=True)  # 独立 IMU 实例（自动校准陀螺仪）
+bt_imu_last_ms = 0                      # 上次 IMU 发送时间戳
+bt_send_imu_enabled = True              # 开关标志，按状态控制
 
 # ═══════════════════════════════════════════════════════════════
 #  过渡动作 — 辅助函数
@@ -356,6 +368,16 @@ def main():
             loop_cnt += 1
             if loop_cnt % 50 == 0:
                 gc.collect()
+
+            # ─── 蓝牙 IMU 遥测发送 (10Hz, 非阻塞) ───
+            if bt_send_imu_enabled and time.ticks_diff(now, bt_imu_last_ms) >= 100:
+                d = bt_imu.get_safe()
+                if d:
+                    bt_imu.update(d)
+                    r, p, y = bt_imu.get_angles()
+                    wx, wy, wz = bt_imu.get_angular_velocity()
+                    bt.send_imu_data(r, p, y, wx, wy, wz)
+                bt_imu_last_ms = now
 
             # ─── 按键模式切换 ───
             if key_triggered(1):           # KEY1 → UWB
@@ -650,6 +672,10 @@ def main():
             except Exception:
                 pass
         pause_encoder_ticker()
+        try:
+            bt_imu.stop()
+        except Exception:
+            pass
         time.sleep_ms(50)
         print("\nRobot stopped. (you may now re-run or enter REPL)")
 

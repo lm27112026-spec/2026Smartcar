@@ -9,7 +9,7 @@ uart6.init(baudrate=9600, bits=8, parity=None, stop=1)
 print("Master HC-05 ready, sending...")
 
 while True:
-    cmd = b'run\r\n'
+    cmd = b'run/r/n'
     uart6.write(cmd)
     print('Sent:', cmd)
 
