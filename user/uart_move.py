@@ -35,7 +35,7 @@ PRINT_MS = 200
 DIST_KP = 1.0
 DIST_KI = 0.5
 DIST_OUT_LIMIT = 0.30
-MIN_SPEED = 0.08
+MIN_SPEED = 0.1
     
 # 航向 PID（外环：航向偏差 → 目标 dps，内环由 imu_motion 角速度闭环处理）
 HDG_KP = 0.08     # 航向偏差 (°) → 目标 dps：1° → 30dps，5° → 150dps
@@ -224,7 +224,7 @@ print("\n" + "=" * 50)
 print("  Route: RIGHT 30 → FWD 60 → ROT 180 → RIGHT 30")
 print("=" * 50)
 
-ok = move_straight(0, 1, 0.30, "1/4 RIGHT 30cm", use_heading=True)
+ok = move_straight(1, 0, 0.30, "1/4 RIGHT 30cm", use_heading=True)
 if ok:
     ok = move_straight(1, 0, 0.60, "2/4 FWD 60cm", use_heading=True)
 if ok:
