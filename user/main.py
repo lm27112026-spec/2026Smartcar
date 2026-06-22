@@ -13,7 +13,9 @@ main.py — 按键驱动控制
 
   启动流程（main 中依次执行）:
     origin 记录                     — UWB 初始化，读取起点坐标
-    _action_startup_forward()       — 记录原点后前进 10cm（航向保持，5° 偏差自动回正）
+    _action_startup_forward()       — 前进 10cm（航向保持，5° 偏差自动回正）
+    _action_startup_translate_right() — 向右平移，UWB 逼近，摄像头检测到目标后停止
+    see_and_push()   — 靠近目标 → 距离条件满足 → rotate 发数字 1 → 等待从车 ok
 
   按键动作:
     action_c14()                    — KEY3: 前进 20cm 后 UWB 平移
@@ -29,6 +31,8 @@ main.py — 按键驱动控制
     _encoder_reset()                — 编码器复位 + PWM 清零
     _abort_check()                  — SW2 + 超时退出检测
     _action_startup_forward()       — 记录原点后前进 10cm（航向保持）
+    _action_startup_translate_right() — 向右平移，UWB 逼近，摄像头检测到目标后停止
+    see_and_push()   — 靠近目标 → 发数字 1 → 等待从车 ok
     _action_forward_20cm()          — C14 步骤 1: 前进 20cm
     _action_uwb_translate()         — C14 步骤 2: UWB 平移纠偏
 
@@ -85,6 +89,14 @@ STARTUP_FORWARD_DIST_CM = 10.0   # 目标距离 (cm)
 STARTUP_FORWARD_SPEED   = 0.30   # 前进速度 (m/s)
 STARTUP_TIMEOUT_S      = 5.0     # 超时 (s)
 STARTUP_HEADING_DB     = 5.0     # 航向死区 (度)，偏差 5° 后自动回正
+
+# ── 启动: 向右平移（逼近 UWB，摄像头检测终止） ──
+STARTUP_TRANSLATE_SPEED    = 0.30   # 右移速度 (m/s)
+STARTUP_TRANSLATE_TIMEOUT = 15.0   # 超时 (s)
+
+# ── 启动: 靠近目标 + 蓝牙信号 ──
+STARTUP_APPROACH_TIMEOUT = 10.0    # 靠近超时 (s)
+WAIT_OK_TIMEOUT_MS       = 5000    # 等待从车 ok 应答超时 (ms)
 
 # ── SW2 ──
 SW2_DEBOUNCE_MS  = 50
@@ -364,6 +376,205 @@ def _action_startup_forward():
             print("  [STARTUP] 驱动错误:", e)
 
         time.sleep_ms(int(FWD_CTRL_DT * 1000))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  启动步骤: 向右平移 — 逼近 UWB，摄像头检测到目标后停止
+# ═══════════════════════════════════════════════════════════════
+
+def _action_startup_translate_right():
+    """
+    向右平移直至摄像头识别到目标。
+    
+    平移时 UWB Y 值会逐渐减小（靠近锚点），航向闭环保持。
+    检测到目标后记录 supplies 并停轮，返回 True。
+    摄像头识别逻辑待实现，当前占位返回 False（永不停止），
+    依靠超时或 SW2 中断退出。
+    
+    返回: True=摄像头检测到目标, False=超时/中断
+    """
+    global supplies
+    print("  [TRANSLATE] 向右平移开始（逼近 UWB）...")
+
+    # 锁定当前航向
+    target_heading = _lock_yaw()
+    print("  [TRANSLATE] 航向锁定: {:.1f}°".format(target_heading))
+
+    # ── 初始化 UWB ──
+    uwb = None
+    try:
+        uwb = UWBPosition(uart_id=0, baudrate=115200, target_anchor="8834")
+    except Exception as e:
+        print("  [TRANSLATE] UWB 初始化失败:", e)
+        return False
+
+    # ── 等待首次有效 UWB 数据 ──
+    print("  [TRANSLATE] 等待 UWB 数据...")
+    wait_start = time.ticks_ms()
+    while uwb.get_frame_count() == 0:
+        if _abort_check():
+            uwb.stop()
+            return False
+        uwb.step()
+        if time.ticks_diff(time.ticks_ms(), wait_start) > UWB_INIT_TIMEOUT_S * 1000:
+            print("  [TRANSLATE] UWB 超时 ({:.0f}s)".format(UWB_INIT_TIMEOUT_S))
+            uwb.stop()
+            return False
+        time.sleep_ms(10)
+    print("  [TRANSLATE] UWB 数据已获取 (frame {})".format(uwb.get_frame_count()))
+
+    start_ms = time.ticks_ms()
+    last_print_ms = start_ms
+    loop_cnt = 0
+
+    led.value(1)
+
+    while True:
+        # ── 超时 / 退出 ──
+        if _abort_check():
+            led.value(0)
+            uwb.stop()
+            return False
+
+        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+        if elapsed > STARTUP_TRANSLATE_TIMEOUT:
+            print("  [TRANSLATE] 超时 ({:.1f}s)，未检测到目标".format(elapsed))
+            led.value(0)
+            uwb.stop()
+            return False
+
+        # ── 读取 UWB 数据 ──
+        uwb.step()
+        y_cm = uwb.get_position()[1]
+        _, angle = uwb.get_distance_angle()
+
+        # ═══════════════════════════════════════════════════════
+        #  【待实现】摄像头目标检测
+        #  替换下方条件为实际的摄像头识别逻辑，例如：
+        #   - from cam_data import CamDataReceiver
+        #   - cam = CamDataReceiver()
+        #   - cam_data = cam.receive()
+        #   - if cam_data is not None and cam_data['target_detected']:
+        # ═══════════════════════════════════════════════════════
+        if False:  # ← 替换为实际摄像头检测条件
+            # ── 记录物资点坐标 ──
+            stop_all()
+            supplies = uwb.get_position()
+            print("  [TRANSLATE] 摄像头检测到目标！ supplies = ({:.1f}, {:.1f})".format(
+                supplies[0], supplies[1]))
+            led.value(0)
+            uwb.stop()
+            return True
+
+        # ── 进度打印（每 500ms） ──
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_print_ms) >= 500:
+            last_print_ms = now
+            print("  [TRANSLATE] Y={:.1f}cm  D={:.1f}cm  A={:.1f}°  yaw={:.1f}°".format(
+                y_cm, uwb.get_distance_angle()[0], angle, yaw))
+
+        loop_cnt += 1
+        if loop_cnt % 50 == 0:
+            gc.collect()
+
+        # ── 航向纠偏 ──
+        wz = _heading_correction(target_heading)
+
+        # ── 闭环驱动: vx=0（无前后）, vy>0 向右平移, wz=航向纠偏 ──
+        try:
+            rc = get_encoder_counts()
+            if rc is None or len(rc) < 4:
+                time.sleep_ms(5)
+                continue
+            rs = [rc[i] / ENC_SCALE[i] / UWB_CTRL_DT if ENC_SCALE[i] != 0 else 0
+                  for i in range(4)]
+            omni_drive_closed_loop(0, STARTUP_TRANSLATE_SPEED, wz, rs, UWB_CTRL_DT)
+        except Exception as e:
+            print("  [TRANSLATE] 驱动错误:", e)
+
+        time.sleep_ms(int(UWB_CTRL_DT * 1000))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  启动步骤: 靠近目标 → 蓝牙信号通知从车
+# ═══════════════════════════════════════════════════════════════
+
+def see_and_push():
+    """
+    摄像头检测到目标后：靠近目标 → 到达指定距离 → rotate 发数字 1 → 等待从车 ok。
+    
+    流程:
+      1. 【占位】向目标靠近（运动控制代码待填写）
+      2. 【占位】摄像头识别到与目标距离到达某值后
+      3. 调用 bt.rotate() 向从车发送数字 1
+      4. 阻塞等待从车回复 "ok"
+      5. 返回 True
+    
+    返回: True=完整流程完成, False=超时/中断
+    """
+    print("\n  [APPROACH] === 靠近目标 & 蓝牙信号 ===")
+
+    # ── 锁定航向（靠近过程保持方向） ──
+    target_heading = _lock_yaw()
+    print("  [APPROACH] 航向锁定: {:.1f}°".format(target_heading))
+
+    start_ms = time.ticks_ms()
+    loop_cnt = 0
+
+    # ═══════════════════════════════════════════════════════════
+    #  阶段 1: 向目标靠近
+    #  【待实现】填入实际靠近控制逻辑，例如：
+    #   - from cam_follow import compute_control, reset_control
+    #   - reset_control()
+    #   - while True:
+    #   -     if _abort_check(): return False
+    #   -     elapsed = time.ticks_diff(...) / 1000
+    #   -     if elapsed > STARTUP_APPROACH_TIMEOUT: ...
+    #   -     cam_data = cam.receive()
+    #   -     if cam_data is None: continue
+    #   -     vx, vy, wz = compute_control(cam_data, target_heading)
+    #   -     omni_drive_closed_loop(vx, vy, wz, rs, FWD_CTRL_DT)
+    #   -     # 当距离满足条件时 break 进入阶段 2
+    #   -     if cam_data['distance_cm'] < TARGET_DIST_CM:
+    #   -         break
+    # ═══════════════════════════════════════════════════════════
+    print("  [APPROACH] 【占位】靠近目标运动代码待实现")
+
+    # 占位：直接进入阶段 2（无实际靠近动作）
+    # 后续将上方占位中的循环结果走到此处
+
+    # ── 停轮 ──
+    stop_all()
+    print("  [APPROACH] 到达目标位置")
+
+    # ═══════════════════════════════════════════════════════════
+    #  阶段 2: 检查距离条件 → 调用 rotate 发送数字 1
+    #  【待实现】替换下方条件为实际摄像头距离判断，例如：
+    #   - if cam_data is not None and cam_data['distance_cm'] < TARGET_DIST_CM:
+    # ═══════════════════════════════════════════════════════════
+    if True:  # ← 替换为实际距离判定条件（空置时始终执行以便调试）
+        print("  [APPROACH] 距离条件满足，调用 rotate 发送数字 1...")
+
+        try:
+            bt.rotate()
+            print("  [APPROACH] 数字 1 已发送，等待从车 ok...")
+
+            # 阶段 3: 等待从车回复 "ok"
+            ok_received = bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS)
+            if ok_received:
+                print("  [APPROACH] 从车已确认 (ok)，流程完成")
+                return True
+            else:
+                print("  [APPROACH] 等待从车 ok 超时 ({:.0f}s)".format(
+                    WAIT_OK_TIMEOUT_MS / 1000))
+                return False
+        except Exception as e:
+            print("  [APPROACH] 蓝牙通信失败:", e)
+            return False
+    else:
+        # 距离条件不满足，由阶段 1 循环继续靠近
+        print("  [APPROACH] 距离条件暂不满足，继续靠近（需循环逻辑）")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -668,7 +879,7 @@ def main():
     print("")
     print("=" * 50)
     print("  RT1021 — 按键驱动控制")
-    print("  启动: 记录原点 → 前进 10cm（航向保持）")
+    print("  启动: 记录原点 → 前进 10cm → 右移（摄像头停）")
     print("=" * 50)
     print("  C14 (KEY3): 前进 20cm → UWB 平移")
     print("  C8  (KEY1): 蓝牙发送从车消息")
@@ -705,7 +916,17 @@ def main():
     # ── 记录原点后，前进 10cm（航向保持，5° 偏差自动回正） ──
     pause_encoder_ticker()
     _encoder_reset()
-    if not _action_startup_forward():
+    if _action_startup_forward():
+        # ── 前进完成后向右平移，直至摄像头识别到目标 ──
+        result = _action_startup_translate_right()
+        if result:
+            print("  [STARTUP] 摄像头检测到目标，平移完毕")
+            # ── 靠近目标 → 蓝牙信号通知从车 ──
+            if not see_and_push():
+                print("  [STARTUP] 靠近/信号流程中断")
+        else:
+            print("  [STARTUP] 平移超时/中断，进入主循环")
+    else:
         print("  [STARTUP] 前进中断，进入主循环")
     stop_all()
     _encoder_reset()
