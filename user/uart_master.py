@@ -48,14 +48,14 @@ class MasterBT:
 
 
     def turn_left(self):
-        """发送数字 0 给从车，表示向左转。火抛不等待应答。"""
-        print("MasterBT: turn_left -> 0")
-        self._uart.write(b"0\r\n")
+        """发送数字 1 给从车，表示向左转。火抛不等待应答。"""
+        print("MasterBT: turn_left -> 1")
+        self._uart.write(b"1\r\n")
 
     def turn_right(self):
-        """发送数字 1 给从车，表示向右转。火抛不等待应答。"""
-        print("MasterBT: turn_right -> 1")
-        self._uart.write(b"1\r\n")
+        """发送数字 0 给从车，表示向右转。火抛不等待应答。"""
+        print("MasterBT: turn_right -> 0")
+        self._uart.write(b"0\r\n")
 
     
     # ── 接收 ───────────────────────────────────────────
