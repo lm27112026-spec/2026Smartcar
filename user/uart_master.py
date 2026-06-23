@@ -26,7 +26,6 @@ class MasterBT:
         self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1)
 
 
-
     def send_imu_data(self, roll, pitch, yaw, wx, wy, wz):
         """发送 IMU 姿态与角速度 JSON 数据，火抛不等待应答。
 
@@ -47,34 +46,18 @@ class MasterBT:
         print("MasterBT: IMU ->", json_str)
         self._uart.write(json_str.encode())
 
-    def rotate(self):
-        """发送数字 1，火抛不等待应答。"""
-        print("MasterBT: rotate -> 1")
+
+    def turn_left(self):
+        """发送数字 0 给从车，表示向左转。火抛不等待应答。"""
+        print("MasterBT: turn_left -> 0")
+        self._uart.write(b"0\r\n")
+
+    def turn_right(self):
+        """发送数字 1 给从车，表示向右转。火抛不等待应答。"""
+        print("MasterBT: turn_right -> 1")
         self._uart.write(b"1\r\n")
 
-    def will_move(self, direction, angle):
-        """发送转弯预告指令，火抛不等待应答。
-
-        参数:
-            direction: 转弯方向，字符串 "LEFT" 或 "RIGHT"
-            angle:     转动角度（度），正数
-
-        协议格式: WILL_MOVE:<direction>,<angle>\\r\\n
-        示例: WILL_MOVE:LEFT,90.0\\r\\n
-
-        从车收到后可知主车即将向指定方向转动指定角度，
-        可用于协同避让或同步转向。
-        """
-        # 参数校验
-        direction = str(direction).upper()
-        if direction not in ("LEFT", "RIGHT"):
-            print("MasterBT: will_move invalid direction '{}', use LEFT/RIGHT".format(direction))
-            return
-
-        cmd = "WILL_MOVE:{},{:.1f}\r\n".format(direction, float(angle))
-        print("MasterBT: will_move ->", cmd.strip())
-        self._uart.write(cmd.encode())
-
+    
     # ── 接收 ───────────────────────────────────────────
 
     def read_response(self):

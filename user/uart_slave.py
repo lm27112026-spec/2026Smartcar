@@ -63,11 +63,23 @@ class SlaveBT:
         if line == "EMERGENCY_STOP":
             return {"type": "emergency_stop"}
 
-        # rotate 指令
+        # turn 指令
+        if line == "0":
+            return {"type": "turn_left"}
         if line == "1":
-            return {"type": "rotate"}
+            return {"type": "turn_right"}
 
         return None
+
+    def read_turn_left(self):
+        """非阻塞读取左转指令 (0)。返回 True 表示收到左转指令。"""
+        cmd = self.read_command()
+        return cmd is not None and cmd.get("type") == "turn_left"
+
+    def read_turn_right(self):
+        """非阻塞读取右转指令 (1)。返回 True 表示收到右转指令。"""
+        cmd = self.read_command()
+        return cmd is not None and cmd.get("type") == "turn_right"
 
     def _parse_json(self, line):
         """解析 JSON 格式 IMU 数据"""
