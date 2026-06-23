@@ -166,7 +166,7 @@ while True:
                                 x_filt = XY_FILT_ALPHA * x_cm + (1 - XY_FILT_ALPHA) * x_filt
                                 y_filt = XY_FILT_ALPHA * y_cm + (1 - XY_FILT_ALPHA) * y_filt
 
-                            angle_to_target = math.atan2(-x_filt, y_filt) * 180.0 / math.pi
+                            angle_to_target = math.atan2(y_filt, -x_filt) * 180.0 / math.pi
                             if angle_filt is None:
                                 angle_filt = angle_to_target
                             else:

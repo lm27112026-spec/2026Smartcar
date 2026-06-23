@@ -284,8 +284,8 @@ class UWBPosition:
         self._y_filt = float(y_med)
         self._d_filt = float(d_med)
 
-        # ── 角度计算（基于已滤波坐标） ──
-        self._angle_filt = math.atan2(-self._x_filt, self._y_filt) * 180.0 / math.pi
+        # ── 角度计算（基于已滤波坐标，前方=-X, Y减小→向右） ──
+        self._angle_filt = math.atan2(self._y_filt, -self._x_filt) * 180.0 / math.pi
 
         # ── 更新异常值参考值 ──
         self._last_valid_d = d_med

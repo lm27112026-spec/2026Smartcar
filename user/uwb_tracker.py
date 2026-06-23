@@ -192,7 +192,7 @@ class UWBFollower:
             self._x_filt = self.XY_FILT_ALPHA * x_cm + (1 - self.XY_FILT_ALPHA) * self._x_filt
             self._y_filt = self.XY_FILT_ALPHA * y_cm + (1 - self.XY_FILT_ALPHA) * self._y_filt
 
-        angle_to_target = math.atan2(-self._x_filt, self._y_filt) * 180.0 / math.pi
+        angle_to_target = math.atan2(self._y_filt, -self._x_filt) * 180.0 / math.pi
         if self._angle_filt is None:
             self._angle_filt = angle_to_target
         else:
@@ -239,7 +239,7 @@ class UWBFollower:
             update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
             # ── 航向偏差 ──
-            # _angle_filt = atan2(-x, y): 正=目标在左，负=目标在右
+            # _angle_filt = atan2(y, -x): 正=目标在左，负=目标在右
             # 航向纠偏需要取反：目标在左(yaw_err>0) → 向左转(wz>0)
             yaw_err = -self._angle_filt
 
@@ -292,7 +292,7 @@ class UWBFollower:
 
     def get_angle(self):
         """返回锚点相对车头的滤波后方向角（度）。
-        atan2(-x, y) 约定：负=右侧，正=左侧。"""
+        atan2(y, -x) 约定：负=右侧，正=左侧。"""
         return self._angle_filt if self._angle_filt is not None else 0.0
 
     def is_near_target(self):

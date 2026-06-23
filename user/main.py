@@ -16,15 +16,13 @@ main.py — 按键驱动控制
     _action_startup_forward()       — 前进 10cm（航向保持，5° 偏差自动回正）
     _action_startup_translate_right() — 向右平移，UWB 逼近，摄像头检测到目标后停止
     
-    === 首次检测到目标后进入循环（退出条件：走完 20cm 未检测到）===
-    while 摄像头检测到物品:
-      ① supplies 记录/刷新
-      ② see_and_push()              — 靠近 → rotate("1") → wait_ok → supplies 刷新
-      ③ supplies 刷新
-      ④ _action_forward_until_yellow() — 全速前进至黄线停车（占位）
-      ⑤⑥ _action_turn_backward()    — will_move → 向后转 → wait_ok
-       ⑦ _action_move_to_supplies()  — Phase1 UWB导航→Phase2 向UWB 20cm搜索
-      ⑧ 回到 ①
+    === 首次检测到目标后进入循环（退出条件：Phase2 走完 20cm 未检测到）===
+    while True:
+       ① see_and_push()                     — 靠近 → rotate("1") → wait_ok（内部刷新 supplies）
+       ② _action_forward_until_yellow()      — 全速前进至黄线停车（占位）
+       ③ _action_turn_backward()             — will_move → 向后转 → wait_ok
+       ④ _action_move_to_supplies()          — Phase1 UWB导航→Phase2 向UWB 20cm搜索
+       ⑤ 回到 ①
 
   按键动作:
     action_c14()                    — KEY3: 前进 20cm 后 UWB 平移
@@ -50,8 +48,8 @@ main.py — 按键驱动控制
     _action_forward_20cm()          — C14 步骤 1: 前进 20cm
     _action_uwb_translate()         — C14 步骤 2: UWB 平移纠偏
 
-  参数常量（文件中部）:
-    全局常量定义见第 17-45 行（车速、距离、PID 参数等）
+   参数常量（# ═══════════ 常量 ═══════════ 区域）:
+     全局常量定义见下方常量区域（车速、距离、PID 参数等）
 
   UWB 坐标记录:
     origin                          — 起点坐标 (x, y)，在 main() 启动时通过 uwb_record() 记录
@@ -373,7 +371,7 @@ def _action_forward_20cm():
 # ═══════════════════════════════════════════════════════════════
 
 def _action_startup_forward():
-    """记录原点后前进 10cm，IMU 航向闭环保持（5° 偏差自动回正）。返回: True=正常完成, False=中断"""
+    """前进 10cm，IMU 航向闭环保持（5° 偏差自动回正）。返回: True=正常完成, False=中断"""
     dist_m = STARTUP_FORWARD_DIST_CM / 100.0
     print("  [STARTUP] 前进 {:.0f}cm 开始...".format(STARTUP_FORWARD_DIST_CM))
 
@@ -889,12 +887,10 @@ def _action_move_to_supplies():
             _read_imu_update_yaw()
             wz = _heading_correction(target_heading)
 
-            # ── 坐标系变换 + P 控制 ──
+            # ── 坐标系变换 + P 控制（前方=UWB -X，Y减小→向右） ──
             yaw_rad = math.radians(yaw)
-            rot_x = error_x * math.cos(yaw_rad) + error_y * math.sin(yaw_rad)
-            rot_y = -error_x * math.sin(yaw_rad) + error_y * math.cos(yaw_rad)
-            body_fwd = -rot_y
-            body_right = rot_x
+            body_fwd  = -math.cos(yaw_rad) * error_x - math.sin(yaw_rad) * error_y
+            body_right =  math.sin(yaw_rad) * error_x - math.cos(yaw_rad) * error_y
 
             vx_cmd = body_fwd * SUPPLIES_KP
             vy_cmd = body_right * SUPPLIES_KP
@@ -965,8 +961,7 @@ def _action_move_to_supplies():
             _read_imu_update_yaw()
             wz = _heading_correction(target_heading)
 
-            # ── 向 UWB -Y 方向平移（只改变 Y 坐标，yaw 锁） ──
-            # 世界 -Y 分解为车体: vx=cos(yaw), vy=-sin(yaw)
+            # ── 向 UWB 方向前进搜索（yaw 锁） ──
             yaw_rad = math.radians(yaw)
             vx_cmd = math.cos(yaw_rad) * SUPPLIES_FALLBACK_SPEED
             vy_cmd = -math.sin(yaw_rad) * SUPPLIES_FALLBACK_SPEED
@@ -999,14 +994,6 @@ def _action_uwb_translate():
         print("  [UWB] UWB not initialized")
         return False
     print("  [UWB] UWB ready, frame={}".format(uwb.get_frame_count()))
-
-    # ── UWB 坐标记录：supplies（占位，待填写触发条件） ──
-    # global supplies
-    # TODO: 在特定时间调用 uwb_record() 记录 supplies 坐标
-    # if <supplies_触发条件>:
-    #     uwb.uwb_record()
-    #     supplies = uwb.get_position()
-    #     print("  [UWB] Supplies recorded:", supplies)
 
     # ── 平移主循环 ──
     start_ms = time.ticks_ms()
@@ -1050,15 +1037,15 @@ def _action_uwb_translate():
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        # ── 计算横向速度：P 控制 X 误差 → vy ──
-        # X>0 → 锚点在右侧 → vy>0 向右平移
-        lat_speed = x_cm * UWB_LAT_P_GAIN
-        lat_speed = max(-UWB_LAT_SPEED, min(lat_speed, UWB_LAT_SPEED))
+        # ── 计算纵向速度：P 控制 X 误差 → vx ──
+        # X>0 → 锚点在前方 → vx>0 前进（前方=UWB -X，Y减小→向右）
+        fwd_speed = x_cm * UWB_LAT_P_GAIN
+        fwd_speed = max(-UWB_LAT_SPEED, min(fwd_speed, UWB_LAT_SPEED))
 
         # ── 航向纠偏 ──
         wz = _heading_correction(target_heading)
 
-        # ── 闭环驱动: vx=0（无前后）, vy=横向速度, wz=航向纠偏 ──
+        # ── 闭环驱动: vx=纵向速度, vy=0, wz=航向纠偏 ──
         try:
             rc = get_encoder_counts()
             if rc is None or len(rc) < 4:
@@ -1066,7 +1053,7 @@ def _action_uwb_translate():
                 continue
             rs = [rc[i] / ENC_SCALE[i] / UWB_CTRL_DT if ENC_SCALE[i] != 0 else 0
                   for i in range(4)]
-            omni_drive_closed_loop(0, lat_speed, wz, rs, UWB_CTRL_DT)
+            omni_drive_closed_loop(fwd_speed, 0, wz, rs, UWB_CTRL_DT)
         except Exception as e:
             print("  [UWB] Drive error:", e)
 

@@ -102,8 +102,8 @@ def calc_target_angle(from_x, from_y, to_x, to_y):
     """计算从 (from_x, from_y) 到 (to_x, to_y) 的目标角度（UWB 坐标系）"""
     dx = to_x - from_x
     dy = to_y - from_y
-    # atan2(-dx, dy)：与 uwb_following 一致
-    return math.atan2(-dx, dy) * 180.0 / math.pi
+    # atan2(dy, -dx)：前方=-X，Y减小→向右
+    return math.atan2(dy, -dx) * 180.0 / math.pi
 
 
 def calc_distance(from_x, from_y, to_x, to_y):
