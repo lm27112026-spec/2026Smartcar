@@ -4,7 +4,7 @@ main.py — 按键驱动控制
 【按键映射】
   C14 (KEY3) → action_c14(): 前进 20cm → UWB 平移（航向保持）
   C8  (KEY1) → action_c8():  通过蓝牙向从车发送消息
-  C9  (KEY2) → action_c9():  摄像头靠近（代码空置）
+  C9  (KEY2) → action_c9():  摄像头跟随靠近
 
 【函数功能】
 
@@ -17,9 +17,9 @@ main.py — 按键驱动控制
      _action_goto_supplies_startup() — UWB 导航到 supplies 固定坐标（航向锁）
      _action_search_supplies_area()  — 之字形搜索 100cm×100cm 物质区（航向锁）
     
-    === 首次检测到目标后进入循环（退出条件：搜索物质区未检测到）===
+    === 首次检测到目标后进入循环（退出条件：物质区搜索完成/中断）===
     while True:
-        ① see_and_push()                     — 靠近 → turn_right → wait_ok
+        ① see_and_push()                     — 摄像头跟随靠近 → turn_right → wait_ok
         ② _action_forward_until_yellow()      — 全速后退至黄线 → turn_left → wait_ok
         ③ _action_goto_supplies_startup()     — UWB 导航到 supplies 固定坐标
         ④ _action_search_supplies_area()      — 之字形搜索 100cm×100cm 物质区
@@ -28,8 +28,7 @@ main.py — 按键驱动控制
   按键动作:
     action_c14()                    — KEY3: 前进 20cm 后 UWB 平移
     action_c8()                     — KEY1: 向从车发送蓝牙指令
-    action_c9()                     — KEY2: 摄像头靠近动作（空置）
-    send_messages()                 — 蓝牙消息发送循环
+    action_c9()                     — KEY2: 摄像头跟随靠近
 
   底层辅助:
     check_sw2()                     — SW2 消抖检测
@@ -40,11 +39,13 @@ main.py — 按键驱动控制
     _abort_check()                  — SW2 + 超时退出检测
     _ensure_uwb()                   — 确保 UWB 已初始化，返回共享实例（懒加载）
     _reset_uwb_if_needed()          — UWB 超时时自动重置，下次调用重建
+    _ensure_cam()                   — 确保 CameraController 已初始化（懒加载）
     _action_startup_forward()       — 记录原点后前进 10cm（航向保持）
-    see_and_push()                  — 靠近目标 → 发数字 0 → 等待从车 ok
-    _action_forward_until_yellow()  — 收到 ok 后全速后退，黄线检测后停车
+    see_and_push()                  — 摄像头跟随靠近目标 → 发数字 0 → wait_ok
+    _action_forward_until_yellow()  — 全速后退 + 摄像头检测黄线，检测到后停车
     _action_goto_supplies_startup() — UWB 导航到 supplies 固定坐标（航向锁）
-    _action_return_to_origin()     — 循环结束后 UWB 导航回到原点
+    _action_return_to_origin()      — 循环结束后 UWB 导航回到原点
+    _action_search_supplies_area()  — 之字形搜索 100cm×100cm 物质区（航向锁 + 摄像头检测）
     _action_forward_20cm()          — C14 步骤 1: 前进 20cm
     _action_uwb_translate()         — C14 步骤 2: UWB 平移纠偏
 
@@ -55,7 +56,7 @@ main.py — 按键驱动控制
     origin                          — 起点坐标 (x, y)，在 main() 启动时通过 uwb_record() 记录
     supplies                        — 物资点固定坐标 (x, y)
 
-【依赖】motor.py, imu_motion.py, key.py, uwb_position.py, uart_master.py, utils.py
+【依赖】motor.py, imu_motion.py, key.py, uwb_position.py, uart_master.py, cam_control.py
 【PIT 分配】PIT0=系统, PIT1=编码器(motor), PIT2=看门狗(key), PIT3=IMU
 """
 
@@ -68,6 +69,7 @@ from imu_motion import (update_angle, imu_get_safe, yaw,
                         reset_ang_vel_pid)
 from key import capture, key_triggered, pet_watchdog
 from uwb_position import UWBPosition
+from cam_control import CameraController
 
 # ═══════════════════════════════════════════════════════════════
 #  常量
@@ -132,6 +134,7 @@ SW2_DEBOUNCE_MS  = 50
 origin   = None    # 起点坐标 (x, y)，在特定时间通过 uwb_record() 记录
 supplies = (50.0, 210.0)    # 物资点固定坐标 (x, y)
 _uwb_shared = None  # 共享 UWBPosition 实例，通过 _ensure_uwb() 懒加载
+_cam_shared = None  # 共享 CameraController 实例，通过 _ensure_cam() 懒加载
 
 # ═══════════════════════════════════════════════════════════════
 #  硬件初始化
@@ -279,6 +282,19 @@ def _reset_uwb_if_needed():
         print("  [UWB] 超时，重置连接...")
         _uwb_shared.stop()
         _uwb_shared = None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  摄像头共享实例管理
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_cam():
+    """确保 CameraController 已初始化，返回共享实例（懒加载）"""
+    global _cam_shared
+    if _cam_shared is None:
+        _cam_shared = CameraController(uart_id=7)
+        print("[CAM] CameraController 就绪")
+    return _cam_shared
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -445,84 +461,125 @@ def _action_startup_forward():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  启动步骤: 靠近目标 → 蓝牙信号通知从车
+#  启动步骤: 摄像头跟随靠近 → 蓝牙信号通知从车
 # ═══════════════════════════════════════════════════════════════
 
 def see_and_push():
     """
-    摄像头检测到目标后：靠近目标 → 到达指定距离 → turn_right 发数字 0 → 等待从车 ok。
-    
+    摄像头跟随目标 → 到达指定距离 → turn_right 发数字 0 → 等待从车 ok。
+
     流程:
-      1. 【占位】向目标靠近（运动控制代码待填写）
-      2. 【占位】摄像头识别到与目标距离到达某值后
+      1. 初始化 CameraController + 锁定航向
+      2. 跟随循环：cam.step() → 闭环驱动 → 到达判定
       3. 调用 bt.turn_right() 向从车发送数字 0
       4. 阻塞等待从车回复 "ok"
-      5. 返回 True
-    
+
     返回: True=完整流程完成, False=超时/中断
     """
+    APPROACH_TIMEOUT_S = 15.0   # 靠近超时 (s)
+    APPROACH_CTRL_DT   = 0.02   # 控制周期 (s)
+
     print("\n  [APPROACH] === 靠近目标 & 蓝牙信号 ===")
+
+    # ── 初始化摄像头控制器 ──
+    cam = _ensure_cam()
+    cam.reset()
 
     # ── 锁定航向（靠近过程保持方向） ──
     target_heading = _lock_yaw()
     print("  [APPROACH] 航向锁定: {:.1f}°".format(target_heading))
 
     start_ms = time.ticks_ms()
+    last_print_ms = start_ms
     loop_cnt = 0
 
-    # ═══════════════════════════════════════════════════════════
-    #  阶段 1: 向目标靠近
-    #  【待实现】填入实际靠近控制逻辑，例如：
-    #   - from cam_follow import compute_control, reset_control
-    #   - reset_control()
-    #   - while True:
-    #   -     if _abort_check(): return False
-    #   -     elapsed = time.ticks_diff(...) / 1000
-    #   -     if elapsed > STARTUP_APPROACH_TIMEOUT: ...
-    #   -     cam_data = cam.receive()
-    #   -     if cam_data is None: continue
-    #   -     vx, vy, wz = compute_control(cam_data, target_heading)
-    #   -     omni_drive_closed_loop(vx, vy, wz, rs, FWD_CTRL_DT)
-    #   -     # 当距离满足条件时 break 进入阶段 2
-    #   -     if cam_data['distance_cm'] < TARGET_DIST_CM:
-    #   -         break
-    # ═══════════════════════════════════════════════════════════
-    print("  [APPROACH] 【占位】靠近目标运动代码待实现")
+    led.value(1)
 
-    # 占位：直接进入阶段 2（无实际靠近动作）
-    # 后续将上方占位中的循环结果走到此处
-
-    # ── 停轮 ──
-    stop_all()
-    print("  [APPROACH] 到达目标位置")
-
-    # ═══════════════════════════════════════════════════════════
-    #  阶段 2: 检查距离条件 → 调用 turn_right 发送数字 0
-    #  【待实现】替换下方条件为实际摄像头距离判断，例如：
-    #   - if cam_data is not None and cam_data['distance_cm'] < TARGET_DIST_CM:
-    # ═══════════════════════════════════════════════════════════
-    if True:  # ← 替换为实际距离判定条件（空置时始终执行以便调试）
-        print("  [APPROACH] 距离条件满足，调用 turn_right 发送数字 0...")
-
-        try:
-            bt.turn_right()
-            print("  [APPROACH] 数字 0 已发送，等待从车 ok...")
-
-            # 阶段 3: 等待从车回复 "ok"
-            ok_received = bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS)
-            if ok_received:
-                print("  [APPROACH] 从车已确认 (ok)，流程完成")
-                return True
-            else:
-                print("  [APPROACH] 等待从车 ok 超时 ({:.0f}s)".format(
-                    WAIT_OK_TIMEOUT_MS / 1000))
-                return False
-        except Exception as e:
-            print("  [APPROACH] 蓝牙通信失败:", e)
+    while True:
+        # ── 超时 / 退出 ──
+        if _abort_check():
+            led.value(0)
             return False
-    else:
-        # 距离条件不满足，由阶段 1 循环继续靠近
-        print("  [APPROACH] 距离条件暂不满足，继续靠近（需循环逻辑）")
+
+        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+        if elapsed > APPROACH_TIMEOUT_S:
+            print("  [APPROACH] 靠近超时 ({:.1f}s)".format(elapsed))
+            led.value(0)
+            return False
+
+        # ── 一帧跟随计算 ──
+        ctrl = cam.step()
+
+        # 状态切换消息
+        if ctrl['state_msg']:
+            print("\n" + ctrl['state_msg'])
+
+        # ── 驱动 ──
+        if ctrl['vx'] is not None and ctrl['vy'] is not None:
+            wz = _heading_correction(target_heading)
+            try:
+                rc = get_encoder_counts()
+                if rc is not None and len(rc) >= 4:
+                    rs = [rc[i] / ENC_SCALE[i] / APPROACH_CTRL_DT if ENC_SCALE[i] != 0 else 0
+                          for i in range(4)]
+                    omni_drive_closed_loop(ctrl['vx'], ctrl['vy'], wz, rs, APPROACH_CTRL_DT)
+            except Exception as e:
+                print("  [APPROACH] 驱动错误:", e)
+        else:
+            # 无有效控制 → 仅维持航向
+            wz = _heading_correction(target_heading)
+            if abs(wz) > 0.001:
+                try:
+                    rc = get_encoder_counts()
+                    if rc is not None and len(rc) >= 4:
+                        rs = [rc[i] / ENC_SCALE[i] / APPROACH_CTRL_DT if ENC_SCALE[i] != 0 else 0
+                              for i in range(4)]
+                        omni_drive_closed_loop(0, 0, wz, rs, APPROACH_CTRL_DT)
+                except Exception:
+                    pass
+            else:
+                stop_all()
+
+        # ── 进度打印 ──
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_print_ms) >= 500:
+            last_print_ms = now
+            tgt_str = "T" if ctrl['has_target'] else "-"
+            print("  [APPROACH] {} X:{:+5.1f}cm D:{:5.1f}cm vx:{:.2f} vy:{:.2f}".format(
+                tgt_str, ctrl['x_cm'], ctrl['dist_cm'],
+                ctrl['vx'] if ctrl['vx'] else 0.0,
+                ctrl['vy'] if ctrl['vy'] else 0.0))
+
+        loop_cnt += 1
+        if loop_cnt % 50 == 0:
+            gc.collect()
+
+        # ── 到达判定 → 退出跟随循环 ──
+        if ctrl['arrived']:
+            stop_all()
+            print("  [APPROACH] 已到达目标距离！arrived=True")
+            break
+
+        time.sleep_ms(int(APPROACH_CTRL_DT * 1000))
+
+    # ── 跟随循环结束 → 发送蓝牙信号 ──
+    led.value(0)
+    print("  [APPROACH] 到达目标位置，调用 turn_right 发送数字 0...")
+
+    try:
+        bt.turn_right()
+        print("  [APPROACH] 数字 0 已发送，等待从车 ok...")
+
+        ok_received = bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS)
+        if ok_received:
+            print("  [APPROACH] 从车已确认 (ok)，流程完成")
+            return True
+        else:
+            print("  [APPROACH] 等待从车 ok 超时 ({:.0f}s)".format(
+                WAIT_OK_TIMEOUT_MS / 1000))
+            return False
+    except Exception as e:
+        print("  [APPROACH] 蓝牙通信失败:", e)
         return False
 
 
@@ -532,10 +589,10 @@ def see_and_push():
 
 def _action_forward_until_yellow():
     """
-    收到从车 ok 后全速后退，直至摄像头识别到黄线后停车。
-    
-    航向闭环保持，摄像头黄线识别逻辑待实现（当前占位）。
-    
+    全速后退，同时摄像头检测黄线，检测到后停车。
+
+    航向闭环保持，退出条件：检测到黄线 / 超时 / SW2 中断。
+
     返回: True=检测到黄线已停车, False=超时/中断
     """
     print("\n  [YELLOW] === 全速后退，等待黄线 ===")
@@ -569,15 +626,10 @@ def _action_forward_until_yellow():
             time.sleep_ms(5)
             continue
 
-        # ═══════════════════════════════════════════════════════
-        #  【待实现】摄像头黄线识别
-        #  替换下方条件为实际的黄线检测逻辑，例如：
-        #   - from cam_data import CamDataReceiver
-        #   - cam = CamDataReceiver()
-        #   - cam_data = cam.receive()
-        #   - if cam_data is not None and cam_data.get('yellow_line', False):
-        # ═══════════════════════════════════════════════════════
-        if False:  # ← 替换为实际黄线检测条件
+        # ── 摄像头黄线检测 ──
+        cam = _ensure_cam()
+        ctrl = cam.step()
+        if ctrl['line_flag']:
             print("  [YELLOW] 检测到黄线，停车！")
             led.value(0)
             return True
@@ -613,12 +665,12 @@ def _action_forward_until_yellow():
 
 def _action_goto_supplies_startup():
     """
-    启动流程中：UWB XY 控制导航到 supplies 固定坐标 (-50, 210)。
-    
+    启动流程中：UWB XY 控制导航到 supplies 固定坐标。
+
     IMU 航向在全程保持不变（锁定初始 yaw）。
     到达 supplies（死区内连续 N 帧）后返回 True。
     无 Phase 2 搜索，无摄像头检测。
-    
+
     返回: True=已到达 supplies, False=超时/中断
     """
 
@@ -922,11 +974,10 @@ def _action_search_supplies_area():
                     wheel_dists.append(total_pulses[i] / abs(ENC_SCALE[i]))
             avg_dist = sum(wheel_dists) / len(wheel_dists) if wheel_dists else 0.0
 
-            # ═══════════════════════════════════════════════════
-            #  【待实现】摄像头物品检测
-            #  替换下方条件为实际摄像头识别逻辑
-            # ═══════════════════════════════════════════════════
-            if False:  # ← 替换为实际摄像头检测条件
+            # ── 摄像头物品检测 ──
+            cam = _ensure_cam()
+            ctrl = cam.step()
+            if ctrl['has_target']:
                 stop_all()
                 print("  [SEARCH] 摄像头识别到物品！")
                 led.value(0)
@@ -999,7 +1050,9 @@ def _action_search_supplies_area():
             avg_dist = sum(wheel_dists) / len(wheel_dists) if wheel_dists else 0.0
 
             # ── 摄像头检测 ──
-            if False:  # ← 替换为实际摄像头检测条件
+            cam = _ensure_cam()
+            ctrl = cam.step()
+            if ctrl['has_target']:
                 stop_all()
                 print("  [SEARCH] 步进中识别到物品！")
                 led.value(0)
@@ -1187,124 +1240,86 @@ def action_c8():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  C9: 摄像头靠近（代码空置）
+#  C9: 摄像头跟随靠近
 # ═══════════════════════════════════════════════════════════════
 
 def action_c9():
-    """C9 (KEY2): 摄像头靠近 — 代码空置，待实现"""
+    """C9 (KEY2): 摄像头跟随靠近目标"""
     print("\n" + "=" * 50)
-    print("[C9] 摄像头靠近 — 待实现")
+    print("[C9] 摄像头跟随靠近")
     print("=" * 50)
 
-    # TODO: 摄像头靠近逻辑待补充
-    # 预留接口:
-    #   from cam_data import CamDataReceiver, x_to_cm, y_to_distance
-    #   from cam_follow import compute_control, reset_control
-    #   ...
+    C9_TIMEOUT_S = 10.0
+    C9_CTRL_DT   = 0.02
 
-    print("[C9] 当前为空操作")
+    pause_encoder_ticker()
+    _encoder_reset()
+
+    cam = _ensure_cam()
+    cam.reset()
+
+    target_heading = _lock_yaw()
+    print("  [C9] 航向锁定: {:.1f}°".format(target_heading))
+
+    start_ms = time.ticks_ms()
+    loop_cnt = 0
+
+    led.value(1)
+
+    try:
+        while True:
+            if _abort_check():
+                print("  [C9] SW2 中断")
+                break
+
+            elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+            if elapsed > C9_TIMEOUT_S:
+                print("  [C9] 超时 ({:.1f}s)".format(elapsed))
+                break
+
+            ctrl = cam.step()
+
+            if ctrl['arrived']:
+                stop_all()
+                print("  [C9] 已到达目标！")
+                break
+
+            if ctrl['vx'] is not None and ctrl['vy'] is not None:
+                wz = _heading_correction(target_heading)
+                try:
+                    rc = get_encoder_counts()
+                    if rc is not None and len(rc) >= 4:
+                        rs = [rc[i] / ENC_SCALE[i] / C9_CTRL_DT if ENC_SCALE[i] != 0 else 0
+                              for i in range(4)]
+                        omni_drive_closed_loop(ctrl['vx'], ctrl['vy'], wz, rs, C9_CTRL_DT)
+                except Exception as e:
+                    print("  [C9] 驱动错误:", e)
+            else:
+                wz = _heading_correction(target_heading)
+                if abs(wz) > 0.001:
+                    try:
+                        rc = get_encoder_counts()
+                        if rc is not None and len(rc) >= 4:
+                            rs = [rc[i] / ENC_SCALE[i] / C9_CTRL_DT if ENC_SCALE[i] != 0 else 0
+                                  for i in range(4)]
+                            omni_drive_closed_loop(0, 0, wz, rs, C9_CTRL_DT)
+                    except Exception:
+                        pass
+                else:
+                    stop_all()
+
+            loop_cnt += 1
+            if loop_cnt % 50 == 0:
+                gc.collect()
+
+            time.sleep_ms(int(C9_CTRL_DT * 1000))
+
+    finally:
+        stop_all()
+        resume_encoder_ticker()
+        led.value(0)
+
     print("=" * 50 + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════
-#  send_messages — 条件触发蓝牙从车通信
-# ═══════════════════════════════════════════════════════════════
-
-# 发送间隔控制（避免消息风暴）
-_SEND_INTERVAL_MS = 200       # 最小发送间隔 (ms)
-_send_last_ms = 0
-
-# 发送开关（可由其他模块/动作置位）
-_send_enabled = True
-
-
-def send_messages():
-    """
-    条件判断是否向从车发送蓝牙消息。
-    主循环每迭代调用一次，内部通过 if 条件决定是否实际发送。
-
-    【待实现】根据实际需求填写触发条件，可选方案：
-      1. 距离触发:  UWB 距离 < 阈值 → 通知从车
-      2. 状态触发:  C14 动作完成标志位 → 发送完成通知
-      3. 周期性:    每 N 秒发送一次心跳/状态
-      4. 组合条件:  多个条件 AND/OR 组合
-
-    【待实现】根据协议填写具体消息内容，MasterBT 可用接口：
-      bt.send_sync_move(vx, vy, wz)       — 同步运动指令（火抛）
-      bt.send_pos_adjust(vx, vy, wz)      — 位置调整（等待 ACK）
-      bt.send_pos_adjust_async(vx, vy, wz) — 位置调整（不等待 ACK）
-      bt.send_emergency_stop()            — 紧急停止
-      bt.send_imu_data(r, p, y, wx, wy, wz) — IMU 姿态遥测 (JSON)
-    """
-    global _send_last_ms
-
-    # 发送开关关闭则直接返回
-    if not _send_enabled:
-        return
-
-    # 发送间隔限制（防消息风暴）
-    now = time.ticks_ms()
-    if time.ticks_diff(now, _send_last_ms) < _SEND_INTERVAL_MS:
-        return
-
-    # ═══════════════════════════════════════════════════════════
-    #  【待填写】触发条件判断
-    #  根据实际需求取消注释并修改以下条件之一：
-    # ═══════════════════════════════════════════════════════════
-
-    should_send = False  # 默认不发送，替换为实际条件
-
-    # --- 示例 1: 距离阈值触发（需在 C14/UWB 上下文中使用） ---
-    # if uwb is not None:
-    #     dist_cm, _ = uwb.get_distance_angle()
-    #     if dist_cm < 50.0:  # 距离 < 50cm 时发送
-    #         should_send = True
-
-    # --- 示例 2: 状态标志触发（由 C14 动作完成后置位） ---
-    # global _c14_done_flag
-    # if _c14_done_flag:
-    #     should_send = True
-    #     _c14_done_flag = False  # 单次触发后清零
-
-    # --- 示例 3: 周期性发送（每 1 秒一次） ---
-    # if loop_cnt % 100 == 0:  # 100 × 10ms = 1s
-    #     should_send = True
-
-    # --- 示例 4: 自定义条件 ---
-    # if <你的条件>:
-    #     should_send = True
-
-    # ═══════════════════════════════════════════════════════════
-    #  满足条件 → 发送消息
-    # ═══════════════════════════════════════════════════════════
-
-    if should_send:
-        try:
-            # 【待填写】选择并取消注释以下消息类型之一：
-
-            # --- 同步运动指令 ---
-            # bt.send_sync_move(vx=0.0, vy=0.0, wz=0.0)
-
-            # --- 位置调整指令（等待从机 ACK） ---
-            # bt.send_pos_adjust(vx=0.0, vy=0.0, wz=0.0)
-
-            # --- 位置调整指令（不等待 ACK） ---
-            # bt.send_pos_adjust_async(vx=0.0, vy=0.0, wz=0.0)
-
-            # --- 紧急停止 ---
-            # bt.send_emergency_stop()
-
-            # --- IMU 遥测数据（需先读取 IMU 获取 roll/pitch/yaw/wx/wy/wz） ---
-            # bt.send_imu_data(roll=0.0, pitch=0.0, yaw=0.0,
-            #                  wx=0.0, wy=0.0, wz=0.0)
-
-            # --- 自定义消息（直接操作 bt._uart.write） ---
-            # bt._uart.write(b"YOUR_CUSTOM_CMD\r\n")
-
-            _send_last_ms = now
-
-        except Exception as e:
-            print("[SEND] 发送失败:", e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1319,106 +1334,106 @@ def main():
     print("=" * 50)
     print("  C14 (KEY3): 前进 20cm → UWB 平移")
     print("  C8  (KEY1): 蓝牙发送从车消息")
-    print("  C9  (KEY2): 摄像头靠近 (空置)")
+    print("  C9  (KEY2): 摄像头跟随靠近")
     print("  SW2 (D9)  : 强制退出")
     print("=" * 50)
     print("")
     loop_cnt = 0
 
-    # ── UWB 初始化 & 记录起点坐标（小车运动前） ──
-    global origin
-    uwb = _ensure_uwb()
-    if uwb is not None and uwb.get_frame_count() > 0:
-        uwb.uwb_record()
-        origin = uwb.get_position()
-        print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
-            origin[0], origin[1]))
-    else:
-        print("  [ORIGIN] UWB 未就绪，使用默认坐标")
-        origin = (120, 320)
+    # # ── UWB 初始化 & 记录起点坐标（小车运动前） ──
+    # global origin
+    # uwb = _ensure_uwb()
+    # if uwb is not None and uwb.get_frame_count() > 0:
+    #     uwb.uwb_record()
+    #     origin = uwb.get_position()
+    #     print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
+    #         origin[0], origin[1]))
+    # else:
+    #     print("  [ORIGIN] UWB 未就绪，使用默认坐标")
+    #     origin = (120, 320)
 
-    # ── 记录原点后，前进 10cm（航向保持，5° 偏差自动回正） ──
-    pause_encoder_ticker()
-    _encoder_reset()
-    if _action_startup_forward():
-        # ── 段间停顿 + 编码器复位 ──
-        stop_all()
-        time.sleep_ms(300)
-        _encoder_reset()
+    # # ── 记录原点后，前进 10cm（航向保持，5° 偏差自动回正） ──
+    # pause_encoder_ticker()
+    # _encoder_reset()
+    # if _action_startup_forward():
+    #     # ── 段间停顿 + 编码器复位 ──
+    #     stop_all()
+    #     time.sleep_ms(300)
+    #     _encoder_reset()
 
-        # ── 导航到 supplies 固定坐标（航向锁，全程 IMU 不变） ──
-        if _action_goto_supplies_startup():
-            # ── 段间停顿 ──
-            stop_all()
-            time.sleep_ms(300)
-            _encoder_reset()
+    #     # ── 导航到 supplies 固定坐标（航向锁，全程 IMU 不变） ──
+    #     if _action_goto_supplies_startup():
+    #         # ── 段间停顿 ──
+    #         stop_all()
+    #         time.sleep_ms(300)
+    #         _encoder_reset()
 
-            # ── 到达 supplies 后之字形搜索 100cm×100cm 物质区 ──
-            result = _action_search_supplies_area()
-            if result:
-                print("  [STARTUP] 摄像头检测到目标，平移完毕")
+    #         # ── 到达 supplies 后之字形搜索 100cm×100cm 物质区 ──
+    #         result = _action_search_supplies_area()
+    #         if result:
+    #             print("  [STARTUP] 检测到目标，进入循环")
 
-                # ═══════════════════════════════════════════════════════
-                #  循环：靠近 → 后退 → 导航 → 搜索 → 再循环
-                #  退出条件：物质区搜索完成或中断
-                # ═══════════════════════════════════════════════════════
-                cycle = 0
-                while True:
-                    cycle += 1
-                    print("\n  [CYCLE] === 第 {} 轮 ===".format(cycle))
+    #             # ═══════════════════════════════════════════════════════
+    #             #  循环：靠近 → 后退 → 导航 → 搜索 → 再循环
+    #             #  退出条件：物质区搜索完成或中断
+    #             # ═══════════════════════════════════════════════════════
+    #             cycle = 0
+    #             while True:
+    #                 cycle += 1
+    #                 print("\n  [CYCLE] === 第 {} 轮 ===".format(cycle))
 
-                    # ① 靠近目标 → 蓝牙信号通知从车
-                    if not see_and_push():
-                        print("  [CYCLE] 靠近/信号中断，退出循环")
-                        break
+    #                 # ① 靠近目标 → 蓝牙信号通知从车
+    #                 if not see_and_push():
+    #                     print("  [CYCLE] 靠近/信号中断，退出循环")
+    #                     break
 
-                    # ② 全速后退至黄线
-                    if not _action_forward_until_yellow():
-                        print("  [CYCLE] 黄线检测中断/超时，退出循环")
-                        break
+    #                 # ② 全速后退至黄线
+    #                 if not _action_forward_until_yellow():
+    #                     print("  [CYCLE] 黄线检测中断/超时，退出循环")
+    #                     break
 
-                    # ── 后退完成后通知从车左转 ──
-                    try:
-                        bt.turn_left()
-                        print("  [CYCLE] turn_left 已发送，等待从车 ok...")
-                        if not bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS):
-                            print("  [CYCLE] 等待从车 ok 超时 ({:.0f}s)，退出循环".format(
-                                WAIT_OK_TIMEOUT_MS / 1000))
-                            break
-                        print("  [CYCLE] 从车已确认 (ok)")
-                    except Exception as e:
-                        print("  [CYCLE] turn_left 通信失败:", e)
-                        break
+    #                 # ── 后退完成后通知从车左转 ──
+    #                 try:
+    #                     bt.turn_left()
+    #                     print("  [CYCLE] turn_left 已发送，等待从车 ok...")
+    #                     if not bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS):
+    #                         print("  [CYCLE] 等待从车 ok 超时 ({:.0f}s)，退出循环".format(
+    #                             WAIT_OK_TIMEOUT_MS / 1000))
+    #                         break
+    #                     print("  [CYCLE] 从车已确认 (ok)")
+    #                 except Exception as e:
+    #                     print("  [CYCLE] turn_left 通信失败:", e)
+    #                     break
 
-                    # ③ 导航到 supplies 固定坐标
-                    if not _action_goto_supplies_startup():
-                        print("  [CYCLE] 导航到 supplies 失败，退出循环")
-                        break
+    #                 # ③ 导航到 supplies 固定坐标
+    #                 if not _action_goto_supplies_startup():
+    #                     print("  [CYCLE] 导航到 supplies 失败，退出循环")
+    #                     break
 
-                    # ④ 之字形搜索物质区 → 摄像头再检测
-                    if not _action_search_supplies_area():
-                        print("  [CYCLE] 物质区搜索完成/中断，退出循环")
-                        break
+    #                 # ④ 之字形搜索物质区 → 摄像头再检测
+    #                 if not _action_search_supplies_area():
+    #                     print("  [CYCLE] 物质区搜索完成/中断，退出循环")
+    #                     break
 
-                    # ⑤ 摄像头检测到物品 → 回到 ① 继续下一轮
-                    print("  [CYCLE] 检测到物品，继续下一轮...")
-            else:
-                print("  [STARTUP] 物质区搜索完成/中断，进入主循环")
-        else:
-            print("  [STARTUP] 导航到 supplies 失败，进入主循环")
-    else:
-        print("  [STARTUP] 前进中断，进入主循环")
+    #                 # ⑤ 摄像头检测到物品 → 回到 ① 继续下一轮
+    #                 print("  [CYCLE] 检测到物品，继续下一轮...")
+    #         else:
+    #             print("  [STARTUP] 物质区搜索完成/中断，进入主循环")
+    #     else:
+    #         print("  [STARTUP] 导航到 supplies 失败，进入主循环")
+    # else:
+    #     print("  [STARTUP] 前进中断，进入主循环")
 
-    # ── 循环退出后，返回原点 ──
-    print("\n  [RTN] 循环结束，返回原点...")
-    stop_all()
-    time.sleep_ms(300)
-    _encoder_reset()
-    _action_return_to_origin()
+    # # ── 循环退出后，返回原点 ──
+    # print("\n  [RTN] 循环结束，返回原点...")
+    # stop_all()
+    # time.sleep_ms(300)
+    # _encoder_reset()
+    # _action_return_to_origin()
 
-    stop_all()
-    _encoder_reset()
-    resume_encoder_ticker()
+    # stop_all()
+    # _encoder_reset()
+    # resume_encoder_ticker()
     led.value(1)  # 就绪指示
     print("  等待按键...")
     print("")
@@ -1436,7 +1451,7 @@ def main():
 
             # ── 按键分发 ──
             if key_triggered(1):          # KEY1 (C8) → 蓝牙消息
-                action_c8()
+                see_and_push()
                 led.value(1)
                 continue
 
@@ -1449,9 +1464,6 @@ def main():
                 action_c14()
                 led.value(1)
                 continue
-
-            # ── 条件触发蓝牙从车通信 ──
-            send_messages()
 
             # ── SW2 强制退出 ──
             if check_sw2():

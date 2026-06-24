@@ -1,425 +1,249 @@
 """
-cam_follow.py — 摄像头目标跟随（级联 PID 控制）
-【架构】
-   外环: 位置 PID → 目标速度
-   中环: 速度限幅/斜坡 → 平滑速度指令
-   内环: motor.py 轮速 PI → PWM
-【流程】
-   1. FOLLOW：级联 PID 控制跟随
-   2. STOPPED：到达目标距离
-   3. LOST：目标丢失
-【复用】compute_control() 可直接被 main.py 调用
-【安全】SW2 随时终止
-【依赖】cam_data.py, motor.py, pid.py
+cam_follow.py — 视觉跟随级联控制器
+
+【架构】 外环位置PID → 死区+刹车带 → 动态速度预算 → 内环轮速PI
+【依赖】 pid.py, motor.py
+【API】
+    from cam_follow import compute_control, reset_control
+    ctrl = compute_control(x_cm, dist_cm, has_tgt, now_ms, dt)
+    ctrl['cmd_fwd']  # vx (m/s)
+    ctrl['cmd_lat']  # vy (m/s)
 """
 
-import gc, time, math
-from machine import Pin
-from cam_data import CamDataReceiver, x_to_cm, y_to_distance
-from motor import (stop_all, omni_drive_closed_loop,
-                   get_encoder_counts, reset_encoder_filter, reset_wheel_pi,
-                   enc_ticker, ENC_SCALE)
+import time
 from pid import PID
-
-# ═══════════════════════════════════════════════════════════════
-#  常量
-# ═══════════════════════════════════════════════════════════════
-
-STATE_FOLLOW  = 0
-STATE_STOPPED = 1
-STATE_LOST    = 2
-
-TARGET_DIST_CM  = 10.0   # 目标跟随距离 (cm)
-STOP_DIST_CM    = 5.0    # 到达判定容差 (cm)
-LOST_TIMEOUT_MS = 500    # 丢失超时 (ms)
-
-MAX_SPEED_FWD  = 0.50    # 最大前进速度 (m/s)
-MAX_SPEED_LAT  = 0.45    # 最大横向速度 (m/s)
-ACCEL_LIMIT    = 2.0     # 加速度限制 (m/s²)
-MIN_SPEED      = 0.05    # 最低速度，防电机死区 (m/s)
-DT             = 0.02    # 控制周期 (s)
-
-# ═══════════════════════════════════════════════════════════════
-#  CascadePID 类
-# ═══════════════════════════════════════════════════════════════
-
-class CascadePID:
-    """级联 PID: 位置环 → 速度限幅 → 输出（带软启动 + 软停止）"""
-
-    def __init__(self, kp, ki, kd, out_limit, accel_limit,
-                 soft_start_ms=300, soft_stop_ms=200):
-        self.pid = PID(kp=kp, ki=ki, kd=kd,
-                       integral_limit=50, output_limit=out_limit)
-        self.accel_limit = accel_limit
-        self.prev_output = 0.0
-        # ── 软启动 ──
-        self.soft_start_ms = soft_start_ms   # 爬升时间 (ms)
-        self.soft_start_t0 = 0               # 本次 reset 时间戳
-        self.soft_start_active = False       # 是否正在爬升
-        # ── 软停止 ──
-        self.soft_stop_ms = soft_stop_ms     # 减速时间 (ms)
-        self.soft_stop_t0 = 0                # 开始减速的时间戳
-        self.soft_stop_active = False        # 是否正在减速
-
-    def compute(self, error, dt):
-        """
-        计算输出，带软启动 + 软停止 + 加速度限幅
-        error: 位置误差 (cm)
-        返回: 速度指令 (m/s)
-        """
-        # 位置 PID → 目标速度
-        target_speed = self.pid.compute(error, 0, dt)
-
-        # ── 软启动：输出 = PID值 × ramp(0→1) ──
-        if self.soft_start_active:
-            elapsed = time.ticks_diff(time.ticks_ms(), self.soft_start_t0)
-            if elapsed >= self.soft_start_ms:
-                self.soft_start_active = False
-                ramp = 1.0
-            else:
-                ramp = elapsed / self.soft_start_ms
-            target_speed *= ramp
-
-        # ── 软停止：目标归零，由加速度限幅自然减速 ──
-        if self.soft_stop_active:
-            target_speed = 0.0
-
-        # 加速度限幅（在软启/停基础上做二次平滑）
-        delta = target_speed - self.prev_output
-        max_delta = self.accel_limit * dt
-        if abs(delta) > max_delta:
-            delta = max_delta if delta > 0 else -max_delta
-        output = self.prev_output + delta
-        self.prev_output = output
-
-        return output
-
-    # ── 软停止 API ──
-
-    def begin_soft_stop(self):
-        """触发软停止：输出从当前值由加速度限幅自然降到 0"""
-        self.soft_stop_active = True
-
-    @property
-    def stop_done(self):
-        """软停止是否完成（输出已接近 0）"""
-        return abs(self.prev_output) < 0.005
-
-    def reset(self):
-        self.pid.reset()
-        # 软停止进行中（电机还在转）→ 保留 prev_output 以保持平滑过渡
-        if not self.soft_stop_active:
-            self.prev_output = 0.0
-        # ── 触发软启动 ──
-        self.soft_start_t0 = time.ticks_ms()
-        self.soft_start_active = True
-        # ── 取消软停止 ──
-        self.soft_stop_active = False
+from motor import stop_all, reset_wheel_pi
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PID 实例（backup 已验证参数）
+#  跟踪参数
 # ═══════════════════════════════════════════════════════════════
 
-PID_FWD = CascadePID(
-    kp=0.02, ki=0.00, kd=0.0,
-    out_limit=MAX_SPEED_FWD,
-    accel_limit=ACCEL_LIMIT
-)
+DIST       = 4          # 期望距离 (cm)  纵向目标
+E_X        = 5           # 期望横向距离 (cm)  正=偏左目标
 
-PID_LAT = CascadePID(
-    kp=0.0, ki=0.00, kd=0.0,
-    out_limit=MAX_SPEED_LAT,
-    accel_limit=ACCEL_LIMIT
-)
+# ── 外环 PID 增益 ──
+PX  = 0.05                # 横向 P  (x_err → vy)
+IX  = 0.003                # 横向 I
+DX  = 0.01                # 横向 D
 
-# ═══════════════════════════════════════════════════════════════
-#  速度低通滤波
-# ═══════════════════════════════════════════════════════════════
+PY  = 0.05                 # 纵向 P  (y_err → vx)
+IY  = 0.003                # 纵向 I
+DY  = 0.01                # 纵向 D
 
-SPEED_FILTER_ALPHA = 0.8
-filt_fwd = 0.0
-filt_lat = 0.0
-filt_fwd_sign = 0
-filt_lat_sign = 0
+# ── 死区 + 刹车带 ──
+DX0 = 0.5                  # 横向死区 (cm)  |x|<DX0 → 冻结PID/输出0
+DY0 = 0.5                  # 纵向死区 (cm)  |y|<DY0 → 冻结PID/输出0
+BX  = 1.0                  # 横向刹车带宽 (cm)  区间 DX0~DX0+BX → smoothstep
+BY  = 1.0                  # 纵向刹车带宽 (cm)  区间 DY0~DY0+BY → smoothstep
 
+# ── 输出限幅 ──
+VX_MAX = 1.0              # 前后最大 (m/s)
+VY_MAX = 1.0              # 横向最大 (m/s)
 
-def speed_filter(fwd, lat):
-    """一阶低通滤波，方向变化时重置滤波器"""
-    global filt_fwd, filt_lat, filt_fwd_sign, filt_lat_sign
+# ── 动态速度预算 ──
+VBUD   = 0.80              # 总预算 (归一化) 预留0.25给WZ航向
+VY_LO  = 0.25              # 横向占比下限 (y_err大→vx优先时)
+VY_HI  = 0.70              # 横向占比上限 (x_err大→vy优先时)
+#   分配策略: 根据 x_err/(x_err+y_err) 在 [VY_LO, VY_HI] 间线性插值
 
-    new_sign = 1 if fwd > 0 else (-1 if fwd < 0 else 0)
-    if new_sign != 0 and new_sign != filt_fwd_sign:
-        filt_fwd = fwd
-        filt_fwd_sign = new_sign
-    else:
-        filt_fwd = SPEED_FILTER_ALPHA * fwd + (1 - SPEED_FILTER_ALPHA) * filt_fwd
+# ── 积分限幅 ──
+IX_OUT = 0.20                   # X通道积分输出上限 (m/s)
+IY_OUT = 0.20                   # Y通道积分输出上限 (m/s)
+I_BUF  = 50                     # PID内部积分缓冲
 
-    new_sign_lat = 1 if lat > 0 else (-1 if lat < 0 else 0)
-    if new_sign_lat != 0 and new_sign_lat != filt_lat_sign:
-        filt_lat = lat
-        filt_lat_sign = new_sign_lat
-    else:
-        filt_lat = SPEED_FILTER_ALPHA * lat + (1 - SPEED_FILTER_ALPHA) * filt_lat
+# ── 对齐 & 到达 ──
+ALGN_X = 1.0               # 横向对齐阈值 (cm)
+ALGN_Y = 1.0               # 纵向对齐阈值 (cm)
+ARRIV  = 2.0               # 到达判定 (cm) — 宽松于ALGN_Y，防主状态机前抢停
 
-    return filt_fwd, filt_lat
-
-
-def _reset_filter():
-    """重置滤波全局状态（内部使用）"""
-    global filt_fwd, filt_lat, filt_fwd_sign, filt_lat_sign
-    filt_fwd = 0.0
-    filt_lat = 0.0
-    filt_fwd_sign = 0
-    filt_lat_sign = 0
-
+# ── 丢失 & 周期 ──
+LOST_T = 500               # 丢失超时 (ms)
+DT     = 0.01              # 默认控制周期 (s)
 
 # ═══════════════════════════════════════════════════════════════
-#  状态机变量（模块级，与 backup 完全一致）
+#  状态枚举
 # ═══════════════════════════════════════════════════════════════
 
-_state = STATE_LOST
-last_target_ms = time.ticks_ms()
+S_FOLLOW = 0
+S_STOP   = 1
+S_LOST   = 2
+
+
+_pid_x = PID(PX, IX, DX, IX_OUT / IX, VY_MAX)
+_pid_y = PID(PY, IY, DY, IY_OUT / IY, VX_MAX)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  API — 供 main.py 调用
+#  模块状态
 # ═══════════════════════════════════════════════════════════════
+
+_st  = S_LOST
+_tms = 0
+_hot = True                 # 热启动: 首帧消D脉冲
+
+
+# ═══════════════════════════════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════════════════════════════
+
+def _brake(val, err, dead, width):
+    """smoothstep 刹车: [dead, dead+width] 内三次平滑衰减"""
+    if err <= dead:
+        return 0.0
+    end = dead + width
+    if err >= end:
+        return val
+    t = (err - dead) / width
+    return val * t * t * (3.0 - 2.0 * t)   # smoothstep: 0→1 首尾导数=0
+
+
+def _budget(vx, vy, x_err, y_err):
+    """动态速度预算: 误差比决定 vy/vx 分配优先级"""
+    total = abs(vx) + abs(vy)
+    if total <= VBUD:
+        return vx, vy
+
+    # x_err权重↑ → vy多分; y_err权重↑ → vx多分
+    w = abs(x_err) / (abs(x_err) + abs(y_err) + 1e-6)
+    vy_frac = VY_LO + (VY_HI - VY_LO) * w
+
+    vy_b = min(vy_frac * VBUD, abs(vy))
+    vy_c = vy_b if vy >= 0 else -vy_b
+
+    rem  = VBUD - vy_b
+    vx_c = (1 if vx >= 0 else -1) * min(abs(vx), rem)
+    return vx_c, vy_c
+
+
 
 def reset_control(reset_state=False):
-    """重置控制状态。
-    reset_state=True: 同时复位状态机到 LOST（模式切换时使用）
-    """
-    global _state, last_target_ms
+    """重置控制状态 (状态切换时调用)"""
+    global _st, _tms, _hot
     if reset_state:
-        _state = STATE_LOST
-        last_target_ms = time.ticks_ms()
-    PID_FWD.reset()
-    PID_LAT.reset()
-    _reset_filter()
+        _st  = S_LOST
+        _tms = time.ticks_ms()
+    _pid_x.reset()
+    _pid_y.reset()
+    _hot = True
 
 
-def compute_control(x_cm, actual_dist, is_target, now_ms=None):
+def compute_control(x_cm, dist_cm, has_tgt, now_ms=None, dt=None):
+    """单帧跟随控制 — 由主循环每 10ms 调用
+
+    X/Y 期望由模块常量 E_X / DIST 定义, 默认 E_X=0 (居中跟踪)
+
+    参数:
+        x_cm:    横向偏移 (cm) 正=右, 相对于摄像头中心
+        dist_cm: 纵向距离 (cm)
+        has_tgt: 是否有目标
+        now_ms:  时间戳 (默认自动取)
+        dt:      实际控制周期 (s) 默认 DT
+
+    返回 dict:
+        cmd_fwd:  前后速度 vx (m/s)  None=未输出
+        cmd_lat:  横向速度 vy (m/s)
+        state:    当前子状态 S_*
+        arrived:  是否已到达
+        state_msg:状态切换日志  None=无变化
     """
-    一帧视觉追踪控制（与 backup 主循环逻辑完全一致）。
-    
-    返回: dict {
-        'cmd_fwd':    float|None,   # 前进速度指令 (m/s)
-        'cmd_lat':    float|None,   # 横向速度指令 (m/s)
-        'cmd_fwd_raw': float,        # PID 原始输出（滤波前）
-        'cmd_lat_raw': float,
-        'state':      int,           # 当前状态
-        'arrived':    bool,          # 是否到达目标
-        'state_msg':  str|None,      # 状态变化消息
-    }
-    """
-    global _state, last_target_ms, filt_fwd, filt_lat, filt_fwd_sign, filt_lat_sign
+    global _st, _tms, _hot
 
     if now_ms is None:
         now_ms = time.ticks_ms()
+    if dt is None:
+        dt = DT
 
-    result = {
-        'cmd_fwd':        None,
-        'cmd_lat':        None,
-        'cmd_fwd_raw':    0.0,
-        'cmd_lat_raw':    0.0,
-        'state':          _state,
-        'arrived':        False,
-        'state_msg':      None,
-        'just_switched':  False,
+    out = {
+        'cmd_fwd': None, 'cmd_lat': None,
+        'cmd_fwd_raw': 0.0, 'cmd_lat_raw': 0.0,
+        'state': _st, 'arrived': False,
+        'state_msg': None, 'just_switched': False,
     }
 
-    # ── 状态判断 ──
-    if is_target:
-        last_target_ms = now_ms
-        if _state == STATE_LOST:
-            _state = STATE_FOLLOW
+    # ── 状态判定 ──
+    if has_tgt:
+        _tms = now_ms
+        if _st == S_LOST:
+            _st = S_FOLLOW
             reset_wheel_pi()
-            PID_FWD.reset()   # 取消软停止 + 触发软启动
-            PID_LAT.reset()
-            filt_fwd = 0.0
-            filt_lat = 0.0
-            filt_fwd_sign = 0
-            filt_lat_sign = 0
-            result['state_msg'] = "[LOST -> FOLLOW] Captured!"
-            result['just_switched'] = True
-    else:
-        if _state == STATE_FOLLOW:
-            if time.ticks_diff(now_ms, last_target_ms) > LOST_TIMEOUT_MS:
-                _state = STATE_LOST
-                # ── 软停止：不急停，让加速度限幅自然减速 ──
-                PID_FWD.begin_soft_stop()
-                PID_LAT.begin_soft_stop()
-                result['state_msg'] = "[FOLLOW -> LOST] Lost!"
-                result['state'] = _state
-                # 计算软停止第一帧输出，避免断帧
-                cmd_fwd = PID_FWD.compute(0, DT)
-                cmd_lat = PID_LAT.compute(0, DT)
-                result['cmd_fwd'] = cmd_fwd
-                result['cmd_lat'] = cmd_lat
-                return result
+            _pid_x.reset()
+            _pid_y.reset()
+            _hot = True
+            out['state_msg']     = "[LOST → FOLLOW]"
+            out['just_switched'] = True
+    elif _st == S_FOLLOW:
+        if time.ticks_diff(now_ms, _tms) > LOST_T:
+            _st = S_LOST
+            stop_all()
+            _pid_x.reset()
+            _pid_y.reset()
+            out['state_msg'] = "[FOLLOW → LOST]"
+            out['state']     = _st
+            return out
 
-    result['state'] = _state
+    out['state'] = _st
 
-    # ── FOLLOW 状态：级联 PID 控制 ──
-    if _state == STATE_FOLLOW:
-        x_error = x_cm
-        y_error = actual_dist - TARGET_DIST_CM
+    # ── FOLLOW: 级联控制 ──
+    if _st == S_FOLLOW:
+        x_err = x_cm - E_X       # 补充横向误差定义
+        y_err = dist_cm - DIST   # 补充纵向误差定义
+ 
+        # ── 横向控制: x_err → vy ──
+        if abs(x_err) < DX0:
+            _pid_x._prev_error = x_err
+            _pid_x._d_filtered = 0.0
+            vy = 0.0
+        else:
+            vy = _pid_x.compute(x_err, 0.0, dt)
+            vy = _brake(vy, abs(x_err), DX0, BX)
+        
+        # ── 纵向控制: y_err → vx ──
+        if abs(y_err) < DY0:
+            _pid_y._prev_error = -y_err
+            _pid_y._d_filtered = 0.0
+            vx = 0.0
+        else:
+            vx = -_pid_y.compute(DIST, dist_cm, dt)  # PID(setpoint=DIST, meas=dist_cm)→负反馈取反
+            vx = _brake(vx, abs(y_err), DY0, BY)
+ 
+        out['cmd_fwd_raw'] = vx
+        out['cmd_lat_raw'] = vy
+ 
+        # 动态速度分配
+        vx, vy = _budget(vx, vy, x_err, y_err)
+        out['cmd_fwd'] = vx
+        out['cmd_lat'] = vy
 
-        # 外环：位置 PID → 目标速度
-        cmd_fwd = PID_FWD.compute(y_error, DT)
-        cmd_lat = PID_LAT.compute(x_error, DT)
+        # ── 到达判定 (安全网: 极近时停车, 主流程由 main.py 状态机控制) ──
+        # [DEBUG] 临时注释 — 测试跟随为什么会停车
+        # if abs(y_err) < ARRIV and abs(x_err) < ALGN_X:
+        #     _st = S_STOP
+        #     stop_all()
+        #     _pid_x.reset()
+        #     _pid_y.reset()
+        #     out['arrived']   = True
+        #     out['state_msg'] = "[FOLLOW → STOPPED] d={:.1f}".format(dist_cm)
+        #     out['state']     = _st
+        #     return out
 
-        result['cmd_fwd_raw'] = cmd_fwd
-        result['cmd_lat_raw'] = cmd_lat
 
-        # 速度滤波
-        cmd_fwd, cmd_lat = speed_filter(cmd_fwd, cmd_lat)
-
-        # fwd 永远为正：不后退，只前进或停
-        if cmd_fwd < 0:
-            cmd_fwd = 0.0
-
-        # 最低速度防死区
-        if cmd_fwd > 0.01 and cmd_fwd < MIN_SPEED:
-            cmd_fwd = MIN_SPEED
-        if abs(cmd_lat) > 0.01 and abs(cmd_lat) < MIN_SPEED:
-            cmd_lat = MIN_SPEED if cmd_lat > 0 else -MIN_SPEED
-
-        # 到达判定 → 软停止
-        if abs(y_error) < STOP_DIST_CM and abs(x_cm) < 10:
-            _state = STATE_STOPPED
-            PID_FWD.begin_soft_stop()
-            PID_LAT.begin_soft_stop()
-            result['arrived'] = True
-            result['state_msg'] = "[FOLLOW -> STOPPED] dist={:.1f}cm".format(actual_dist)
-            result['state'] = _state
-            # 计算软停止第一帧输出
-            cmd_fwd = PID_FWD.compute(0, DT)
-            cmd_lat = PID_LAT.compute(0, DT)
-            result['cmd_fwd'] = cmd_fwd
-            result['cmd_lat'] = cmd_lat
-            return result
-
-        result['cmd_fwd'] = cmd_fwd
-        result['cmd_lat'] = cmd_lat
-
-    # ── STOPPED 状态 ──
-    elif _state == STATE_STOPPED:
-        # 优先：目标偏移过大 → 恢复跟随（reset 会取消软停止 + 触发软启动）
-        if abs(actual_dist - TARGET_DIST_CM) > STOP_DIST_CM * 2:
-            _state = STATE_FOLLOW
+    # ── STOPPED: 保持静止, 距离或横向偏移恢复后自动重跟 ──
+    elif _st == S_STOP:
+        if abs(dist_cm - DIST) > ARRIV * 2 or abs(x_cm - E_X) > ALGN_X * 2:
+            _st = S_FOLLOW
             reset_wheel_pi()
-            PID_FWD.reset()
-            PID_LAT.reset()
-            filt_fwd = 0.0
-            filt_lat = 0.0
-            filt_fwd_sign = 0
-            filt_lat_sign = 0
-            result['state_msg'] = "[STOPPED -> FOLLOW] Resuming."
-            result['state'] = _state
-        # 软停止进行中 → 继续输出减速指令
-        elif not PID_FWD.stop_done or not PID_LAT.stop_done:
-            cmd_fwd = PID_FWD.compute(0, DT)
-            cmd_lat = PID_LAT.compute(0, DT)
-            result['cmd_fwd'] = cmd_fwd
-            result['cmd_lat'] = cmd_lat
-        # 软停止完成 → 真正断电
+            _pid_x.reset()
+            _pid_y.reset()
+            _hot = True
+            out['state_msg'] = "[STOPPED → FOLLOW]"
+            out['state']     = _st
         else:
             stop_all()
 
-    # ── LOST 状态 ──
-    elif _state == STATE_LOST:
-        # 软停止进行中 → 继续输出减速指令
-        if not PID_FWD.stop_done or not PID_LAT.stop_done:
-            cmd_fwd = PID_FWD.compute(0, DT)
-            cmd_lat = PID_LAT.compute(0, DT)
-            result['cmd_fwd'] = cmd_fwd
-            result['cmd_lat'] = cmd_lat
-        # 软停止完成 → 真正断电
-        else:
-            stop_all()
+    # ── LOST: 停车等待 ──
+    elif _st == S_LOST:
+        stop_all()
 
-    return result
+    return out
 
-
-# ═══════════════════════════════════════════════════════════════
-#  独立运行入口（仅当直接运行 cam_follow.py 时执行）
-# ═══════════════════════════════════════════════════════════════
-
-def _standalone():
-    """独立运行模式 — 与 backup 完全一致"""
-
-    # ── 硬件 ──
-    SWITCH2_PIN = 'D9'
-    switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
-    state2 = switch2.value()
-
-    # ── 初始化（与 backup 第136-151行完全一致）──
-    time.sleep_ms(100)
-    stop_all()
-    enc_ticker.stop()
-    for _ in range(5):
-        _ = get_encoder_counts()
-        time.sleep_ms(10)
-    reset_encoder_filter()
-    reset_wheel_pi()
-    recv = CamDataReceiver(uart_id=7)
-
-    print("=" * 50)
-    print("Camera Following (Cascade PID)")
-    print("Target: {:.0f}cm".format(TARGET_DIST_CM))
-    print("Build: 2026-06-19 23:30")
-    print("SW2 = exit")
-    print("=" * 50)
-
-    # ── 主循环（与 backup 第157-258行完全一致）──
-    loop_count = 0
-    last_print_ms = time.ticks_ms()
-
-    while True:
-        if switch2.value() != state2:
-            stop_all()
-            enc_ticker.start(10)
-            print("\n[EXIT] SW2 toggled.")
-            break
-
-        data = recv.read()
-        if data is None:
-            time.sleep_ms(1)
-            continue
-
-        now = time.ticks_ms()
-
-        # ── 调用核心控制 ──
-        x_cm = x_to_cm(data['x'])
-        actual_dist = y_to_distance(data['y'])
-        ctrl = compute_control(x_cm, actual_dist, data['is_target'], now)
-
-        if ctrl['state_msg']:
-            print(ctrl['state_msg'])
-
-        if ctrl['cmd_fwd'] is not None:
-            rc = get_encoder_counts()
-            rs = [rc[i] / ENC_SCALE[i] / DT for i in range(4)]
-            omni_drive_closed_loop(ctrl['cmd_fwd'], ctrl['cmd_lat'], 0, rs, DT)
-
-        if time.ticks_diff(now, last_print_ms) >= 300:
-            state_str = {0: "FOLLOW", 1: "STOP", 2: "LOST"}[_state]
-            print("[#{:04d} {:s}] X:{:+5.1f}cm dist:{:5.1f}cm fwd:{:+.3f} lat:{:+.3f}".format(
-                recv.frame_count, state_str, x_cm, actual_dist,
-                PID_FWD.prev_output, PID_LAT.prev_output))
-            last_print_ms = now
-
-        loop_count += 1
-        if loop_count % 50 == 0:
-            gc.collect()
-        time.sleep_ms(1)
-
-    print("\n" + "=" * 50)
-    print("Session: {} frames".format(recv.frame_count))
-    print("=" * 50)
-
-
-if __name__ == '__main__':
-    _standalone()

@@ -20,6 +20,130 @@ from motor import (stop_all, omni_drive_closed_loop,
                    get_encoder_speeds_filtered, get_encoder_counts,
                    reset_encoder_filter, reset_wheel_pi)
 
+
+# ═══════════════════════════════════════════════════════════════
+#  CameraController — 供 main.py 调用的摄像头跟随封装
+# ═══════════════════════════════════════════════════════════════
+
+class CameraController:
+    """摄像头目标跟随控制器（不含航向保持，wz 由外部提供）"""
+
+    def __init__(self, uart_id=7):
+        self._recv = CamDataReceiver(uart_id)
+        self._last_x_cm = 0.0
+        self._last_dist_cm = 0.0
+        self._last_has_tgt = False
+        self._t_prev = 0
+        self._first = True
+        reset_control(reset_state=True)
+
+    # ── 属性（只读统计） ──
+    @property
+    def frame_count(self):
+        return self._recv.frame_count
+
+    @property
+    def target_count(self):
+        return self._recv.target_count
+
+    @property
+    def error_count(self):
+        return self._recv.error_count
+
+    def flush(self):
+        """清空摄像头串口缓冲区（循环读取直到无数据）"""
+        for _ in range(20):
+            if self._recv.read() is None:
+                break
+
+    def reset(self):
+        """复位 PID + 状态机 + 清空坐标缓存"""
+        reset_control(reset_state=True)
+        self._last_x_cm = 0.0
+        self._last_dist_cm = 0.0
+        self._last_has_tgt = False
+        self._first = True
+        self.flush()
+
+    def step(self, now_ms=None):
+        """
+        一帧控制计算（封装 cam_control.py L79-115 逻辑）。
+
+        参数:
+            now_ms: 当前时间戳 (ms)，用于 dt 计算；None 则取 time.ticks_ms()
+
+        返回: dict {
+            'vx': float|None,       # 前进速度 (m/s)，None=不应驱动
+            'vy': float|None,       # 横向速度 (m/s)
+            'has_target': bool,     # 当前是否检测到目标
+            'x_cm': float,          # 目标横向偏移 (cm)
+            'dist_cm': float,       # 目标距离 (cm)
+            'obj_id': int,          # 目标 ID
+            'line_flag': bool,      # 黄线标志（从 b7 解析，预留）
+            'arrived': bool,        # 是否到达目标距离
+            'state': int,           # 0=FOLLOW, 1=STOPPED, 2=LOST
+            'state_msg': str|None,  # 状态切换消息（供打印）
+        }
+        """
+        if now_ms is None:
+            now_ms = time.ticks_ms()
+
+        # ── dt 计算 ──
+        if self._first:
+            self._t_prev = now_ms
+            self._first = False
+            dt_act = 0.01  # 首帧用默认值
+        else:
+            dt_act = time.ticks_diff(now_ms, self._t_prev) * 0.001
+            self._t_prev = now_ms
+            if dt_act <= 0 or dt_act > 0.1:
+                dt_act = 0.01
+
+        # ── 读取摄像头 ──
+        cam_data = self._recv.read()
+
+        has_tgt = False
+        x_cm = 0.0
+        dist_cm = 0.0
+        obj_id = 0
+        line_flag = False
+
+        if cam_data is not None:
+            has_tgt = cam_data['is_target']
+            obj_id = cam_data['id']
+            # 【待确认】黄线标志 — 按实际协议修改此行
+            line_flag = bool(cam_data.get('b7', 0) & 0x01)
+            if has_tgt:
+                x_cm = x_to_cm(cam_data['x'])
+                dist_cm = y_to_distance(cam_data['y'])
+                self._last_x_cm = x_cm
+                self._last_dist_cm = dist_cm
+                self._last_has_tgt = True
+            elif self._last_has_tgt:
+                x_cm = self._last_x_cm
+                dist_cm = self._last_dist_cm
+        else:
+            if self._last_has_tgt:
+                x_cm = self._last_x_cm
+                dist_cm = self._last_dist_cm
+
+        # ── 级联控制计算 ──
+        ctrl = compute_control(x_cm, dist_cm, has_tgt, now_ms, dt_act)
+
+        return {
+            'vx':         ctrl['cmd_fwd'],
+            'vy':         ctrl['cmd_lat'],
+            'has_target': has_tgt,
+            'x_cm':       x_cm,
+            'dist_cm':    dist_cm,
+            'obj_id':     obj_id,
+            'line_flag':  line_flag,
+            'arrived':    ctrl.get('arrived', False),
+            'state':      ctrl['state'],
+            'state_msg':  ctrl.get('state_msg'),
+        }
+
+
 # ── 调试配置 ──
 LOOP_MS  = 10               # 控制周期 100Hz
 DT       = 0.01
