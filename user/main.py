@@ -41,12 +41,10 @@ main.py — 按键驱动控制
     _ensure_uwb()                   — 确保 UWB 已初始化，返回共享实例（懒加载）
     _reset_uwb_if_needed()          — UWB 超时时自动重置，下次调用重建
     _action_startup_forward()       — 记录原点后前进 10cm（航向保持）
-    _action_search_supplies_area()  — 之字形搜索 100cm×100cm 物质区（航向锁）
     see_and_push()                  — 靠近目标 → 发数字 0 → 等待从车 ok
     _action_forward_until_yellow()  — 收到 ok 后全速后退，黄线检测后停车
     _action_goto_supplies_startup() — UWB 导航到 supplies 固定坐标（航向锁）
     _action_return_to_origin()     — 循环结束后 UWB 导航回到原点
-    _action_search_supplies_area()  — 之字形搜索 100cm×100cm 物质区（航向锁）
     _action_forward_20cm()          — C14 步骤 1: 前进 20cm
     _action_uwb_translate()         — C14 步骤 2: UWB 平移纠偏
 
@@ -69,7 +67,6 @@ from motor import (stop_all, omni_drive_closed_loop,
 from imu_motion import (update_angle, imu_get_safe, yaw,
                         reset_ang_vel_pid)
 from key import capture, key_triggered, pet_watchdog
-from utils import normalize_angle
 from uwb_position import UWBPosition
 
 # ═══════════════════════════════════════════════════════════════
@@ -104,12 +101,7 @@ STARTUP_FORWARD_SPEED   = 0.30   # 前进速度 (m/s)
 STARTUP_TIMEOUT_S      = 5.0     # 超时 (s)
 STARTUP_HEADING_DB     = 5.0     # 航向死区 (度)，偏差 5° 后自动回正
 
-# ── 启动: 向右平移（逼近 UWB，摄像头检测终止） ──
-STARTUP_TRANSLATE_SPEED    = 0.30   # 右移速度 (m/s)
-STARTUP_TRANSLATE_TIMEOUT = 15.0   # 超时 (s)
-
 # ── 启动: 靠近目标 + 蓝牙信号 ──
-STARTUP_APPROACH_TIMEOUT = 10.0    # 靠近超时 (s)
 WAIT_OK_TIMEOUT_MS       = 5000    # 等待从车 ok 应答超时 (ms)
 
 # ── 启动: 收到 ok 后全速后退至黄线 ──
@@ -123,8 +115,6 @@ SUPPLIES_SLOW_DIST    = 20.0    # 减速距离 (cm)
 SUPPLIES_MAX_SPEED    = 0.30    # 最大速度 (m/s)
 SUPPLIES_TIMEOUT_S    = 20.0    # 超时 (s)
 SUPPLIES_CTRL_DT      = 0.01    # 控制周期 (s)，参考 main_uwb.py
-SUPPLIES_FALLBACK_DIST_CM = 20.0   # 未检测到物品时向 UWB 前进距离 (cm)
-SUPPLIES_FALLBACK_SPEED   = 0.30   # fallback 前进速度 (m/s)
 SUPPLIES_ARRIVAL_FRAMES   = 5      # 连续 N 帧在死区内算到达 supplies
 
 # ── 物质区之字形搜索 ──
@@ -631,7 +621,6 @@ def _action_goto_supplies_startup():
     
     返回: True=已到达 supplies, False=超时/中断
     """
-    global supplies
 
     uwb = _ensure_uwb()
     if uwb is None:
@@ -1326,7 +1315,7 @@ def main():
     print("")
     print("=" * 50)
     print("  RT1021 — 按键驱动控制")
-    print("  启动: 原点 → 前进10cm → 导航supplies → 右移（摄像头停）")
+    print("  启动: 原点 → 前进10cm → 导航supplies → 之字形搜索")
     print("=" * 50)
     print("  C14 (KEY3): 前进 20cm → UWB 平移")
     print("  C8  (KEY1): 蓝牙发送从车消息")
@@ -1388,7 +1377,7 @@ def main():
                         print("  [CYCLE] 黄线检测中断/超时，退出循环")
                         break
 
-                    # ── 后退完成后通知从车右转 ──
+                    # ── 后退完成后通知从车左转 ──
                     try:
                         bt.turn_left()
                         print("  [CYCLE] turn_left 已发送，等待从车 ok...")
