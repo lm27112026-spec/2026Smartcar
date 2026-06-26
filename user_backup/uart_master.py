@@ -4,7 +4,7 @@ import math
 import time
 
 uart6 = UART(5)
-uart6.init(baudrate=9600, bits=8, parity=None, stop=1)
+uart6.init(baudrate=38400, bits=8, parity=None, stop=1)
 
 print("Master HC-05 ready, sending...")
 

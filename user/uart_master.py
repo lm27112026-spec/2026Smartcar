@@ -40,8 +40,8 @@ class MasterBT:
         JSON 格式: {"roll":R,"pitch":P,"yaw":Y,"wx":X,"wy":Y,"wz":Z}\\r\\n
         所有值使用 {:.1f} 格式化。
         """
-        json_str = '{{"roll":{:.1f},"yaw":{:.1f},"wx":{:.1f},"wy":{:.1f},"wz":{:.1f}}}\r\n'.format(
-            roll,yaw, wx, wy, wz
+        json_str = '{{"roll":{:.1f},"pitch":{:.1f},"yaw":{:.1f},"wx":{:.1f},"wy":{:.1f},"wz":{:.1f}}}\r\n'.format(
+            roll, pitch, yaw, wx, wy, wz
         )
         print("MasterBT: IMU ->", json_str)
         self._uart.write(json_str.encode())

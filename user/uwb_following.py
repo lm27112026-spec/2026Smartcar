@@ -1,8 +1,7 @@
 """
-uwb_following.py — UWB 锚点跟随（实时调向+逼近）
+uwb_following.py — UWB 锚点跟随（全向平移逼近）- 右侧安装适配版
 【流程】
-   1. FOLLOW：每帧根据锚点实时位置计算航向偏差，边走边调向
-      速度按 cos(yaw_err) 缩放：正对全速、侧向减速、背对原地旋转
+   1. FOLLOW：根据锚点实时位置分解为前向/侧向速度，全向平移靠近
    2. STOPPED：到达 20cm → 等移开 >25cm 重新跟随
 【安全】SWITCH2 随时终止
 【依赖】motor.py, imu_motion.py
@@ -22,8 +21,8 @@ from imu_motion import (
 )
 
 # ── 状态机 ──
-STATE_FOLLOW   = 0  # 跟随：边走向锚点边实时调整航向
-STATE_STOPPED  = 1  # 到达
+STATE_FOLLOW   = 0
+STATE_STOPPED  = 1
 
 # ── 硬件 ──
 LED_PIN = 'C4'
@@ -36,22 +35,26 @@ state2  = switch2.value()
 APPROACH_SPEED    = 0.60
 STOP_DIST_M       = 0.20
 RESTART_DIST_M    = 0.25
-FULL_SPEED_DIST_M = 0.35   # ≥35cm 全速
-MIN_APPROACH_SPEED = 0.30  # 最低逼近速度（防电机死区）
+FULL_SPEED_DIST_M = 0.35
+MIN_APPROACH_SPEED = 0.30
 TARGET_ANCHOR     = "8834"
 ANGLE_TIMEOUT_MS  = 800
-DT                = 0.02   # 控制周期 20ms
+DT                = 0.02
+
+# ── 右侧安装 UWB 物理偏移参数（单位：cm） ──
+UWB_OFFSET_X      = 15.0
+UWB_OFFSET_Y      = 0.0
 
 # ── 滤波 ──
-D_FILT_ALPHA    = 0.15      # 距离低通
-XY_FILT_ALPHA   = 0.10      # 坐标低通
-ANGLE_FILT_ALPHA = 0.10     # 角度低通（独立于XY，抑制UWB角度跳变）
+D_FILT_ALPHA     = 0.15
+XY_FILT_ALPHA    = 0.10
+ANGLE_FILT_ALPHA = 0.10
 
-# ── 航向纠偏参数（跟随阶段用，兼顾旋转+直行） ──
-ROT_KP       = 2.0         # 偏差(°) → 目标 dps 增益（边开边转不宜过大）
-ROT_DEADBAND = 3.0         # 到位判定（度）
-ROT_MAX_RATE = 200         # 最大旋转速度 (dps)
-ROT_MIN_RATE = 25          # 最低旋转速度 (dps)，仅死区外生效
+# ── 航向纠偏参数 ──
+ROT_KP       = 2.0
+ROT_DEADBAND = 3.0
+ROT_MAX_RATE = 200
+ROT_MIN_RATE = 25
 
 # ── 全局状态 ──
 _state = STATE_FOLLOW
@@ -117,7 +120,7 @@ def parse_json_line(line_str):
 # ============================================================
 #  主循环
 # ============================================================
-print("=== UWB Following (Continuous) ===")
+print("=== UWB Following (Continuous - Right Mounted) ===")
 print("Waiting for UWB data...")
 frame_count = 0
 loop_count = 0
@@ -143,18 +146,30 @@ while True:
 
                 if b == 0x0D or b == 0x0A:
                     if len(rx_line) > 0:
-                        line_str = ''
-                        for c in rx_line:
-                            line_str += chr(c)
+                        # ── 高效字节转字符串（避免逐字拼接吃内存） ──
+                        try:
+                            line_str = bytes(rx_line).decode()
+                        except:
+                            rx_line = bytearray()
+                            continue
 
                         data = parse_json_line(line_str)
                         if data and 'TWR' in data:
                             frame_count += 1
                             twr = data['TWR']
                             anchor = twr.get('a16', '?')
-                            d_cm  = twr.get('D', 0)
-                            x_cm  = twr.get('Xcm', 0)
-                            y_cm  = twr.get('Ycm', 0)
+
+                            # 获取原始 UWB 模块坐标
+                            x_uwb = twr.get('Xcm', 0)
+                            y_uwb = twr.get('Ycm', 0)
+
+                            # ── 坐标系转换：UWB 右视 → 小车中心坐标系 ──
+                            # 锚点正前(+Y_uwb) = 小车右侧(+X_robot)
+                            x_cm = y_uwb + UWB_OFFSET_X
+                            y_cm = -x_uwb + UWB_OFFSET_Y
+
+                            d_cm = math.sqrt(x_cm**2 + y_cm**2)
+
                             last_data_ticks = time.ticks_ms()
                             timeout_stopped = False
 
@@ -166,10 +181,12 @@ while True:
                                 x_filt = XY_FILT_ALPHA * x_cm + (1 - XY_FILT_ALPHA) * x_filt
                                 y_filt = XY_FILT_ALPHA * y_cm + (1 - XY_FILT_ALPHA) * y_filt
 
-                            angle_to_target = math.atan2(y_filt, -x_filt) * 180.0 / math.pi
-                            # 直接用滤波后XY算出的角度，不再对角度本身做二次滤波
-                            # （XY_FILT_ALPHA 已在坐标层提供足够平滑，角度再滤波会导致控制回路严重滞后）
-                            angle_filt = angle_to_target
+                            # ── 角度：锚点相对角（0°=锚点正前方，匹配 uwb_position.py） ──
+                            angle_to_target = math.atan2(x_uwb, y_uwb) * 180.0 / math.pi
+                            if angle_filt is None:
+                                angle_filt = angle_to_target
+                            else:
+                                angle_filt = ANGLE_FILT_ALPHA * angle_to_target + (1 - ANGLE_FILT_ALPHA) * angle_filt
 
                             if d_filt is None:
                                 d_filt = float(d_cm)
@@ -177,9 +194,9 @@ while True:
                                 d_filt = D_FILT_ALPHA * d_cm + (1 - D_FILT_ALPHA) * d_filt
                             dist_m_filt = d_filt / 100.0
 
-                            print("[{}] a={} D={} Df={:.1f} X={} Y={} ang={:+.0f}° ang_f={:+.0f}° spd={:.2f} state={}".format(
-                                frame_count, anchor, d_cm, d_filt,
-                                x_cm, y_cm, angle_to_target, angle_filt, _ramp_speed(dist_m_filt),
+                            print("[{}] a={} D_f={:.1f} X_f={:.1f} Y_f={:.1f} ang_f={:+.0f}° spd={:.2f} state={}".format(
+                                frame_count, anchor, d_filt,
+                                x_filt, y_filt, angle_filt, _ramp_speed(dist_m_filt),
                                 _state))
 
                             # ── 跳过其它锚点 ──
@@ -188,7 +205,6 @@ while True:
 
                             # ── 状态机 ──
                             if _state == STATE_FOLLOW:
-                                # == 跟随：边走向锚点边实时调向 ==
                                 if dist_m_filt <= STOP_DIST_M:
                                     _state = STATE_STOPPED
                                     reset_ang_vel_pid()
@@ -199,7 +215,7 @@ while True:
                                 # ── 控制周期 ──
                                 now = time.ticks_ms()
                                 dt_raw = time.ticks_diff(now, last_control_ms) / 1000.0
-                                if dt_raw > 0.2:          # 首帧 / 跳帧免执行
+                                if dt_raw > 0.2:
                                     last_control_ms = now
                                     continue
                                 dt = max(dt_raw, 0.005)
@@ -209,15 +225,18 @@ while True:
                                 d = imu_motion.imu.read()
                                 update_angle(d[0], d[1], d[2], d[3], d[4], d[5])
 
-                                # ── 目标航向（锚点方向） ──
+                                # ── 航向保持（不主动面向 tag） ──
                                 target_yaw = imu_motion.yaw - angle_filt
-                                while target_yaw > 180:  target_yaw -= 360
-                                while target_yaw < -180: target_yaw += 360
+                                while target_yaw > 180:
+                                    target_yaw -= 360
+                                while target_yaw < -180:
+                                    target_yaw += 360
                                 yaw_err = target_yaw - imu_motion.yaw
-                                while yaw_err > 180:  yaw_err -= 360
-                                while yaw_err < -180: yaw_err += 360
+                                while yaw_err > 180:
+                                    yaw_err -= 360
+                                while yaw_err < -180:
+                                    yaw_err += 360
 
-                                # ── 航向纠偏（角速度闭环） ──
                                 if abs(yaw_err) > ROT_DEADBAND:
                                     target_dps = yaw_err * ROT_KP
                                     if abs(target_dps) < ROT_MIN_RATE:
@@ -228,19 +247,19 @@ while True:
                                     reset_ang_vel_pid()
                                     wz = 0.0
 
-                                # ── 速度按航向对齐度缩放 ──
-                                alignment = max(0.0, math.cos(math.radians(abs(yaw_err))))
-                                spd = _ramp_speed(dist_m_filt) * alignment
-                                if spd < MIN_APPROACH_SPEED and dist_m_filt > STOP_DIST_M and alignment > 0.5:
-                                    spd = MIN_APPROACH_SPEED
+                                # ── 速度分解：锚点相对角 → 小车坐标系速度分量 ──
+                                # 锚点正前(+Y_uwb)=小车右侧，故偏移 +90°
+                                approach_spd = _ramp_speed(dist_m_filt)
+                                robot_angle_rad = math.radians(angle_filt + 90.0)
+                                fw_spd = -approach_spd * math.cos(robot_angle_rad)
+                                lat_spd =  approach_spd * math.sin(robot_angle_rad)
 
                                 # ── 编码器PID闭环驱动 ──
                                 rc = get_encoder_counts()
                                 rs = [rc[i] / ENC_SCALE[i] / dt for i in range(4)]
-                                omni_drive_closed_loop(spd, 0, wz, rs, dt)
+                                omni_drive_closed_loop(fw_spd, lat_spd, wz, rs, dt)
 
                             elif _state == STATE_STOPPED:
-                                # == 到达：等移开才重新跟随 ==
                                 if dist_m_filt > RESTART_DIST_M:
                                     _state = STATE_FOLLOW
                                     reset_wheel_pi()
@@ -256,6 +275,6 @@ while True:
                     rx_line = bytearray()
 
     loop_count += 1
-    if loop_count % 50 == 0:
+    if loop_count % 10 == 0:
         gc.collect()
     time.sleep_ms(1)
