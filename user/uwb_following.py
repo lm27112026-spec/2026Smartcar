@@ -167,10 +167,9 @@ while True:
                                 y_filt = XY_FILT_ALPHA * y_cm + (1 - XY_FILT_ALPHA) * y_filt
 
                             angle_to_target = math.atan2(y_filt, -x_filt) * 180.0 / math.pi
-                            if angle_filt is None:
-                                angle_filt = angle_to_target
-                            else:
-                                angle_filt = ANGLE_FILT_ALPHA * angle_to_target + (1 - ANGLE_FILT_ALPHA) * angle_filt
+                            # 直接用滤波后XY算出的角度，不再对角度本身做二次滤波
+                            # （XY_FILT_ALPHA 已在坐标层提供足够平滑，角度再滤波会导致控制回路严重滞后）
+                            angle_filt = angle_to_target
 
                             if d_filt is None:
                                 d_filt = float(d_cm)

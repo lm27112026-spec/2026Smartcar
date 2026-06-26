@@ -25,7 +25,7 @@ except ImportError:
 class SlaveBT:
     """UART 数据接收解析类"""
 
-    def __init__(self, uart_id=5, baudrate=9600):
+    def __init__(self, uart_id=5, baudrate=38400):
         self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1, timeout=10)
 
 

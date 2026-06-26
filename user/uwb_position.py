@@ -127,8 +127,12 @@ class UWBPosition:
         # ── 时间管理 ──
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
+        self._timeout_start_ms = 0     # 超时开始时间（诊断用，main.py 据此触发重建）
         self._frame_count = 0
         self._uart_rx_count = 0  # UART 总接收字节数（诊断用）
+        self._step_count = 0     # step() 调用计数（独立于有效帧，用于 GC）
+        self._reject_raw_jump = 0  # 原始值跳变拒绝计数
+        self._reject_med_jump = 0  # 中值跳变拒绝计数
 
         # ── 位置存储 ──
         self.location = []  # 位置历史数组
@@ -191,12 +195,15 @@ class UWBPosition:
                 return False
 
         # ── 超时保护 ──
-        if time.ticks_diff(time.ticks_ms(), self._last_data_ticks) > self.TIMEOUT_MS:
+        now_ms = time.ticks_ms()
+        if time.ticks_diff(now_ms, self._last_data_ticks) > self.TIMEOUT_MS:
             if not self._timeout_stopped:
                 self._timeout_stopped = True
+                self._timeout_start_ms = now_ms
                 uart_bytes = self._uart.any() if self._uart else -1
                 print("UWBPosition: timeout — uart_bytes={} frame={}".format(
                     uart_bytes, self._frame_count))
+            # 重连由 main.py 的 _reset_uwb_if_needed() + _ensure_uwb() 统一管理
 
         # ── 非阻塞读取 UART ──
         if self._uart is not None and self._uart.any():
@@ -220,13 +227,17 @@ class UWBPosition:
                     if len(self._rx_line) > 200:
                         self._rx_line = bytearray()
         else:
-            # 每 200 帧打印一次 UART 状态（诊断用）
-            if self._frame_count > 0 and self._frame_count % 200 == 0:
-                print("[diag] frame={} uart_bytes={} rx_total={}".format(
-                    self._frame_count,
+            # 每 200 次 step 打印诊断（独立于 frame_count，帧全被拒也触发）
+            if self._step_count > 0 and self._step_count % 200 == 0:
+                print("[diag] step={} frame={} uart_bytes={} rx_total={} rej_raw={} rej_med={}".format(
+                    self._step_count, self._frame_count,
                     self._uart.any() if self._uart else -1,
-                    self._uart_rx_count))
+                    self._uart_rx_count,
+                    self._reject_raw_jump, self._reject_med_jump))
 
+        self._step_count += 1
+        if self._step_count % 200 == 0:
+            gc.collect()
         return True
 
     # ============================================================
@@ -251,17 +262,11 @@ class UWBPosition:
         if self._target_anchor is not None and str(anchor) != self._target_anchor:
             return
 
-        # ── 目标锚点：更新计时 ──
-        self._frame_count += 1
-        if self._frame_count % 50 == 0:
-            gc.collect()
-        self._last_data_ticks = time.ticks_ms()
-        self._timeout_stopped = False
-
         # ── 第 1 层：原始值跳变检测（在中值滤波前，拦截大幅跳变） ──
         if self._last_raw_x is not None:
             if abs(x_cm - self._last_raw_x) > self.OUTLIER_RAW_XY_CM or \
                abs(y_cm - self._last_raw_y) > self.OUTLIER_RAW_XY_CM:
+                self._reject_raw_jump += 1
                 return  # 原始值跳变过大，丢弃本帧
         self._last_raw_x = x_cm
         self._last_raw_y = y_cm
@@ -274,12 +279,19 @@ class UWBPosition:
         # ── 第 3 层：异常值检测（中值跳变过大则丢弃） ──
         if self._last_valid_d is not None:
             if abs(d_med - self._last_valid_d) > self.OUTLIER_DIST_CM:
+                self._reject_med_jump += 1
                 return  # 丢弃本帧
             if abs(x_med - self._last_valid_x) > self.OUTLIER_XY_CM or \
                abs(y_med - self._last_valid_y) > self.OUTLIER_XY_CM:
+                self._reject_med_jump += 1
                 return  # 丢弃本帧
 
-        # ── 第 3 层：直接使用中值滤波结果（去掉卡尔曼，避免位置冻结） ──
+        # ── 帧通过所有检查：更新计时与计数 ──
+        self._frame_count += 1
+        self._last_data_ticks = time.ticks_ms()
+        self._timeout_stopped = False
+
+        # ── 第 4 层：直接使用中值滤波结果（去掉卡尔曼，避免位置冻结） ──
         self._x_filt = float(x_med)
         self._y_filt = float(y_med)
         self._d_filt = float(d_med)
@@ -447,6 +459,31 @@ class UWBPosition:
             return False
         self._store_position()
         return True
+
+    # ============================================================
+    #  UART 恢复（通信中断后自动重连）
+    # ============================================================
+    def reset_uart(self):
+        """重新初始化 UART（通信中断恢复）。不影响滤波器和位置存储状态。"""
+        if self._uart is not None:
+            try:
+                self._uart.deinit()
+            except Exception:
+                pass
+        time.sleep_ms(100)
+        self._uart = UART(0)
+        self._uart.init(baudrate=115200, bits=8, parity=None, stop=1)
+        self._rx_line = bytearray()
+        self._last_data_ticks = time.ticks_ms()
+        self._timeout_stopped = False
+        self._timeout_start_ms = 0
+        self._reject_raw_jump = 0
+        self._reject_med_jump = 0
+        print("UWBPosition: UART reinitialized")
+
+    def is_alive(self):
+        """返回 UWB 通信是否正常（非超时状态）。"""
+        return not self._timeout_stopped
 
     # ============================================================
     #  清理

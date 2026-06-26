@@ -261,6 +261,7 @@ def _ensure_uwb():
             wait_start = time.ticks_ms()
             while _uwb_shared.get_frame_count() == 0:
                 _uwb_shared.step()
+                pet_watchdog()  # 喂狗：防止 UWB 初始化期间看门狗超时触发硬复位
                 if time.ticks_diff(time.ticks_ms(), wait_start) > 3000:
                     print("  [UWB] 首帧超时")
                     _uwb_shared.stop()
@@ -700,6 +701,7 @@ def _action_goto_supplies_startup():
     last_uwb_ms = start_ms
     loop_cnt = 0
     near_target_count = 0
+    uwb_dead_start = 0   # UWB 超时开始时间 (0 = 未超时)
 
     led.value(1)
 
@@ -720,6 +722,26 @@ def _action_goto_supplies_startup():
         if time.ticks_diff(now_ms, last_uwb_ms) >= 50:
             uwb.step()
             last_uwb_ms = now_ms
+
+        # ── UWB 超时检测 + 自动重连 ──
+        if uwb.is_timeout():
+            if uwb_dead_start == 0:
+                uwb_dead_start = time.ticks_ms()
+            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > 3000:
+                print("  [GOTO] UWB 超时 3s+，尝试重连...")
+                _reset_uwb_if_needed()
+                new_uwb = _ensure_uwb()
+                if new_uwb is not None:
+                    uwb = new_uwb
+                    uwb_dead_start = 0
+                    last_uwb_ms = time.ticks_ms()
+                    print("  [GOTO] UWB 重连成功")
+                else:
+                    print("  [GOTO] UWB 重连失败，退出导航")
+                    led.value(0)
+                    return False
+        else:
+            uwb_dead_start = 0
 
         # ── 当前 UWB 坐标 ──
         curr_x, curr_y = uwb.get_position()
@@ -824,6 +846,7 @@ def _action_return_to_origin():
     last_uwb_ms = start_ms
     loop_cnt = 0
     near_target_count = 0
+    uwb_dead_start = 0   # UWB 超时开始时间 (0 = 未超时)
 
     led.value(1)
 
@@ -842,6 +865,26 @@ def _action_return_to_origin():
         if time.ticks_diff(now_ms, last_uwb_ms) >= 50:
             uwb.step()
             last_uwb_ms = now_ms
+
+        # ── UWB 超时检测 + 自动重连 ──
+        if uwb.is_timeout():
+            if uwb_dead_start == 0:
+                uwb_dead_start = time.ticks_ms()
+            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > 3000:
+                print("  [RTN] UWB 超时 3s+，尝试重连...")
+                _reset_uwb_if_needed()
+                new_uwb = _ensure_uwb()
+                if new_uwb is not None:
+                    uwb = new_uwb
+                    uwb_dead_start = 0
+                    last_uwb_ms = time.ticks_ms()
+                    print("  [RTN] UWB 重连成功")
+                else:
+                    print("  [RTN] UWB 重连失败，退出导航")
+                    led.value(0)
+                    return False
+        else:
+            uwb_dead_start = 0
 
         curr_x, curr_y = uwb.get_position()
 
@@ -1117,6 +1160,7 @@ def _action_uwb_translate():
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    uwb_dead_start = 0   # UWB 超时开始时间 (0 = 未超时)
 
     led.value(1)
 
@@ -1135,6 +1179,25 @@ def _action_uwb_translate():
         # ── 读取 UWB 数据 ──
         uwb.step()
         x_cm, y_cm = uwb.get_position()
+
+        # ── UWB 超时检测 + 自动重连 ──
+        if uwb.is_timeout():
+            if uwb_dead_start == 0:
+                uwb_dead_start = time.ticks_ms()
+            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > 3000:
+                print("  [UWB] UWB 超时 3s+，尝试重连...")
+                _reset_uwb_if_needed()
+                new_uwb = _ensure_uwb()
+                if new_uwb is not None:
+                    uwb = new_uwb
+                    uwb_dead_start = 0
+                    print("  [UWB] UWB 重连成功")
+                else:
+                    print("  [UWB] UWB 重连失败，退出平移")
+                    led.value(0)
+                    return False
+        else:
+            uwb_dead_start = 0
 
         # ── 到达判定：X 方向已居中 ──
         if abs(x_cm) < UWB_X_DEADBAND:
@@ -1341,99 +1404,98 @@ def main():
     loop_cnt = 0
 
     # # ── UWB 初始化 & 记录起点坐标（小车运动前） ──
-    # global origin
-    # uwb = _ensure_uwb()
-    # if uwb is not None and uwb.get_frame_count() > 0:
-    #     uwb.uwb_record()
-    #     origin = uwb.get_position()
-    #     print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
-    #         origin[0], origin[1]))
-    # else:
-    #     print("  [ORIGIN] UWB 未就绪，使用默认坐标")
-    #     origin = (120, 320)
+    global origin
+    uwb = _ensure_uwb()
+    if uwb is not None and uwb.get_frame_count() > 0:
+        origin = uwb.get_position()  # 首帧已由 _check_and_store() 自动存储
+        print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
+            origin[0], origin[1]))
+    else:
+        print("  [ORIGIN] UWB 未就绪，使用默认坐标")
+        origin = (120, 320)
 
-    # # ── 记录原点后，前进 10cm（航向保持，5° 偏差自动回正） ──
-    # pause_encoder_ticker()
-    # _encoder_reset()
-    # if _action_startup_forward():
-    #     # ── 段间停顿 + 编码器复位 ──
-    #     stop_all()
-    #     time.sleep_ms(300)
-    #     _encoder_reset()
+    # ── 记录原点后，前进 10cm（航向保持，5° 偏差自动回正） ──
+    pause_encoder_ticker()
+    _encoder_reset()
+    if _action_startup_forward():
+        # ── 段间停顿 + 编码器复位 ──
+        stop_all()
+        time.sleep_ms(300)
+        _encoder_reset()
 
-    #     # ── 导航到 supplies 固定坐标（航向锁，全程 IMU 不变） ──
-    #     if _action_goto_supplies_startup():
-    #         # ── 段间停顿 ──
-    #         stop_all()
-    #         time.sleep_ms(300)
-    #         _encoder_reset()
+        # ── 导航到 supplies 固定坐标（航向锁，全程 IMU 不变） ──
+        if _action_goto_supplies_startup():
+            # ── 段间停顿 ──
+            stop_all()
+            time.sleep_ms(300)
+            _encoder_reset()
 
-    #         # ── 到达 supplies 后之字形搜索 100cm×100cm 物质区 ──
-    #         result = _action_search_supplies_area()
-    #         if result:
-    #             print("  [STARTUP] 检测到目标，进入循环")
+            # ── 到达 supplies 后之字形搜索 100cm×100cm 物质区 ──
+            result = _action_search_supplies_area()
+            if result:
+                print("  [STARTUP] 检测到目标，进入循环")
 
-    #             # ═══════════════════════════════════════════════════════
-    #             #  循环：靠近 → 后退 → 导航 → 搜索 → 再循环
-    #             #  退出条件：物质区搜索完成或中断
-    #             # ═══════════════════════════════════════════════════════
-    #             cycle = 0
-    #             while True:
-    #                 cycle += 1
-    #                 print("\n  [CYCLE] === 第 {} 轮 ===".format(cycle))
+                # ═══════════════════════════════════════════════════════
+                #  循环：靠近 → 后退 → 导航 → 搜索 → 再循环
+                #  退出条件：物质区搜索完成或中断
+                # ═══════════════════════════════════════════════════════
+                cycle = 0
+                while True:
+                    cycle += 1
+                    print("\n  [CYCLE] === 第 {} 轮 ===".format(cycle))
 
-    #                 # ① 靠近目标 → 蓝牙信号通知从车
-    #                 if not see_and_push():
-    #                     print("  [CYCLE] 靠近/信号中断，退出循环")
-    #                     break
+                    # ① 靠近目标 → 蓝牙信号通知从车
+                    if not see_and_push():
+                        print("  [CYCLE] 靠近/信号中断，退出循环")
+                        break
 
-    #                 # ② 全速后退至黄线
-    #                 if not _action_forward_until_yellow():
-    #                     print("  [CYCLE] 黄线检测中断/超时，退出循环")
-    #                     break
+                    # ② 全速后退至黄线
+                    if not _action_forward_until_yellow():
+                        print("  [CYCLE] 黄线检测中断/超时，退出循环")
+                        break
 
-    #                 # ── 后退完成后通知从车左转 ──
-    #                 try:
-    #                     bt.turn_left()
-    #                     print("  [CYCLE] turn_left 已发送，等待从车 ok...")
-    #                     if not bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS):
-    #                         print("  [CYCLE] 等待从车 ok 超时 ({:.0f}s)，退出循环".format(
-    #                             WAIT_OK_TIMEOUT_MS / 1000))
-    #                         break
-    #                     print("  [CYCLE] 从车已确认 (ok)")
-    #                 except Exception as e:
-    #                     print("  [CYCLE] turn_left 通信失败:", e)
-    #                     break
+                    # ── 后退完成后通知从车左转 ──
+                    try:
+                        bt.turn_left()
+                        print("  [CYCLE] turn_left 已发送，等待从车 ok...")
+                        if not bt.wait_ok(timeout_ms=WAIT_OK_TIMEOUT_MS):
+                            print("  [CYCLE] 等待从车 ok 超时 ({:.0f}s)，退出循环".format(
+                                WAIT_OK_TIMEOUT_MS / 1000))
+                            break
+                        print("  [CYCLE] 从车已确认 (ok)")
+                    except Exception as e:
+                        print("  [CYCLE] turn_left 通信失败:", e)
+                        break
 
-    #                 # ③ 导航到 supplies 固定坐标
-    #                 if not _action_goto_supplies_startup():
-    #                     print("  [CYCLE] 导航到 supplies 失败，退出循环")
-    #                     break
+                    # ③ 导航到 supplies 固定坐标
+                    if not _action_goto_supplies_startup():
+                        print("  [CYCLE] 导航到 supplies 失败，退出循环")
+                        break
 
-    #                 # ④ 之字形搜索物质区 → 摄像头再检测
-    #                 if not _action_search_supplies_area():
-    #                     print("  [CYCLE] 物质区搜索完成/中断，退出循环")
-    #                     break
+                    # ④ 之字形搜索物质区 → 摄像头再检测
+                    if not _action_search_supplies_area():
+                        print("  [CYCLE] 物质区搜索完成/中断，退出循环")
+                        break
 
-    #                 # ⑤ 摄像头检测到物品 → 回到 ① 继续下一轮
-    #                 print("  [CYCLE] 检测到物品，继续下一轮...")
-    #         else:
-    #             print("  [STARTUP] 物质区搜索完成/中断，进入主循环")
-    #     else:
-    #         print("  [STARTUP] 导航到 supplies 失败，进入主循环")
-    # else:
-    #     print("  [STARTUP] 前进中断，进入主循环")
+                    # ⑤ 摄像头检测到物品 → 回到 ① 继续下一轮
+                    print("  [CYCLE] 检测到物品，继续下一轮...")
+            else:
+                print("  [STARTUP] 物质区搜索完成/中断，进入主循环")
+        else:
+            print("  [STARTUP] 导航到 supplies 失败，进入主循环")
+    else:
+        print("  [STARTUP] 前进中断，进入主循环")
 
-    # # ── 循环退出后，返回原点 ──
-    # print("\n  [RTN] 循环结束，返回原点...")
-    # stop_all()
-    # time.sleep_ms(300)
-    # _encoder_reset()
-    # _action_return_to_origin()
+    # ── 循环退出后，返回原点 ──
+    print("\n  [RTN] 循环结束，返回原点...")
+    stop_all()
+    time.sleep_ms(300)
+    _encoder_reset()
+    _action_return_to_origin()
 
-    # stop_all()
-    # _encoder_reset()
-    # resume_encoder_ticker()
+    stop_all()
+    _encoder_reset()
+    resume_encoder_ticker()
     led.value(1)  # 就绪指示
     print("  等待按键...")
     print("")
@@ -1451,7 +1513,7 @@ def main():
 
             # ── 按键分发 ──
             if key_triggered(1):          # KEY1 (C8) → 蓝牙消息
-                see_and_push()
+                action_c8()
                 led.value(1)
                 continue
 
