@@ -144,6 +144,143 @@ class CameraController:
         }
 
 
+# ═══════════════════════════════════════════════════════════════
+#  cam_approach() — 摄像头驱动闭环靠近目标直到到达判定
+#  提取自 main.py see_and_push() 的驱动闭环部分（不含蓝牙通信）
+# ═══════════════════════════════════════════════════════════════
+
+APPROACH_TIMEOUT_S       = 15.0   # 靠近超时 (s)
+APPROACH_CTRL_DT         = 0.02   # 控制周期 (s)
+APPROACH_DEADBAND_DEG    = 0.5    # 航向死区 (度)
+APPROACH_THRESHOLD_CM    = 6.0    # 物理距离防撞兜底 (cm)
+CLOSE_LOSS_THRESHOLD_CM  = 16.0   # 近距离丢锁判定阈值 (cm)
+APPROACH_PRINT_INTERVAL_MS = 500  # 状态打印间隔 (ms)
+
+
+def cam_approach(cam, lock_heading_fn, calc_wz_fn,
+                 should_abort_fn, drive_fn, stop_fn, led_fn=None):
+    """摄像头驱动闭环靠近目标直到到达判定。
+
+    参数（均为回调函数，由调用方注入）:
+        cam:              CameraController 实例
+        lock_heading_fn:  () -> float  锁定并返回目标航向角 (度)
+        calc_wz_fn:       (target_deg, deadband_deg) -> float  计算航向修正 wz
+        should_abort_fn:  () -> bool   检查 SW2/看门狗，返回 True 则中断
+        drive_fn:         (vx, vy, wz, dt)  驱动电机（须内部读取编码器）
+        stop_fn:          ()  停止所有电机
+        led_fn:           (bool) -> None  设置 LED，None 表示不控制
+
+    返回:
+        (arrived: bool, reason: str)
+        - (True, 'aligned')         → PID 对齐到达
+        - (True, 'safety_threshold')→ 物理防撞兜底
+        - (True, 'blind_zone')      → 近距离盲区遮挡到位
+        - (False, 'lost_far')       → 远距离丢锁，需重新搜索
+        - (False, 'timeout')        → 超时
+        - (False, 'aborted')        → SW2 中断
+    """
+    cam.reset()
+
+    target_heading = lock_heading_fn()
+    print("  [APPROACH] 航向锁定: {:.1f}°".format(target_heading))
+
+    if led_fn:
+        led_fn(True)
+
+    start_ms = time.ticks_ms()
+    last_print_ms = start_ms
+    loop_cnt = 0
+    has_found_once = False
+    last_known_dist = 999.0
+
+    while True:
+        if should_abort_fn():
+            if led_fn:
+                led_fn(False)
+            return (False, 'aborted')
+
+        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+        if elapsed > APPROACH_TIMEOUT_S:
+            print("  [APPROACH] 靠近超时 ({:.1f}s)".format(elapsed))
+            if led_fn:
+                led_fn(False)
+            return (False, 'timeout')
+
+        ctrl = cam.step()
+
+        if ctrl['state_msg']:
+            print("\n" + ctrl['state_msg'])
+
+        if ctrl['has_target']:
+            has_found_once = True
+            if 0 < ctrl['dist_cm']:
+                last_known_dist = ctrl['dist_cm']
+
+        # ── ① PID 精确对齐到达 ──
+        if ctrl['arrived']:
+            print("\n  [APPROACH] ➔ 触发内环 PID 精确对齐到位")
+            stop_fn()
+            break
+
+        # ── ② 物理距离防撞兜底 ──
+        if ctrl['has_target'] and 0 < ctrl['dist_cm'] <= APPROACH_THRESHOLD_CM:
+            print("\n  [APPROACH] ➔ 物理距离 D:{:.1f}cm 已达到防撞界限 (<= {:.1f}cm)".format(
+                ctrl['dist_cm'], APPROACH_THRESHOLD_CM))
+            stop_fn()
+            break
+
+        # ── ③ 丢锁滤波中断判定 ──
+        if has_found_once and ctrl['state'] == 2:
+            if last_known_dist <= CLOSE_LOSS_THRESHOLD_CM:
+                print("\n  [APPROACH] ➔ 目标在近距离 ({:.1f}cm <= {:.1f}cm) 连续丢失，判定盲区遮挡到位！".format(
+                    last_known_dist, CLOSE_LOSS_THRESHOLD_CM))
+                stop_fn()
+                break
+            else:
+                print("\n  [APPROACH] ➔ 目标在远距离 ({:.1f}cm) 异常丢失！返回重新搜索。".format(
+                    last_known_dist))
+                stop_fn()
+                cam.reset()
+                return (False, 'lost_far')
+
+        # ── 驱动电机 ──
+        if ctrl['vx'] is not None and ctrl['vy'] is not None:
+            wz = calc_wz_fn(target_heading, APPROACH_DEADBAND_DEG)
+            try:
+                drive_fn(ctrl['vx'], ctrl['vy'], wz, APPROACH_CTRL_DT)
+            except Exception as e:
+                print("  [APPROACH] 驱动错误:", e)
+        else:
+            wz = calc_wz_fn(target_heading, APPROACH_DEADBAND_DEG)
+            if abs(wz) > 0.001:
+                try:
+                    drive_fn(0, 0, wz, APPROACH_CTRL_DT)
+                except Exception:
+                    pass
+            else:
+                stop_fn()
+
+        # ── 状态打印 ──
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_print_ms) >= APPROACH_PRINT_INTERVAL_MS:
+            last_print_ms = now
+            tgt_str = "T" if ctrl['has_target'] else "-"
+            print("  [APPROACH] {0} X:{1:+5.1f}cm D:{2:5.1f}cm vx:{3:.2f} vy:{4:.2f}".format(
+                tgt_str, ctrl['x_cm'], ctrl['dist_cm'],
+                ctrl['vx'] if ctrl['vx'] else 0.0,
+                ctrl['vy'] if ctrl['vy'] else 0.0))
+
+        loop_cnt += 1
+        if loop_cnt % 50 == 0:
+            gc.collect()
+
+        time.sleep_ms(int(APPROACH_CTRL_DT * 1000))
+
+    if led_fn:
+        led_fn(False)
+    return (True, 'arrived')
+
+
 # ── 调试配置 ──
 LOOP_MS  = 10               # 控制周期 100Hz
 DT       = 0.01
