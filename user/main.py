@@ -35,7 +35,7 @@ FWD_TIMEOUT_S    = 10.0    # 超时 (s)
 FWD_CTRL_DT      = 0.02    # 控制周期 (s)
 
 # ── C14: UWB 平移 ──
-UWB_LAT_SPEED    = 0.30    # 最大平移速度 (m/s)
+UWB_LAT_SPEED    = 0.50    # 最大平移速度 (m/s)
 UWB_X_DEADBAND   = 3.0     # X 方向死区 (cm)
 UWB_LAT_P_GAIN   = 0.02    # X 误差 → 平移速度 P 增益
 UWB_TIMEOUT_S    = 10.0    # 超时 (s)
@@ -49,7 +49,7 @@ WZ_LIMIT         = 0.3     # wz 限幅 (归一化值)
 
 # ── 启动: 记录原点后前进 20cm ──
 STARTUP_FORWARD_DIST_CM = 20.0   # 目标距离 (cm)
-STARTUP_FORWARD_SPEED   = 0.30   # 前进速度 (m/s)
+STARTUP_FORWARD_SPEED   = 0.50   # 前进速度 (m/s)
 STARTUP_TIMEOUT_S      = 5.0     # 超时 (s)
 STARTUP_HEADING_DB     = 5.0     # 航向死区 (度)，偏差 5° 后自动回正
 
@@ -57,14 +57,14 @@ STARTUP_HEADING_DB     = 5.0     # 航向死区 (度)，偏差 5° 后自动回�
 WAIT_OK_TIMEOUT_MS       = 5000    # 等待从车 ok 应答超时 (ms)
 
 # ── 启动: 收到 ok 后全速后退至黄线 ──
-STARTUP_FULL_SPEED     = 1.00    # 全速后退速度（绝对值，m/s）
+STARTUP_FULL_SPEED     = -1.00    # 全速后退速度（绝对值，m/s）
 YELLOW_LINE_TIMEOUT_S  = 10.0    # 黄线检测超时 (s)
 
 # ── 启动: 向 supplies 坐标靠近（UWB 直接 XY 控制） ──
 SUPPLIES_KP           = 0.012   # 位置 P 增益 (参考 main_uwb.py)
 SUPPLIES_DB           = 8.0     # 到位死区 (cm)
 SUPPLIES_SLOW_DIST    = 20.0    # 减速距离 (cm)
-SUPPLIES_MAX_SPEED    = 0.30    # 最大速度 (m/s)
+SUPPLIES_MAX_SPEED    = 0.50    # 最大速度 (m/s)
 SUPPLIES_TIMEOUT_S    = 20.0    # 超时 (s)
 SUPPLIES_CTRL_DT      = 0.01    # 控制周期 (s)，参考 main_uwb.py
 SUPPLIES_ARRIVAL_FRAMES   = 5      # 连续 N 帧在死区内算到达 supplies
@@ -1152,15 +1152,15 @@ def main():
     _encoder_reset()
 
     # ── 导航到 supplies 固定坐标 ──
-    # if not _action_goto_supplies_startup():
-    #     print("  [STARTUP] 导航到 supplies 失败，准备返航...")
-    #     _safe_return_and_exit()
-    #     return
+    if not _action_goto_supplies_startup():
+        print("  [STARTUP] 导航到 supplies 失败，准备返航...")
+        _safe_return_and_exit()
+        return
 
     # ── [Fix 2] 步骤间停顿与重置 ──
-    # stop_all()
-    # time.sleep_ms(300)
-    # _encoder_reset()
+    stop_all()
+    time.sleep_ms(300)
+    _encoder_reset()
 
     # ── 执行物资区之字形搜索（包含最多 5 次的前移重搜） ──
     found_target = _execute_supplies_search_flow()
@@ -1300,3 +1300,4 @@ def _safe_return_and_exit():
 # ═══════════════════════════════════════════════════════════════
 
 main()
+
