@@ -19,7 +19,7 @@ from motor import stop_all, reset_wheel_pi
 #  跟踪参数
 # ═══════════════════════════════════════════════════════════════
 
-DIST       = 8          # 期望距离 (cm)  纵向目标（太近摄像头丢失）
+DIST       = 3          # 期望距离 (cm)  纵向目标
 E_X        = 5           # 期望横向距离 (cm)  正=偏左目标
 
 # ── 外环 PID 增益 ──
@@ -54,8 +54,8 @@ I_BUF  = 50                     # PID内部积分缓冲
 
 # ── 对齐 & 到达 ──
 ALGN_X = 1.0               # 横向对齐阈值 (cm)
-ALGN_Y = 2.0               # 纵向对齐阈值 (cm)
-ARRIV  = 3.0               # 到达判定 (cm) — 适配 DIST=8
+ALGN_Y = 1.0               # 纵向对齐阈值 (cm)
+ARRIV  = 2.0               # 到达判定 (cm) — 宽松于ALGN_Y，防主状态机前抢停
 
 # ── 丢失 & 周期 ──
 LOST_T = 500               # 丢失超时 (ms)
@@ -181,18 +181,6 @@ def compute_control(x_cm, dist_cm, has_tgt, now_ms=None, dt=None):
             out['state_msg'] = "[FOLLOW → LOST]"
             out['state']     = _st
             return out
-        # 短暂丢失（<LOST_T） → 用缓存坐标判断是否已到达目标
-        x_err = x_cm - E_X
-        y_err = dist_cm - DIST
-        if abs(y_err) < ARRIV and abs(x_err) < ALGN_X:
-            _st = S_STOP
-            stop_all()
-            _pid_x.reset()
-            _pid_y.reset()
-            out['arrived']   = True
-            out['state_msg'] = "[FOLLOW → STOPPED] d={:.1f}".format(dist_cm)
-            out['state']     = _st
-            return out
 
     out['state'] = _st
 
@@ -227,7 +215,8 @@ def compute_control(x_cm, dist_cm, has_tgt, now_ms=None, dt=None):
         out['cmd_fwd'] = vx
         out['cmd_lat'] = vy
 
-        # ── 到达判定 ──
+        # ── 到达判定 (安全网: 极近时停车, 主流程由 main.py 状态机控制) ──
+        # [DEBUG] 临时注释 — 测试跟随为什么会停车
         if abs(y_err) < ARRIV and abs(x_err) < ALGN_X:
             _st = S_STOP
             stop_all()

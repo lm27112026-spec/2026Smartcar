@@ -28,23 +28,46 @@ uwb_position.py — UWB 定位模块
 """
 
 import gc, time, math, json
-from machine import UART, Pin
-from kalman_filter import KalmanFilter1D
+from machine import Pin, UART
+
+
+class LKF1D:
+    """一维极简自包含卡尔曼滤波器"""
+
+    def __init__(self, q=1.8, r=8.0):
+        self.q = q  # 过程噪声协方差 (越大越灵敏)
+        self.r = r  # 测量噪声协方差 (越大越平滑)
+        self.x = None  # 状态估计值
+        self.p = 1.0   # 估计协方差
+
+    def update(self, measurement):
+        if self.x is None:
+            self.x = measurement
+            return self.x
+        # 预测
+        p_prior = self.p + self.q
+        # 更新
+        k = p_prior / (p_prior + self.r)
+        self.x = self.x + k * (measurement - self.x)
+        self.p = (1.0 - k) * p_prior
+        return self.x
+
+    def reset(self):
+        self.x = None
+        self.p = 1.0
 
 
 class MedianFilter:
-    """滑动窗口中值滤波器 — 去除尖刺噪声，MicroPython 友好。"""
+    """滑动窗口中值滤波器"""
 
     def __init__(self, window_size=5):
         self._buf = []
         self._window = window_size
 
     def update(self, value):
-        """加入新值，返回中值。"""
         self._buf.append(value)
         if len(self._buf) > self._window:
             self._buf.pop(0)
-        # 拷贝排序取中值（避免改原数组）
         tmp = sorted(self._buf)
         n = len(tmp)
         return tmp[n // 2]
@@ -54,88 +77,71 @@ class MedianFilter:
 
 
 class UWBPosition:
-    """UWB 定位器 — 连续接收 UWB 数据，提供坐标输出和条件存储。"""
+    """UWB 定位器 — 采用中值剔噪 + 轻量卡尔曼平滑的双重低延迟滤波体系"""
 
-    # ── 滤波系数 ──
-    D_FILT_ALPHA = 0.20       # 距离低通
-    XY_FILT_ALPHA = 0.15      # 坐标低通
-    ANGLE_FILT_ALPHA = 0.18   # 角度低通
+    # ── 滤波窗口调优 ──
+    MEDIAN_WINDOW = 5         
 
-    # ── 中值滤波 ──
-    MEDIAN_WINDOW = 11        # 中值滤波窗口（11帧 ≈ 1.1s）
+    # ── 突变剔除阈值（配合小车物理加速，防止数据断锁冻结） ──
+    OUTLIER_DIST_CM = 35.0    # 距离突变阈值 (cm)
+    OUTLIER_XY_CM = 30.0      # XY 突变阈值 (cm)
+    OUTLIER_RAW_XY_CM = 45.0  # 原始数据突变阈值 (cm)
 
-    # ── 异常值检测 ──
-    OUTLIER_DIST_CM = 10.0    # 距离跳变阈值（收紧到10cm）
-    OUTLIER_XY_CM = 8.0       # XY 跳变阈值（收紧到8cm）
-    OUTLIER_RAW_XY_CM = 15.0  # 原始值跳变阈值（新增）
-
-    # ── 超时 ──
     TIMEOUT_MS = 800
-
-    # ── 条件存储参数 ──
-    STORE_DISTANCE_CM = 10.0  # 移动超过此距离才存储 (cm)
+    STORE_DISTANCE_CM = 10.0  
+    
+    # [Fix 2] 防止 location 数组过大导致内存溢出 (OOM)，设置最大缓存上限
+    MAX_LOCATION_POINTS = 500  
 
     # ── 按键引脚 ──
     SWITCH2_PIN = 'D9'
 
     def __init__(self, uart_id=0, baudrate=115200, target_anchor="8834"):
-        """
-        初始化 UWB 定位模块。
-        
-        参数:
-            uart_id: UART 编号 (默认 0)
-            baudrate: 波特率 (默认 115200)
-            target_anchor: 目标锚点 ID (默认 "8834")
-        """
-        # ── UART 初始化 ──
         self._uart = UART(uart_id)
         self._uart.init(baudrate=baudrate, bits=8, parity=None, stop=1)
         self._rx_line = bytearray()
         self._target_anchor = target_anchor
 
-        # ── SW2 按键初始化 ──
         self._switch2 = Pin(self.SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
-        self._switch2_state = self._switch2.value()  # 记录初始状态
-        self._switch2_synced = False  # 首次 step() 时同步
+        self._switch2_state = self._switch2.value()  
         self._switch2_pressed = False
 
-        # ── 滤波状态变量 ──
+        # ── 状态变量 ──
         self._d_filt = None
         self._x_filt = None
         self._y_filt = None
         self._angle_filt = None
 
-        # ── 中值滤波器（每通道独立） ──
+        # ── 中值滤波器 ──
         self._med_d = MedianFilter(self.MEDIAN_WINDOW)
         self._med_x = MedianFilter(self.MEDIAN_WINDOW)
         self._med_y = MedianFilter(self.MEDIAN_WINDOW)
 
-        # ── 异常值检测：上一次有效值 ──
+        # ── 内置自包含卡尔曼平滑器 ──
+        self._kf_x = LKF1D(q=1.8, r=8.0)
+        self._kf_y = LKF1D(q=1.8, r=8.0)
+        self._kf_d = LKF1D(q=2.0, r=6.0)
+        self._kf_angle = LKF1D(q=2.5, r=5.0)
+
+        # ── 上一次有效值参考 ──
         self._last_valid_d = None
         self._last_valid_x = None
         self._last_valid_y = None
-        self._last_raw_x = None  # 原始值记录
+        self._last_raw_x = None  
         self._last_raw_y = None
 
-        # ── 卡尔曼滤波器（轻度平滑，主要靠中值滤波去噪） ──
-        # Q大 → 跟踪快；R适中 → 不会冻结
-        self._kf_x = KalmanFilter1D(Q=2.0, R=15.0, P_min=2.0, name='uwb_x')
-        self._kf_y = KalmanFilter1D(Q=2.0, R=15.0, P_min=2.0, name='uwb_y')
-        self._kf_d = KalmanFilter1D(Q=2.5, R=12.0, P_min=2.0, name='uwb_d')
-        self._kf_angle = KalmanFilter1D(Q=3.0, R=10.0, P_min=2.0, name='uwb_ang')
-
-        # ── 时间管理 ──
+        # ── 运行时间与诊断 ──
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
-        self._timeout_start_ms = 0     # 超时开始时间（诊断用，main.py 据此触发重建）
+        self._timeout_start_ms = 0     
         self._frame_count = 0
-        self._uart_rx_count = 0  # UART 总接收字节数（诊断用）
-        self._step_count = 0     # step() 调用计数（独立于有效帧，用于 GC）
-        self._reject_raw_jump = 0  # 原始值跳变拒绝计数
-        self._reject_med_jump = 0  # 中值跳变拒绝计数
+        self._uart_rx_count = 0  
+        self._step_count = 0     
+        self._reject_raw_jump = 0  
+        self._reject_med_jump = 0  
 
         # ── 位置存储 ──
-        self.location = []  # 位置历史数组
+        self.location = []  
         self._last_store_x = None
         self._last_store_y = None
 
@@ -148,12 +154,8 @@ class UWBPosition:
         print("=== UWBPosition ready (UART{} {} baud, anchor={}) ===".format(
             uart_id, baudrate, target_anchor))
 
-    # ============================================================
-    #  内部：JSON 解析
-    # ============================================================
     @staticmethod
     def _parse_json_line(line_str):
-        """解析 JSON 行数据。"""
         try:
             idx = line_str.find('{')
             if idx < 0:
@@ -162,28 +164,11 @@ class UWBPosition:
         except Exception:
             return None
 
-    # ============================================================
-    #  内部：计算两点间距离
-    # ============================================================
     @staticmethod
     def _calculate_distance(x1, y1, x2, y2):
-        """计算两点间的欧几里得距离。"""
         return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
-    # ============================================================
-    #  公共接口：单次步进（每次主循环调用一次）
-    # ============================================================
     def step(self):
-        """
-        单次迭代：读 UART → 滤波 → 条件存储。
-        
-        可在主循环中每 10ms 调用一次。
-        
-        返回:
-            bool: True 表示程序应继续运行，False 表示 SW2 被按下应退出
-        """
-        # ── SW2 按键检测（边沿触发） ──
-        # 前 5 帧跳过检测，避免上电/初始化时误触发
         if self._frame_count < 5:
             self._switch2_state = self._switch2.value()
         else:
@@ -194,18 +179,11 @@ class UWBPosition:
                 print("SW2 pressed - program will exit")
                 return False
 
-        # ── 超时保护 ──
+        # [Fix 7] 分离职责，纯查询与副作用分离
         now_ms = time.ticks_ms()
         if time.ticks_diff(now_ms, self._last_data_ticks) > self.TIMEOUT_MS:
-            if not self._timeout_stopped:
-                self._timeout_stopped = True
-                self._timeout_start_ms = now_ms
-                uart_bytes = self._uart.any() if self._uart else -1
-                print("UWBPosition: timeout — uart_bytes={} frame={}".format(
-                    uart_bytes, self._frame_count))
-            # 重连由 main.py 的 _reset_uwb_if_needed() + _ensure_uwb() 统一管理
+            self._handle_timeout(now_ms)
 
-        # ── 非阻塞读取 UART ──
         if self._uart is not None and self._uart.any():
             raw = self._uart.read(self._uart.any())
             if raw:
@@ -213,13 +191,14 @@ class UWBPosition:
                 for i in range(len(raw)):
                     b = raw[i]
 
-                    # 行结束符
                     if b == 0x0D or b == 0x0A:
                         if len(self._rx_line) > 0:
-                            line_str = ''
-                            for c in self._rx_line:
-                                line_str += chr(c)
-                            self._process_line(line_str)
+                            # [Fix 6] 抛弃逐字拼接的高开销循环，使用 MicroPython 优化的一次性 decode
+                            try:
+                                line_str = self._rx_line.decode('utf-8')
+                                self._process_line(line_str)
+                            except Exception:
+                                pass # 忽略可能由串口物理噪声引起的帧解析异常
                             self._rx_line = bytearray()
                         continue
 
@@ -227,7 +206,6 @@ class UWBPosition:
                     if len(self._rx_line) > 200:
                         self._rx_line = bytearray()
         else:
-            # 每 200 次 step 打印诊断（独立于 frame_count，帧全被拒也触发）
             if self._step_count > 0 and self._step_count % 200 == 0:
                 print("[diag] step={} frame={} uart_bytes={} rx_total={} rej_raw={} rej_med={}".format(
                     self._step_count, self._frame_count,
@@ -240,11 +218,7 @@ class UWBPosition:
             gc.collect()
         return True
 
-    # ============================================================
-    #  内部：处理一行 UWB 数据（滤波 + 条件存储）
-    # ============================================================
     def _process_line(self, line_str):
-        """处理一行 UWB 数据（三层滤波：中值 → 异常值剔除 → 低通）。"""
         data = self._parse_json_line(line_str)
         if data is None or 'TWR' not in data:
             return
@@ -256,95 +230,94 @@ class UWBPosition:
             x_cm = float(twr.get('Xcm', 0))
             y_cm = float(twr.get('Ycm', 0))
         except (ValueError, TypeError):
-            return  # 数据格式异常，丢弃本帧
+            return  
 
-        # ── 跳过非目标锚点 ──
         if self._target_anchor is not None and str(anchor) != self._target_anchor:
             return
 
-        # ── 第 1 层：原始值跳变检测（在中值滤波前，拦截大幅跳变） ──
+        # ── 第 1 层：原始值跳变检测 ──
         if self._last_raw_x is not None:
             if abs(x_cm - self._last_raw_x) > self.OUTLIER_RAW_XY_CM or \
                abs(y_cm - self._last_raw_y) > self.OUTLIER_RAW_XY_CM:
                 self._reject_raw_jump += 1
-                return  # 原始值跳变过大，丢弃本帧
+                return  # 跳变过大拒绝本帧
+        # [Fix 1] 此处不再直接赋值原始参考值，而是将赋值移至所有检测通过（L285 附近）
+
+        # ── [Fix 3] 第 2 层：在数据污染中值滤波器前，先用原始值完成基于最后有效帧的突变检测 ──
+        # 此处适当放宽 1.2 倍阈值作为补偿
+        if self._last_valid_d is not None:
+            if abs(d_cm - self._last_valid_d) > self.OUTLIER_DIST_CM * 1.2:
+                self._reject_med_jump += 1
+                return  
+            if abs(x_cm - self._last_valid_x) > self.OUTLIER_XY_CM * 1.2 or \
+               abs(y_cm - self._last_valid_y) > self.OUTLIER_XY_CM * 1.2:
+                self._reject_med_jump += 1
+                return  
+
+        # [Fix 1] 校验全通过，安全地更新 Layer 1 参考基准，防止误杀
         self._last_raw_x = x_cm
         self._last_raw_y = y_cm
 
-        # ── 第 2 层：中值滤波（去尖刺） ──
-        d_med = self._med_d.update(d_cm)
-        x_med = self._med_x.update(x_cm)
-        y_med = self._med_y.update(y_cm)
-
-        # ── 第 3 层：异常值检测（中值跳变过大则丢弃） ──
-        if self._last_valid_d is not None:
-            if abs(d_med - self._last_valid_d) > self.OUTLIER_DIST_CM:
-                self._reject_med_jump += 1
-                return  # 丢弃本帧
-            if abs(x_med - self._last_valid_x) > self.OUTLIER_XY_CM or \
-               abs(y_med - self._last_valid_y) > self.OUTLIER_XY_CM:
-                self._reject_med_jump += 1
-                return  # 丢弃本帧
-
-        # ── 帧通过所有检查：更新计时与计数 ──
         self._frame_count += 1
         self._last_data_ticks = time.ticks_ms()
         self._timeout_stopped = False
 
-        # ── 第 4 层：直接使用中值滤波结果（去掉卡尔曼，避免位置冻结） ──
-        self._x_filt = float(x_med)
-        self._y_filt = float(y_med)
-        self._d_filt = float(d_med)
+        # ── [Fix 3] 第 3 层：通过突变校验后，再推入中值窗做二次细节平滑 ──
+        d_med = self._med_d.update(d_cm)
+        x_med = self._med_x.update(x_cm)
+        y_med = self._med_y.update(y_cm)
 
-        # ── 角度计算（基于已滤波坐标，前方=+Y, X增大→向右） ──
-        self._angle_filt = math.atan2(self._x_filt, self._y_filt) * 180.0 / math.pi
+        # ── 第 4 层：使用内置卡尔曼平滑滤波 ──
+        self._x_filt = self._kf_x.update(x_med)
+        self._y_filt = self._kf_y.update(y_med)
+        self._d_filt = self._kf_d.update(d_med)
 
-        # ── 更新异常值参考值 ──
+        # ── 角度解算 ──
+        angle_raw = math.atan2(self._x_filt, self._y_filt) * 180.0 / math.pi
+
+        # ── [Fix 5] 角度卡尔曼差值极界 wrap-around 处理，解决 ±180° 控制摆动扰动 ──
+        if self._angle_filt is not None:
+            diff = angle_raw - self._angle_filt
+            if diff > 180.0:
+                angle_raw -= 360.0
+            elif diff < -180.0:
+                angle_raw += 360.0
+
+        self._angle_filt = self._kf_angle.update(angle_raw)
+
+        # ── 更新历史有效值 ──
         self._last_valid_d = d_med
         self._last_valid_x = x_med
         self._last_valid_y = y_med
 
-        # ── 更新当前坐标 ──
+        # ── 更新对外的当前坐标 ──
         self._current_x = self._x_filt
         self._current_y = self._y_filt
         self._current_distance = self._d_filt
         self._current_angle = self._angle_filt
 
-        # ── 条件存储：移动距离超过阈值时自动保存 ──
         self._check_and_store()
 
-        # ── Debug 打印 ──
         if self._frame_count % 10 == 0:
             print("[{}] a={} D={:.1f} X={:.1f} Y={:.1f} ang={:+.0f}° loc_cnt={}".format(
                 self._frame_count, anchor, self._d_filt,
                 self._x_filt, self._y_filt, self._angle_filt,
                 len(self.location)))
 
-    # ============================================================
-    #  内部：检查并存储坐标
-    # ============================================================
     def _check_and_store(self):
-        """检查是否满足存储条件，满足则存储当前坐标。"""
-        # 首次收到数据时直接存储
         if self._last_store_x is None:
             self._store_position()
             return
 
-        # 计算与上次存储位置的距离
         dist = self._calculate_distance(
             self._last_store_x, self._last_store_y,
             self._current_x, self._current_y
         )
 
-        # 超过阈值则存储
         if dist >= self.STORE_DISTANCE_CM:
             self._store_position()
 
-    # ============================================================
-    #  内部：存储当前位置
-    # ============================================================
     def _store_position(self):
-        """将当前位置存储到 location 数组。"""
         point = {
             'x': self._current_x,
             'y': self._current_y,
@@ -353,118 +326,85 @@ class UWBPosition:
             'timestamp': time.ticks_ms()
         }
         self.location.append(point)
+        
+        # [Fix 2] FIFO 淘汰最旧的记录点，保障在长距离测试中不会发生堆碎片导致的 OOM
+        if len(self.location) > self.MAX_LOCATION_POINTS:
+            self.location.pop(0)
+
         self._last_store_x = self._current_x
         self._last_store_y = self._current_y
         print("Position stored: ({:.1f}, {:.1f}) - Total: {}".format(
             self._current_x, self._current_y, len(self.location)))
 
     # ============================================================
-    #  公共查询接口
+    #  接口函数
     # ============================================================
-
     def get_position(self):
-        """
-        获取当前滤波后的坐标。
-        
-        返回:
-            (x, y): 元组，x 和 y 坐标 (cm)
-        """
+        """获取当前卡尔曼滤波输出的估计位置坐标。"""
         return (self._current_x, self._current_y)
 
     def get_distance_angle(self):
-        """
-        获取当前滤波后的距离和角度。
-        
-        返回:
-            (distance, angle): 元组，距离 (cm) 和角度 (度)
-        """
         return (self._current_distance, self._current_angle)
 
-    def get_raw_position(self):
-        """
-        获取未滤波的原始坐标（最后一次接收到的原始数据）。
-        
-        返回:
-            (x, y): 元组，原始 x 和 y 坐标 (cm)
-        """
+    def get_filtered_position(self):
+        """[Fix 4] 语义修正：获取最后一帧经卡尔曼滤波稳定后的位置（原 get_raw_position 修正）"""
         if self._x_filt is None:
             return (0.0, 0.0)
-        # 注意：这里返回的是滤波后的值，因为原始值没有单独保存
-        # 如需原始值，需要添加额外的变量存储
         return (self._x_filt, self._y_filt)
 
+    def get_raw_position(self):
+        """[Fix 4] 保留原名字别名兼容层，防止调用方（如旧版主控代码）报错"""
+        return self.get_filtered_position()
+
+    def get_latest_raw(self):
+        """[Fix 4] 语义修正：获取最后一帧通过校验的物理原始测量值坐标"""
+        return (self._last_raw_x, self._last_raw_y)
+
     def is_timeout(self):
-        """超过 TIMEOUT_MS 未收到有效帧返回 True。"""
-        if time.ticks_diff(time.ticks_ms(), self._last_data_ticks) > self.TIMEOUT_MS:
-            if not self._timeout_stopped:
-                self._timeout_stopped = True
-                print("UWBPosition: timeout — no data for {}ms".format(self.TIMEOUT_MS))
-            return True
-        return False
+        """[Fix 7] 纯只读属性查询方法，不再掺杂状态改变的副作用"""
+        return time.ticks_diff(time.ticks_ms(), self._last_data_ticks) > self.TIMEOUT_MS
+
+    def _handle_timeout(self, now_ms):
+        """[Fix 7] 剥离出的超时动作处理内部私有方法"""
+        if not self._timeout_stopped:
+            self._timeout_stopped = True
+            self._timeout_start_ms = now_ms
+            uart_bytes = self._uart.any() if self._uart else -1
+            print("UWBPosition: timeout — uart_bytes={} frame={}".format(
+                uart_bytes, self._frame_count))
 
     def get_frame_count(self):
-        """返回已处理的帧数。"""
         return self._frame_count
 
     def get_location_count(self):
-        """返回已存储的位置点数量。"""
         return len(self.location)
 
     def get_last_stored_position(self):
-        """
-        获取最后一个存储的位置点。
-        
-        返回:
-            dict 或 None: 最后一个位置点字典，无数据返回 None
-        """
         if len(self.location) == 0:
             return None
         return self.location[-1]
 
     def get_location_history(self):
-        """
-        获取完整的位置历史记录。
-        
-        返回:
-            list: location 数组的副本
-        """
         return self.location.copy()
 
     def clear_location_history(self):
-        """清空位置历史记录。"""
         self.location.clear()
         self._last_store_x = None
         self._last_store_y = None
         print("Location history cleared.")
 
     def set_store_distance(self, distance_cm):
-        """
-        设置条件存储的触发距离阈值。
-        
-        参数:
-            distance_cm: 触发距离 (cm)，移动超过此距离自动存储
-        """
         self.STORE_DISTANCE_CM = distance_cm
         print("Store distance threshold set to {:.1f} cm".format(distance_cm))
 
     def uwb_record(self):
-        """
-        手动存储当前位置（不受距离阈值限制）。
-        
-        返回:
-            bool: 是否成功存储
-        """
         if self._x_filt is None:
             print("No UWB data received yet.")
             return False
         self._store_position()
         return True
 
-    # ============================================================
-    #  UART 恢复（通信中断后自动重连）
-    # ============================================================
     def reset_uart(self):
-        """重新初始化 UART（通信中断恢复）。不影响滤波器和位置存储状态。"""
         if self._uart is not None:
             try:
                 self._uart.deinit()
@@ -479,17 +419,25 @@ class UWBPosition:
         self._timeout_start_ms = 0
         self._reject_raw_jump = 0
         self._reject_med_jump = 0
-        print("UWBPosition: UART reinitialized")
+        
+        self._med_d.reset()
+        self._med_x.reset()
+        self._med_y.reset()
+        self._kf_x.reset()
+        self._kf_y.reset()
+        self._kf_d.reset()
+        self._kf_angle.reset()
+        self._last_valid_d = None
+        self._last_valid_x = None
+        self._last_valid_y = None
+        self._last_raw_x = None
+        self._last_raw_y = None
+        print("UWBPosition: UART reinitialized and filters reset")
 
     def is_alive(self):
-        """返回 UWB 通信是否正常（非超时状态）。"""
         return not self._timeout_stopped
 
-    # ============================================================
-    #  清理
-    # ============================================================
     def stop(self):
-        """停止 UART。"""
         print("UWBPosition: stopping...")
         if self._uart is not None:
             try:
@@ -500,34 +448,4 @@ class UWBPosition:
         print("UWBPosition: stopped.")
 
     def __del__(self):
-        """析构函数，确保资源释放。"""
         self.stop()
-
-
-# ============================================================
-#  简单测试代码
-# ============================================================
-if __name__ == '__main__':
-    pos = UWBPosition()
-    print("UWB Position Test Started")
-    print("Move the tag to see coordinates change...")
-    print("Location will be stored when tag moves > {} cm".format(pos.STORE_DISTANCE_CM))
-    
-    try:
-        while True:
-            pos.step()
-            
-            x, y = pos.get_position()
-            dist, angle = pos.get_distance_angle()
-            
-            # 每秒打印一次当前状态
-            if pos.get_frame_count() % 100 == 0:
-                print("Current: X={:.1f}cm Y={:.1f}cm D={:.1f}cm A={:.1f}° | Stored: {} points".format(
-                    x, y, dist, angle, pos.get_location_count()))
-            
-            time.sleep_ms(10)
-    
-    except KeyboardInterrupt:
-        print("\nTest stopped by user")
-        print("Total stored positions: {}".format(pos.get_location_count()))
-        pos.stop()
