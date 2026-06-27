@@ -33,13 +33,15 @@ import gc, time, math
 GOTO_KP              = 0.012   # 位置误差 → 速度 P 增益
 GOTO_DB              = 8.0     # 到位死区 (cm)
 GOTO_SLOW_DIST       = 20.0    # 减速起始距离 (cm)
-GOTO_MAX_SPEED       = 0.30    # 最大速度 (m/s)
+GOTO_MAX_SPEED       = 0.50    # 最大速度 (m/s)
 GOTO_MIN_SPEED       = 0.06    # 最小速度 (m/s)，克服静摩擦
 GOTO_TIMEOUT_S       = 20.0    # 总超时 (s)
 GOTO_CTRL_DT         = 0.01    # 控制周期 (s)
 GOTO_ARRIVAL_FRAMES  = 5       # 连续 N 帧在死区内判定到达
 GOTO_UWB_STEP_MS     = 50      # uwb.step() 调用间隔 (ms)
-GOTO_UWB_DEAD_TIMEOUT_S = 3.0  # UWB 离线超时 (s)，超时后放弃导航
+GOTO_UWB_DEAD_TIMEOUT_S = 5.0  # UWB 离线超时 (s)，超时后尝试重连
+GOTO_UWB_MAX_RECONNECT  = 3     # UWB 最大重连次数
+GOTO_UWB_RECONNECT_WAIT_MS = 500  # 重连后等待数据恢复 (ms)
 GOTO_PRINT_INTERVAL_MS = 500   # 状态打印间隔 (ms)
 GOTO_HEADING_DEADBAND = 2.0    # 航向死区 (度)
 
@@ -88,6 +90,7 @@ def goto_location(uwb, target_x, target_y,
     loop_cnt = 0
     near_target_count = 0
     uwb_dead_start = 0
+    uwb_reconnect_count = 0
 
     while True:
         # ── 中断检测 ──
@@ -110,23 +113,48 @@ def goto_location(uwb, target_x, target_y,
             uwb.step()
             last_uwb_ms = now_ms
 
-        # ── UWB 离线检测 ──
+        # ── UWB 离线检测与自动重连 ──
         if uwb.is_timeout():
             if uwb_dead_start == 0:
                 uwb_dead_start = time.ticks_ms()
-            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > GOTO_UWB_DEAD_TIMEOUT_S * 1000:
-                print("  [{}] UWB 离线超时 {:.0f}s，放弃导航".format(
-                    label, GOTO_UWB_DEAD_TIMEOUT_S))
                 stop_fn()
-                if led_fn:
-                    led_fn(False)
-                return (False, 'uwb_lost')
+                print("  [{}] UWB 掉线，等待恢复...".format(label))
+            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > GOTO_UWB_DEAD_TIMEOUT_S * 1000:
+                if uwb_reconnect_count < GOTO_UWB_MAX_RECONNECT:
+                    uwb_reconnect_count += 1
+                    print("  [{}] UWB 离线超时 {:.0f}s，第 {}/{} 次尝试重连...".format(
+                        label, GOTO_UWB_DEAD_TIMEOUT_S,
+                        uwb_reconnect_count, GOTO_UWB_MAX_RECONNECT))
+                    try:
+                        uwb.reset_uart()
+                        time.sleep_ms(GOTO_UWB_RECONNECT_WAIT_MS)
+                        # 等待首帧数据
+                        wait_start = time.ticks_ms()
+                        while uwb.get_frame_count() == 0 or uwb.is_timeout():
+                            uwb.step()
+                            if time.ticks_diff(time.ticks_ms(), wait_start) > 3000:
+                                break
+                            time.sleep_ms(10)
+                        if not uwb.is_timeout() and uwb.get_frame_count() > 0:
+                            print("  [{}] UWB 重连成功，继续导航".format(label))
+                            uwb_dead_start = 0
+                            last_uwb_ms = time.ticks_ms()
+                            continue
+                    except Exception as e:
+                        print("  [{}] UWB 重连异常:".format(label), e)
+                    uwb_dead_start = time.ticks_ms()  # 重置计时，准备下次重连
+                else:
+                    print("  [{}] UWB 全部 {} 次重连均失败，放弃导航".format(
+                        label, GOTO_UWB_MAX_RECONNECT))
+                    if led_fn:
+                        led_fn(False)
+                    return (False, 'uwb_lost')
             # 离线期间停车等待恢复
-            stop_fn()
             time.sleep_ms(int(GOTO_CTRL_DT * 1000))
             continue
         else:
             uwb_dead_start = 0
+            uwb_reconnect_count = 0  # 恢复后重置重连计数
 
         # ── 获取当前位置与误差 ──
         curr_x, curr_y = uwb.get_position()
