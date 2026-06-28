@@ -79,7 +79,7 @@ class CameraController:
             'x_cm': float,          # 目标横向偏移 (cm)
             'dist_cm': float,       # 目标距离 (cm)
             'obj_id': int,          # 目标 ID
-            'line_flag': bool,      # 黄线标志（从 b7 解析，预留）
+            'line_flag': int,       # 黄线标志（0/1）
             'arrived': bool,        # 是否到达目标距离
             'state': int,           # 0=FOLLOW, 1=STOPPED, 2=LOST
             'state_msg': str|None,  # 状态切换消息（供打印）
@@ -111,8 +111,7 @@ class CameraController:
         if cam_data is not None:
             has_tgt = cam_data['is_target']
             obj_id = cam_data['id']
-            # 【待确认】黄线标志 — 按实际协议修改此行
-            line_flag = bool(cam_data.get('b7', 0) & 0x01)
+            line_flag = cam_data.get('line_flag', 0)
             if has_tgt:
                 x_cm = x_to_cm(cam_data['x'])
                 dist_cm = y_to_distance(cam_data['y'])

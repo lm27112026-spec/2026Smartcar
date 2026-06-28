@@ -142,7 +142,11 @@ filter_alpha = 0.98
 # 陀螺仪 Z 轴低通滤波（平滑噪声数据）
 # 运动中陀螺仪有大量电机干扰噪声，需要强滤波
 gz_filtered = 0.0
-gz_filter_alpha = 0.7  # 0.3=超强滤波（运动中噪声大），0.5=强，0.7=中等，0.9=弱
+gz_filter_alpha = 0.5  # 更强抑制（0.3=超强，0.5=强，0.7=中等，0.9=弱）
+
+# ── gz 中值滤波：3 样本滑动窗口剔除单帧 EMI 尖峰 ──
+_gz_hist = [0.0, 0.0, 0.0]
+_gz_hist_idx = 0
 
 # 最新滤波后的 Z 轴角速度 (dps)，供角速度闭环使用
 _wz_dps = 0.0
@@ -155,10 +159,12 @@ def update_angle(ax, ay, az, gx, gy, gz):
     gx, gy, gz: 陀螺仪原始值
     """
     global roll, pitch, yaw, last_time, gz_filtered, _wz_dps
+    global _gz_hist, _gz_hist_idx
     now = time.ticks_ms()
     if last_time == 0:
         last_time = now
         gz_filtered = gz  # 首次初始化
+        _gz_hist = [gz, gz, gz]  # 初始化中值窗
         return
     dt = (now - last_time) * 0.001
     last_time = now
@@ -176,8 +182,13 @@ def update_angle(ax, ay, az, gx, gy, gz):
     gx_dps = (gx - gyro_offset_x) / GYRO_SENSITIVITY
     gy_dps = (gy - gyro_offset_y) / GYRO_SENSITIVITY
 
-    # 对 gz 进行低通滤波，减少噪声影响
-    gz_filtered = gz_filter_alpha * gz_filtered + (1 - gz_filter_alpha) * gz
+    # ── gz 中值滤波：3 样本窗口剔除电机 EMI 单帧尖峰 ──
+    _gz_hist[_gz_hist_idx] = gz
+    _gz_hist_idx = (_gz_hist_idx + 1) % 3
+    gz_med = sorted(_gz_hist)[1]  # 取中值，自动丢弃极值
+
+    # 对中值后的 gz 进行低通滤波
+    gz_filtered = gz_filter_alpha * gz_filtered + (1 - gz_filter_alpha) * gz_med
     gz_dps = (gz_filtered - gyro_offset_z) / GYRO_SENSITIVITY
     _wz_dps = gz_dps  # 供外部角速度闭环使用
 

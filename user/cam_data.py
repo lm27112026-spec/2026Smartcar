@@ -1,11 +1,11 @@
 """
 cam_data.py - 摄像头数据接收与解析模块（适配实际协议）
-【协议】AA [X_H X_L] [Y_H Y_L] [FLAG] [ID] [B6] [B7] BB
+【协议】AA [X_H X_L] [Y_H Y_L] [LABEL_H LABEL_L] [STATUS_H STATUS_L] [LINE_FLAG_H LINE_FLAG_L] BB
         X = 横向偏移 (原始值单位: mm, ÷10后仍为mm)
         Y = 纵向距离 (原始值单位: cm, ÷10后为cm)
-        FLAG: 0x02/0x03=检测到, 0x00=丢失
-        ID = 目标标识 (单字节)
-        B6, B7 = 附加数据 (待定)
+        LABEL = 目标标识 (int16)
+        STATUS = 检测状态 (int16, 0=丢失)
+        LINE_FLAG = 黄线标志 (int16)
         int16 大端序，÷10 精度
 【单位说明】
         X 返回值单位是 mm，用 x_to_cm(x) 转为 cm
@@ -30,7 +30,7 @@ import time
 # 协议常量
 FRAME_HEAD = 0xAA
 FRAME_TAIL = 0xBB
-FRAME_LEN = 10
+FRAME_LEN = 12
 SCALE = 10.0
 
 # Y 坐标参考点：Y=0 时对应的实际距离
@@ -182,7 +182,7 @@ class CamDataReceiver:
         解析一帧数据
         
         参数:
-            frame: 10 字节的帧数据
+            frame: 12 字节的帧数据
             
         返回:
             dict 或 None
@@ -196,15 +196,27 @@ class CamDataReceiver:
         x = _to_signed16(raw_x) / SCALE
         y = _to_signed16(raw_y) / SCALE
         
-        # 解析附加字段
-        flag = frame[5]      # 检测标志 (0x02/0x03=检测到, 0x00=丢失)
-        target_id = frame[6] # 目标标识
-        b6 = frame[6]        # byte 6
-        b7 = frame[7]        # byte 7
+        # 解析 LABEL (bytes 5-6, int16 大端序)
+        raw_label = (frame[5] << 8) | frame[6]
+        label_val = _to_signed16(raw_label)
+        
+        # 解析 STATUS (bytes 7-8, int16 大端序)
+        raw_status = (frame[7] << 8) | frame[8]
+        status_val = _to_signed16(raw_status)
+        
+        # 解析 LINE_FLAG (bytes 9-10, int16 大端序)
+        raw_line_flag = (frame[9] << 8) | frame[10]
+        line_flag_val = _to_signed16(raw_line_flag)
+        
+        # 衍生字段（保持兼容）
+        b6 = frame[5]        # label 高字节
+        b7 = frame[6]        # label 低字节
+        id = label_val       # label 有符号整数值
+        flag = frame[7]      # status 高字节
         
         # 判断是否检测到目标
-        # 当 X=0 且 Y=0 时，flag 也是 0，表示丢失
-        is_target = (flag != 0) and not (x == 0 and y == 0)
+        # status != 0 且 X,Y 不同时为 0 才算有效目标
+        is_target = (status_val != 0) and not (x == 0 and y == 0)
         
         # 统计
         if is_target:
@@ -215,10 +227,13 @@ class CamDataReceiver:
         return {
             'x': x,
             'y': y,
+            'label': label_val,
+            'id': id,
             'flag': flag,
-            'id': target_id,
+            'status': status_val,
             'b6': b6,
             'b7': b7,
+            'line_flag': line_flag_val,
             'is_target': is_target
         }
     
@@ -275,8 +290,8 @@ if __name__ == '__main__':
         now = time.ticks_ms()
         if time.ticks_diff(now, last_print_ms) >= 200:
             state = "TGT" if data['is_target'] else "---"
-            print("[#{:04d} {:s}] X:{:+7.1f} Y:{:6.1f} flag:{:02X} id:{:02X}".format(
-                recv.frame_count, state, data['x'], data['y'], data['flag'], data['id']))
+            print("[#{:04d} {:s}] X:{:+7.1f} Y:{:6.1f} flag:{:02X} id:{:04X} line:{:+d}".format(
+                recv.frame_count, state, data['x'], data['y'], data['flag'], data['id'], data['line_flag']))
             last_print_ms = now
         
         if recv.frame_count % 200 == 0 and recv.frame_count > 0:

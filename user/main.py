@@ -169,7 +169,7 @@ def _read_imu_update_yaw():
             print("  [IMU] 首次成功 raw=(gx:{0:.1f} gy:{1:.1f} gz:{2:.1f}) yaw={3:.2f}°".format(
                 d[3], d[4], d[5], _yaw()))
         if _imu_ok_count % 50 == 0:
-            print("  [IMU] ok={}/fail={} yaw={:.2f}° gz_dps=({:+.1f},{:+.1f},{:+.1f})".format(
+            print("  [IMU] ok={}/fail={} yaw={:.2f}° gz_raw=({:+.1f},{:+.1f},{:+.1f})".format(
                 _imu_ok_count, _imu_fail_count, _yaw(), d[3], d[4], d[5]))
         return True
     _imu_fail_count += 1
@@ -378,7 +378,7 @@ def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FW
         for i in range(4):
             if ENC_SCALE[i] != 0:
                 total_wheel_dists[i] += counts[i] / ENC_SCALE[i]
-        avg_dist = sum(total_wheel_dists) / len(total_wheel_dists)
+        avg_dist = sum(abs(d) for d in total_wheel_dists) / len(total_wheel_dists)
 
         if avg_dist >= dist_m:
             print("  [{}] 到达目标！dist={:.2f}m".format(label, avg_dist))
@@ -507,7 +507,7 @@ def see_and_push():
     #         print("  [APPROACH] 蓝牙发送异常:", e)
     #         time.sleep_ms(500)
 
-    if is_sw2_active():
+    if check_sw2():
         print("  [APPROACH] 检测到 SW2 手动中断，强制跳过蓝牙等待")
         return True
 
@@ -523,7 +523,7 @@ def see_and_push():
             if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
                 print("  [APPROACH] 等待从车 ok 兜底超时 ({}s)，继续执行".format(BT_WAIT_DEADLINE_S))
                 return True
-            if is_sw2_active():
+            if check_sw2():
                 print("  [APPROACH] SW2 中断，强制跳过")
                 return True
             resp = bt.read_response()
@@ -666,9 +666,9 @@ def _action_forward_until_uwb_x():
                 for i in range(4):
                     if ENC_SCALE[i] != 0:
                         backup_dists[i] += bcounts[i] / ENC_SCALE[i]
-                avg_backup = sum(backup_dists) / len(backup_dists)
+                avg_backup = sum(abs(d) for d in backup_dists) / len(backup_dists)
 
-                if abs(avg_backup) >= backup_dist_m:
+                if avg_backup >= backup_dist_m:
                     print("  [UWBX] 倒退完成 dist={:.2f}m".format(abs(avg_backup)))
                     break
 
@@ -955,7 +955,7 @@ def _action_search_supplies_area():
             for i in range(4):
                 if ENC_SCALE[i] != 0:
                     step_dists[i] += counts[i] / ENC_SCALE[i]
-            avg_dist = sum(step_dists) / len(step_dists)
+            avg_dist = sum(abs(d) for d in step_dists) / len(step_dists)
 
             # ── 摄像头检测 ──
             cam = _ensure_cam()
@@ -996,34 +996,12 @@ def _action_search_supplies_area():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  复合型物资区搜索流（5次前移20cm重试机制）
+#  物资区搜索流（单次搜索，不再前移重试）
 # ═══════════════════════════════════════════════════════════════
 
 def _execute_supplies_search_flow():
-    """
-    运行完整的物资区搜索及步进重试控制链。
-    """
-    for attempt in range(6):  # 0 为首次搜，1~5 为重试次数
-        if attempt > 0:
-            print("\n  [SEARCH] ➔ 第 {0}/5 次前移 20cm 重新搜索...".format(attempt))
-            stop_all()
-            time.sleep_ms(300)
-            _encoder_reset()
-            
-            # 前移 20cm 重新搜索
-            if not _action_forward_20cm():
-                print("  [SEARCH] 步进前移过程中断，结束本次重试")
-                return False
-                
-            stop_all()
-            time.sleep_ms(300)
-            _encoder_reset()
-            
-        # 运行完整的之字形搜索区域
-        if _action_search_supplies_area():
-            return True
-            
-    return False
+    """运行一次物资区之字形搜索，找到返回 True，否则返回 False。"""
+    return _action_search_supplies_area()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1316,11 +1294,11 @@ def main():
     _pause_with_yaw_hold(_TARGET_HEADING, 100)
     _encoder_reset()
 
-    # ── 执行物资区之字形搜索（包含最多 5 次的前移重搜） ──
+    # ── 执行物资区之字形搜索 ──
     found_target = _execute_supplies_search_flow()
     
     if not found_target:
-        print("\n  [STARTUP] 整个物资区（包含前移重试）检索完毕，未发现任何目标！开始返航并结束...")
+        print("\n  [STARTUP] 物资区搜索完毕，未发现任何目标！开始返航并结束...")
         _safe_return_and_exit()
         return
 
@@ -1384,7 +1362,7 @@ def main():
         #         print("  [CYCLE] 蓝牙转向通信异常:", e)
         #         time.sleep_ms(500)
 
-        if is_sw2_active():
+        if check_sw2():
             print("  [CYCLE] 检测到 SW2 手动旁路信号，强制跳过转向")
             bt_success = True
         else:
@@ -1400,7 +1378,7 @@ def main():
                         print("  [CYCLE] 等待从车 ok 兜底超时 ({}s)，继续执行".format(BT_WAIT_DEADLINE_S))
                         bt_success = True
                         break
-                    if is_sw2_active():
+                    if check_sw2():
                         print("  [CYCLE] 检测到 SW2 拨码中断信号，强制跳过")
                         bt_success = True
                         break
@@ -1430,9 +1408,9 @@ def main():
         _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
-        # ④ 再次进行复合物资区重试搜索
+        # ④ 再次进行物资区搜索
         if not _execute_supplies_search_flow():
-            print("\n  [CYCLE] 新一轮物资区（重搜）走完未发现任何目标，退出主循环...")
+            print("\n  [CYCLE] 新一轮物资区搜索未发现任何目标，退出主循环...")
             break
 
         print("  [CYCLE] 成功重新捕获物品，准备进入下一轮。")
