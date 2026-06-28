@@ -118,11 +118,18 @@ def goto_location(uwb, target_x, target_y,
             if uwb_dead_start == 0:
                 uwb_dead_start = time.ticks_ms()
                 stop_fn()
-                print("  [{}] UWB 掉线，等待恢复...".format(label))
+                if uwb.is_uart_alive():
+                    print("  [{}] UWB 帧超时但 UART 正常，等待噪声消退...".format(label))
+                else:
+                    print("  [{}] UWB UART 硬件断连，等待恢复...".format(label))
             elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > GOTO_UWB_DEAD_TIMEOUT_S * 1000:
-                if uwb_reconnect_count < GOTO_UWB_MAX_RECONNECT:
+                # [Fix 10] UART 活着时不做 reset_uart()，只延长等待
+                if uwb.is_uart_alive():
+                    print("  [{}] UART 仍活跃，延长等待...".format(label))
+                    uwb_dead_start = time.ticks_ms()
+                elif uwb_reconnect_count < GOTO_UWB_MAX_RECONNECT:
                     uwb_reconnect_count += 1
-                    print("  [{}] UWB 离线超时 {:.0f}s，第 {}/{} 次尝试重连...".format(
+                    print("  [{}] UART 断连超时 {:.0f}s，第 {}/{} 次尝试重连...".format(
                         label, GOTO_UWB_DEAD_TIMEOUT_S,
                         uwb_reconnect_count, GOTO_UWB_MAX_RECONNECT))
                     try:
@@ -164,16 +171,12 @@ def goto_location(uwb, target_x, target_y,
 
         # ── 到达判定（连续 N 帧在死区内） ──
         if dist < GOTO_DB:
-            near_target_count += 1
-            if near_target_count >= GOTO_ARRIVAL_FRAMES:
-                print("  [{}] 已到达目标 ({:.1f}, {:.1f})  dist={:.1f}cm".format(
-                    label, target_x, target_y, dist))
-                stop_fn()
-                if led_fn:
-                    led_fn(False)
-                return (True, 'arrived')
-        else:
-            near_target_count = 0
+            print("  [{}] 已到达目标 ({:.1f}, {:.1f})  dist={:.1f}cm".format(
+                label, target_x, target_y, dist))
+            stop_fn()
+            if led_fn:
+                led_fn(False)
+            return (True, 'arrived')
 
         # ── 状态打印 ──
         now = time.ticks_ms()

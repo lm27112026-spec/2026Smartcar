@@ -16,6 +16,7 @@ def _yaw():
 
 from key import capture, key_triggered, pet_watchdog
 from uwb_position import UWBPosition
+from IMU_hold import HeadingHold
 
 gc.collect()  # 导入相机模块前再次回收
 from cam_control import CameraController, cam_approach
@@ -42,10 +43,15 @@ UWB_TIMEOUT_S    = 10.0    # 超时 (s)
 UWB_INIT_TIMEOUT_S = 3.0   # UWB 初始化超时 (s)
 UWB_CTRL_DT      = 0.02    # 控制周期 (s)
 
-# ── 航向保持 ──
-HEADING_KP       = 0.15    # 航向偏差 → wz P 增益
-HEADING_DEADBAND = 2.0     # 航向死区 (度)
-WZ_LIMIT         = 0.3     # wz 限幅 (归一化值)
+# ── 航向保持（委托给 IMU_hold.HeadingHold）──
+#   以下常量为旧版遗留，保留供参考；实际参数由 HeadingHold 管理
+HEADING_KP       = 0.15    # 航向偏差 → wz P 增益（已迁移至 IMU_hold.py HOLD_KP）
+HEADING_KI       = 0.003   # 航向积分增益（已迁移至 IMU_hold.py HOLD_KI，注意 dt 归一化差异）
+HEADING_I_LIMIT  = 0.06    # 积分项限幅（已迁移至 IMU_hold.py HOLD_I_LIMIT=0.40, 0.15×0.40=0.06）
+HEADING_DEADBAND = 2.0     # 航向死区 (度)（回退默认值；已迁移至 IMU_hold.py HOLD_DEADBAND）
+WZ_LIMIT         = 0.3     # wz 限幅 (归一化值)（已迁移至 IMU_hold.py HOLD_WZ_MAX）
+
+_heading_hold = None        # HeadingHold 实例（首次 _lock_yaw 时懒初始化）
 
 # ── 启动: 记录原点后前进 20cm ──
 STARTUP_FORWARD_DIST_CM = 20.0   # 目标距离 (cm)
@@ -54,7 +60,6 @@ STARTUP_TIMEOUT_S      = 5.0     # 超时 (s)
 STARTUP_HEADING_DB     = 5.0     # 航向死区 (度)，偏差 5° 后自动回正
 
 # ── 启动: 靠近目标 + 蓝牙信号 ──
-WAIT_OK_TIMEOUT_MS       = 5000    # 等待从车 ok 应答超时 (ms)
 BT_WAIT_DEADLINE_S       = 15.0    # 蓝牙阻塞等待兜底超时 (s)，防止死锁
 
 # ── 启动: 收到 ok 后全速前进至 UWB X 距离 < -130cm ──
@@ -143,24 +148,9 @@ bt = MasterBT()
 _imu_ticker_stopped = False
 _imu_ok_count = 0     
 _imu_fail_count = 0   
+_maintain_yaw_fail = 0   # _maintain_yaw() 驱动异常计数（SPI 总线故障等）
 
 
-def _wait_for_follower_ok(timeout_ms=WAIT_OK_TIMEOUT_MS):
-    """
-    非阻塞式等待从车 ok。
-    如果在等待期间检测到 SW2 拨码切换，返回 "abort" 用于触发手动跳过。
-    """
-    deadline = time.ticks_ms() + timeout_ms
-    while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-        pet_watchdog()  # 高频喂狗，防止系统硬复位
-        if check_sw2(): # 检测 SW2 边沿变化
-            print("  [BT] 等待过程中被 SW2 强制中断")
-            return "abort"
-        resp = bt.read_response()
-        if resp == "ok":
-            return "ok"
-        time.sleep_ms(10)
-    return "timeout"
 
 
 def _read_imu_update_yaw():
@@ -190,44 +180,96 @@ def _read_imu_update_yaw():
     return False
 
 
+def _get_heading_hold():
+    """懒初始化 HeadingHold 实例（无 IMU 模式，由调用方外部喂 yaw）"""
+    global _heading_hold
+    if _heading_hold is None:
+        _heading_hold = HeadingHold()
+    return _heading_hold
+
+
 def _lock_yaw():
     global _TARGET_HEADING
     if _TARGET_HEADING is not None:
         return _TARGET_HEADING
+    hold = _get_heading_hold()
     for _ in range(20):  
         if _read_imu_update_yaw():
             _TARGET_HEADING = _yaw()
+            hold.set_target(_TARGET_HEADING)
             print("  [HEADING] 全程航向锁定: {:.1f}°（偏差自动回正）".format(_TARGET_HEADING))
             return _TARGET_HEADING
         time.sleep_ms(10)
     _TARGET_HEADING = _yaw()
+    hold.set_target(_TARGET_HEADING)
     print("  [HEADING] 全程航向锁定(兜底): {:.1f}°".format(_TARGET_HEADING))
     return _TARGET_HEADING
 
 
-def _heading_correction(target_yaw, deadband=None):
+def _heading_correction(target_yaw, deadband=None, dt=None):
+    """PI 航向修正：委托给 IMU_hold.HeadingHold"""
+    if dt is None:
+        dt = FWD_CTRL_DT
     _read_imu_update_yaw()  
+    hold = _get_heading_hold()
+    if target_yaw != hold.target:
+        hold.set_target(target_yaw)
+    wz, _, _ = hold.update(_yaw(), dt, deadband=deadband)
+    return wz
 
-    if deadband is None:
-        deadband = HEADING_DEADBAND
 
-    error = target_yaw - _yaw()
-    if error > 180:
-        error -= 360
-    elif error < -180:
-        error += 360
+def _maintain_yaw(target_heading):
+    """单次 yaw 保持迭代：委托给 HeadingHold 计算 wz → 驱动电机。
+    调用方应在自己的等待/暂停循环中反复调用此函数，
+    以替代 time.sleep_ms() 实现持续航向修正。
 
-    if abs(error) < deadband:
-        return 0.0
+    返回: True=已驱动, False=在死区内无需驱动
+    """
+    global _maintain_yaw_fail
+    hold = _get_heading_hold()
+    if target_heading != hold.target:
+        hold.set_target(target_heading)
 
-    wz = error * HEADING_KP
-    return max(-WZ_LIMIT, min(wz, WZ_LIMIT))
+    _read_imu_update_yaw()
+    wz, _, _ = hold.update(_yaw(), FWD_CTRL_DT)
+
+    if abs(wz) > 0.001:
+        try:
+            rc = get_encoder_counts()
+            if rc is not None and len(rc) >= 4:
+                rs = [rc[i] / ENC_SCALE[i] / 0.02 if ENC_SCALE[i] != 0 else 0
+                      for i in range(4)]
+                omni_drive_closed_loop(0, 0, wz, rs, 0.02)
+        except Exception as e:
+            _maintain_yaw_fail += 1
+            if _maintain_yaw_fail == 1:
+                print("  [YAW] _maintain_yaw 驱动异常(首次):", e)
+            elif _maintain_yaw_fail % 50 == 0:
+                print("  [YAW] _maintain_yaw 驱动异常累计={} 最近:".format(_maintain_yaw_fail), e)
+        return True
+    else:
+        stop_all()
+        return False
+
+
+def _pause_with_yaw_hold(target_heading, duration_ms):
+    """暂停 duration_ms 毫秒，期间持续保持航向修正。
+    替代 stop_all() + time.sleep_ms() 的静默等待，
+    确保暂停期间 yaw 不漂移。"""
+    deadline = time.ticks_ms() + duration_ms
+    while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+        _maintain_yaw(target_heading)
+        time.sleep_ms(10)
+    stop_all()
 
 
 def _encoder_reset():
     reset_encoder_filter()
     reset_wheel_pi()
     reset_ang_vel_pid()
+    # 每步结束清零 HeadingHold PID 积分，防止碰撞/打滑后积分饱和扭动
+    if _heading_hold is not None:
+        _heading_hold.reset()
     for _ in range(5):
         _ = get_encoder_counts()
         time.sleep_ms(10)
@@ -256,6 +298,8 @@ def _ensure_uwb():
             while _uwb_shared.get_frame_count() == 0:
                 _uwb_shared.step()
                 pet_watchdog()  
+                if _TARGET_HEADING is not None:
+                    _maintain_yaw(_TARGET_HEADING)  # 等待期间持续修正航向
                 if time.ticks_diff(time.ticks_ms(), wait_start) > 3000:
                     print("  [UWB] 首帧超时")
                     _uwb_shared.stop()
@@ -271,10 +315,14 @@ def _ensure_uwb():
 
 
 def _reset_uwb_if_needed():
-    """如果 UWB 超时，重置以便下次 _ensure_uwb() 重建。"""
+    """如果 UWB 硬件断连（UART 死），重置以便下次 _ensure_uwb() 重建。
+    [Fix 10] 帧校验拒绝（is_uart_alive=True）≠ 硬件断连，不执行销毁。"""
     global _uwb_shared
     if _uwb_shared is not None and _uwb_shared.is_timeout():
-        print("  [UWB] 超时，重置连接...")
+        if _uwb_shared.is_uart_alive():
+            print("  [UWB] 帧超时但 UART 硬件正常，等待噪声消退...")
+            return  # 不销毁实例，等帧自然恢复
+        print("  [UWB] UART 硬件断连，重置连接...")
         _uwb_shared.stop()
         _uwb_shared = None
 
@@ -292,15 +340,17 @@ def _ensure_cam():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  C14 步骤 1: 前进 20cm（航向保持）
+#  通用前进函数（编码器里程计 + IMU 航向闭环）
 # ═══════════════════════════════════════════════════════════════
 
-def _action_forward_20cm():
-    """前进 20cm，IMU 航向闭环保持。返回: True=正常完成, False=中断"""
-    print("  [FWD] Starting forward {:.0f}cm...".format(FORWARD_DIST_M * 100))
+def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FWD"):
+    """通用前进：编码器距离闭环 + IMU 航向保持。
+    返回: True=到达目标, False=中断/超时"""
+    print("  [{}] 前进 {:.0f}cm 开始...".format(label, dist_m * 100))
 
     target_heading = _lock_yaw()
-    print("  [FWD] Heading locked: {:.1f}°".format(target_heading))
+    db_str = "  死区 {:.0f}°".format(heading_deadband) if heading_deadband is not None else ""
+    print("  [{}] 航向锁定: {:.1f}°{}".format(label, target_heading, db_str))
 
     total_wheel_dists = [0.0, 0.0, 0.0, 0.0]
     start_ms = time.ticks_ms()
@@ -315,75 +365,8 @@ def _action_forward_20cm():
             return False
 
         elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > FWD_TIMEOUT_S:
-            print("  [FWD] Timeout ({:.1f}s)".format(elapsed))
-            led.value(0)
-            return False
-
-        counts = get_encoder_counts()
-        if counts is None or len(counts) < 4:
-            time.sleep_ms(5)
-            continue
-
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                total_wheel_dists[i] += counts[i] / ENC_SCALE[i]
-        avg_dist = sum(total_wheel_dists) / len(total_wheel_dists)
-
-        if avg_dist >= FORWARD_DIST_M:
-            print("  [FWD] Target reached! dist={:.2f}m".format(avg_dist))
-            led.value(0)
-            return True
-
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
-            print("  [FWD] dist={0:.2f}m / {1:.2f}m  yaw={2:.2f}°".format(
-                avg_dist, FORWARD_DIST_M, _yaw()))
-
-        loop_cnt += 1
-        if loop_cnt % 50 == 0:
-            gc.collect()
-
-        wz = _heading_correction(target_heading)
-
-        try:
-            rs = [counts[i] / ENC_SCALE[i] / FWD_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(FORWARD_SPEED, 0, wz, rs, FWD_CTRL_DT)
-        except Exception as e:
-            print("  [FWD] Drive error:", e)
-
-        time.sleep_ms(int(FWD_CTRL_DT * 1000))
-
-
-# ═══════════════════════════════════════════════════════════════
-#  启动步骤: 前进 20cm（航向保持，5° 偏差回正）
-# ═══════════════════════════════════════════════════════════════
-
-def _action_startup_forward():
-    dist_m = STARTUP_FORWARD_DIST_CM / 100.0
-    print("  [STARTUP] 前进 {:.0f}cm 开始...".format(STARTUP_FORWARD_DIST_CM))
-
-    target_heading = _lock_yaw()
-    print("  [STARTUP] 航向锁定: {:.1f}°  死区 {:.0f}° 偏差自动回正".format(
-        target_heading, STARTUP_HEADING_DB))
-
-    total_wheel_dists = [0.0, 0.0, 0.0, 0.0]
-    start_ms = time.ticks_ms()
-    last_print_ms = start_ms
-    loop_cnt = 0
-
-    led.value(1)
-
-    while True:
-        if _abort_check():
-            led.value(0)
-            return False
-
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > STARTUP_TIMEOUT_S:
-            print("  [STARTUP] 超时 ({:.1f}s)".format(elapsed))
+        if elapsed > timeout_s:
+            print("  [{}] 超时 ({:.1f}s)".format(label, elapsed))
             led.value(0)
             return False
 
@@ -398,30 +381,49 @@ def _action_startup_forward():
         avg_dist = sum(total_wheel_dists) / len(total_wheel_dists)
 
         if avg_dist >= dist_m:
-            print("  [STARTUP] 到达目标! dist={:.2f}m".format(avg_dist))
+            print("  [{}] 到达目标！dist={:.2f}m".format(label, avg_dist))
             led.value(0)
             return True
 
         now = time.ticks_ms()
         if time.ticks_diff(now, last_print_ms) >= 500:
             last_print_ms = now
-            print("  [STARTUP] dist={0:.2f}m / {1:.2f}m  yaw={2:.2f}°".format(
-                avg_dist, dist_m, _yaw()))
+            print("  [{}] dist={:.2f}m / {:.2f}m  yaw={:.2f}°".format(
+                label, avg_dist, dist_m, _yaw()))
 
         loop_cnt += 1
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading, deadband=STARTUP_HEADING_DB)
+        wz = _heading_correction(target_heading, deadband=heading_deadband)
 
         try:
             rs = [counts[i] / ENC_SCALE[i] / FWD_CTRL_DT if ENC_SCALE[i] != 0 else 0
                   for i in range(4)]
-            omni_drive_closed_loop(STARTUP_FORWARD_SPEED, 0, wz, rs, FWD_CTRL_DT)
+            omni_drive_closed_loop(speed, 0, wz, rs, FWD_CTRL_DT)
         except Exception as e:
-            print("  [STARTUP] 驱动错误:", e)
+            print("  [{}] 驱动错误:".format(label), e)
 
         time.sleep_ms(int(FWD_CTRL_DT * 1000))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  C14 步骤 1: 前进 20cm（航向保持）— 委托给 _forward_distance
+# ═══════════════════════════════════════════════════════════════
+
+def _action_forward_20cm():
+    return _forward_distance(FORWARD_DIST_M, FORWARD_SPEED, FWD_TIMEOUT_S, label="FWD")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  启动步骤: 前进 20cm（航向保持，5° 偏差回正）
+# ═══════════════════════════════════════════════════════════════
+
+def _action_startup_forward():
+    return _forward_distance(
+        STARTUP_FORWARD_DIST_CM / 100.0, STARTUP_FORWARD_SPEED,
+        STARTUP_TIMEOUT_S, STARTUP_HEADING_DB, label="STARTUP"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -512,10 +514,12 @@ def see_and_push():
     print("  [APPROACH] 向从车发送数字 0 (turn_right)...")
     try:
         bt.turn_right()
+        target_heading = _lock_yaw()
         print("  [APPROACH] 指令已发，等待从车 ok（兜底 {}s）...".format(BT_WAIT_DEADLINE_S))
         bt_wait_start = time.ticks_ms()
         while True:
             pet_watchdog()
+            _maintain_yaw(target_heading)  # 等待期间持续修正航向
             if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
                 print("  [APPROACH] 等待从车 ok 兜底超时 ({}s)，继续执行".format(BT_WAIT_DEADLINE_S))
                 return True
@@ -557,6 +561,7 @@ def _action_forward_until_uwb_x():
     last_uwb_ms = start_ms
     loop_cnt = 0
     uwb_dead_start = 0
+    uwb_dead_reconnect = 0
 
     led.value(1)
 
@@ -587,11 +592,19 @@ def _action_forward_until_uwb_x():
             if uwb_dead_start == 0:
                 uwb_dead_start = time.ticks_ms()
                 stop_all()
-                print("  [UWBX] UWB 掉线，等待恢复...")
+                if uwb.is_uart_alive():
+                    print("  [UWBX] UWB 帧超时但 UART 正常，等待噪声消退...")
+                else:
+                    print("  [UWBX] UART 硬件断连，等待恢复...")
             elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > UWB_DEAD_TIMEOUT_S * 1000:
-                if uwb_dead_reconnect < UWB_DEAD_RECONNECT_MAX:
+                # [Fix 10] UART 活着时不做重建，只延长等待
+                if uwb.is_uart_alive():
+                    print("  [UWBX] UART 仍活跃，延长等待 (帧拒绝 raw={} med={})...".format(
+                        uwb._reject_raw_jump, uwb._reject_med_jump))
+                    uwb_dead_start = time.ticks_ms()  # 重置计时器，继续等待
+                elif uwb_dead_reconnect < UWB_DEAD_RECONNECT_MAX:
                     uwb_dead_reconnect += 1
-                    print("  [UWBX] UWB 掉线超时 {:.0f}s，第 {}/{} 次尝试重连...".format(
+                    print("  [UWBX] UART 断连超时 {:.0f}s，第 {}/{} 次尝试重连...".format(
                         UWB_DEAD_TIMEOUT_S, uwb_dead_reconnect, UWB_DEAD_RECONNECT_MAX))
                     _reset_uwb_if_needed()
                     new_uwb = _ensure_uwb()
@@ -607,6 +620,7 @@ def _action_forward_until_uwb_x():
                     print("  [UWBX] UWB 全部 {} 次重连均失败，放弃".format(UWB_DEAD_RECONNECT_MAX))
                     led.value(0)
                     return False
+            _maintain_yaw(target_heading)  # UWB 掉线期间持续修正航向
             time.sleep_ms(50)
             continue
         else:
@@ -615,7 +629,13 @@ def _action_forward_until_uwb_x():
             uwb_dead_start = 0
             uwb_dead_reconnect = 0  # 恢复后重置重连计数
 
-        x_cm, y_cm = uwb.get_position()
+        try:
+            x_cm, y_cm = uwb.get_position()
+        except Exception as e:
+            print("  [UWBX] get_position() 异常:", e)
+            _maintain_yaw(target_heading)
+            time.sleep_ms(50)
+            continue
 
         if x_cm < UWB_X_THRESHOLD_CM:
             stop_all()
@@ -723,7 +743,7 @@ def _action_goto_supplies_startup():
         return _lock_yaw()
 
     def _wz_fn(target, db):
-        return _heading_correction(target, deadband=db)
+        return _heading_correction(target, deadband=db, dt=SUPPLIES_CTRL_DT)
 
     def _yaw_fn():
         return _yaw()
@@ -783,7 +803,7 @@ def _action_return_to_origin():
         return _lock_yaw()
 
     def _wz_fn(target, db):
-        return _heading_correction(target, deadband=db)
+        return _heading_correction(target, deadband=db, dt=SUPPLIES_CTRL_DT)
 
     def _yaw_fn():
         return _yaw()
@@ -870,7 +890,8 @@ def _action_search_supplies_area():
             for i in range(4):
                 if ENC_SCALE[i] != 0:
                     total_dists[i] += counts[i] / ENC_SCALE[i]
-            avg_dist = abs(sum(total_dists) / len(total_dists))
+            # 横向平移：麦轮对角轮正反转，代数和会抵消为 0，须取各轮绝对值
+            avg_dist = sum(abs(total_dists[i]) for i in range(4)) / 4
 
             # ── 摄像头物品检测 ──
             cam = _ensure_cam()
@@ -1041,25 +1062,45 @@ def _action_uwb_translate():
             return False
 
         uwb.step()
-        x_cm, y_cm = uwb.get_position()
+        try:
+            x_cm, y_cm = uwb.get_position()
+        except Exception as e:
+            print("  [UWB] get_position() 异常:", e)
+            _maintain_yaw(target_heading)
+            time.sleep_ms(50)
+            continue
 
         if uwb.is_timeout():
             if uwb_dead_start == 0:
                 uwb_dead_start = time.ticks_ms()
-            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > 3000:
-                print("  [UWB] UWB 超时 3s+，尝试重连...")
-                _reset_uwb_if_needed()
-                new_uwb = _ensure_uwb()
-                if new_uwb is not None:
-                    uwb = new_uwb
-                    uwb_dead_start = 0
-                    print("  [UWB] UWB 重连成功")
+                stop_all()
+                if uwb.is_uart_alive():
+                    print("  [UWB] UWB 帧超时但 UART 正常，等待噪声消退...")
                 else:
-                    print("  [UWB] UWB 重连失败，退出平移")
-                    led.value(0)
-                    return False
-        else:
-            uwb_dead_start = 0
+                    print("  [UWB] UART 硬件断连，等待恢复...")
+            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > UWB_DEAD_TIMEOUT_S * 1000:
+                # [Fix 10] UART 活着时不做重建，只延长等待
+                if uwb.is_uart_alive():
+                    print("  [UWB] UART 仍活跃，延长等待 (帧拒绝 raw={} med={})...".format(
+                        uwb._reject_raw_jump, uwb._reject_med_jump))
+                    uwb_dead_start = time.ticks_ms()
+                else:
+                    print("  [UWB] UART 断连超时 {:.0f}s+，尝试重连...".format(UWB_DEAD_TIMEOUT_S))
+                    _reset_uwb_if_needed()
+                    new_uwb = _ensure_uwb()
+                    if new_uwb is not None:
+                        uwb = new_uwb
+                        uwb_dead_start = 0
+                        print("  [UWB] UWB 重连成功")
+                    else:
+                        print("  [UWB] UWB 重连失败，退出平移")
+                        led.value(0)
+                        return False
+            _maintain_yaw(target_heading)  # UWB 掉线期间仅维持航向，不用脏数据驱动
+            time.sleep_ms(50)
+            continue
+        # ↓ UWB 健康时才到达此处
+        uwb_dead_start = 0
 
         if abs(x_cm) < UWB_X_DEADBAND:
             print("  [UWB] Centered! X={:.1f}cm (deadband={:.1f}cm)".format(
@@ -1114,8 +1155,7 @@ def action_c14():
     if not _action_forward_20cm():
         result = False
     else:
-        stop_all()
-        time.sleep_ms(300)
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
 
         _encoder_reset()
         if not _action_uwb_translate():
@@ -1205,18 +1245,7 @@ def action_c9():
                 except Exception as e:
                     print("  [C9] 驱动错误:", e)
             else:
-                wz = _heading_correction(target_heading)
-                if abs(wz) > 0.001:
-                    try:
-                        rc = get_encoder_counts()
-                        if rc is not None and len(rc) >= 4:
-                            rs = [rc[i] / ENC_SCALE[i] / C9_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                                  for i in range(4)]
-                        omni_drive_closed_loop(0, 0, wz, rs, C9_CTRL_DT)
-                    except Exception:
-                        pass
-                else:
-                    stop_all()
+                _maintain_yaw(target_heading)  # 丢目标时仅维持航向（含异常计数告警）
 
             loop_cnt += 1
             if loop_cnt % 50 == 0:
@@ -1249,6 +1278,15 @@ def main():
     print("=" * 50)
     print("")
     
+    # ── ⚠ 在进行任何 PID/PI 闭环控制前必须先暂停后台编码器定时器，
+    #     否则 _maintain_yaw() 与后台定时器会同时读写编码器，导致
+    #     电机抖动、异响甚至硬件死锁 ──
+    pause_encoder_ticker()
+    _encoder_reset()
+
+    # ── 🔒 提前锁定航向：UWB 初始化期间即可保持 yaw 不漂移 ──
+    _lock_yaw()
+
     # ── UWB 初始化 & 记录起点坐标 ──
     global origin
     uwb = _ensure_uwb()
@@ -1261,16 +1299,12 @@ def main():
         origin = (130.0, 262.0)
 
     # ── 记录原点后，前进 20cm（航向保持） ──
-    pause_encoder_ticker()
-    _encoder_reset()
-    
     if not _action_startup_forward():
         print("  [STARTUP] 前进 20cm 被中断，准备返航...")
         _safe_return_and_exit()
         return
 
-    stop_all()
-    time.sleep_ms(300)
+    _pause_with_yaw_hold(_TARGET_HEADING, 100)
     _encoder_reset()
 
     # ── 导航到 supplies 固定坐标 ──
@@ -1279,9 +1313,7 @@ def main():
         _safe_return_and_exit()
         return
 
-    # ── [Fix 2] 步骤间停顿与重置 ──
-    stop_all()
-    time.sleep_ms(300)
+    _pause_with_yaw_hold(_TARGET_HEADING, 100)
     _encoder_reset()
 
     # ── 执行物资区之字形搜索（包含最多 5 次的前移重搜） ──
@@ -1302,8 +1334,7 @@ def main():
         cycle += 1
         print("\n  [CYCLE] === 第 {} 轮工作开始 ===".format(cycle))
 
-        stop_all()
-        time.sleep_ms(300)
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
         # ① 靠近目标（支持手动拨 SW2 旁路直接向下运行）
@@ -1313,8 +1344,7 @@ def main():
                 break
             continue
 
-        stop_all()
-        time.sleep_ms(300)
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
         # ② 全速前进至 UWB X 距离达标后停车并倒退
@@ -1324,8 +1354,7 @@ def main():
                 break
             continue
 
-        stop_all()
-        time.sleep_ms(300)
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
         # ── 后退完成后发送转向蓝牙信号（SW2 拨码同样支持手动旁路） ──
@@ -1361,10 +1390,12 @@ def main():
         else:
             try:
                 bt.turn_left()
+                target_heading = _lock_yaw()
                 print("  [CYCLE] turn_left 指令已发出，等待从车 ok（兜底 {}s）...".format(BT_WAIT_DEADLINE_S))
                 bt_wait_start = time.ticks_ms()
                 while True:
                     pet_watchdog()
+                    _maintain_yaw(target_heading)  # 等待期间持续修正航向
                     if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
                         print("  [CYCLE] 等待从车 ok 兜底超时 ({}s)，继续执行".format(BT_WAIT_DEADLINE_S))
                         bt_success = True
@@ -1388,8 +1419,7 @@ def main():
                 break
             continue
 
-        stop_all()
-        time.sleep_ms(300)
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
         # ③ 重新导航回到 supplies 固定起点坐标
@@ -1397,8 +1427,7 @@ def main():
             print("  [CYCLE] 导航到 supplies 全部重试失败，退出主循环...")
             break
 
-        stop_all()
-        time.sleep_ms(300)
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
         # ④ 再次进行复合物资区重试搜索
@@ -1423,8 +1452,7 @@ def _retry_goto_supplies():
         if attempt > 0:
             print("  [GOTO] 导航到 supplies 失败，第 {}/{} 次重试...".format(
                 attempt + 1, SUPPLIES_RETRY_MAX))
-            stop_all()
-            time.sleep_ms(500)
+            _pause_with_yaw_hold(_TARGET_HEADING, 500)
             _encoder_reset()
         if _action_goto_supplies_startup():
             return True
@@ -1436,16 +1464,14 @@ def _goto_and_search_supplies():
     """中间步骤失败后的恢复：导航回 supplies 并执行物资区搜索。
     返回 True=找到目标可继续下一轮, False=搜索枯竭应返 origin"""
     print("\n  [RECOVER] 中间步骤中断，尝试返回 supplies 继续搜索...")
-    stop_all()
-    time.sleep_ms(300)
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
     _encoder_reset()
 
     if not _retry_goto_supplies():
         print("  [RECOVER] 无法导航到 supplies")
         return False
 
-    stop_all()
-    time.sleep_ms(300)
+    _pause_with_yaw_hold(_TARGET_HEADING, 100)
     _encoder_reset()
 
     found = _execute_supplies_search_flow()
@@ -1461,8 +1487,7 @@ def _safe_return_and_exit():
     导航回到 origin 点，清空硬件资源，关闭所有后台定时器，安全退回到 REPL。
     """
     print("\n  [RTN] ➔ 正在返航...")
-    stop_all()
-    time.sleep_ms(300)
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
     _encoder_reset()
     
     _action_return_to_origin()

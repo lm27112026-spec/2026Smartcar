@@ -87,7 +87,10 @@ class UWBPosition:
     OUTLIER_XY_CM = 30.0      # XY 突变阈值 (cm)
     OUTLIER_RAW_XY_CM = 45.0  # 原始数据突变阈值 (cm)
 
-    TIMEOUT_MS = 800
+    TIMEOUT_MS = 2000             # 从 800ms 放宽到 2000ms，避免短暂 EMI/噪声爆发误判断连
+    RAW_TIMEOUT_MS = 5000         # 原始UART数据超时 (ms) — 区分"硬件断连"与"数据帧校验拒绝"
+    OUTLIER_STALE_MS = 500        # 参考值过期阈值 (ms) — 超过此时间跳过突变检测，打破拒绝死锁
+    
     STORE_DISTANCE_CM = 10.0  
     
     # [Fix 2] 防止 location 数组过大导致内存溢出 (OOM)，设置最大缓存上限
@@ -132,6 +135,9 @@ class UWBPosition:
 
         # ── 运行时间与诊断 ──
         self._last_data_ticks = time.ticks_ms()
+        self._last_rx_ticks = time.ticks_ms()     # UART原始字节活跃时间戳 (区分硬件断连)
+        self._last_raw_ticks = 0                  # Layer1 参考值更新时间戳
+        self._last_valid_ticks = 0                # Layer2 参考值更新时间戳
         self._timeout_stopped = False
         self._timeout_start_ms = 0     
         self._frame_count = 0
@@ -188,6 +194,7 @@ class UWBPosition:
             raw = self._uart.read(self._uart.any())
             if raw:
                 self._uart_rx_count += len(raw)
+                self._last_rx_ticks = time.ticks_ms()  # 记录原始UART活跃时间，即使帧被校验拒绝
                 for i in range(len(raw)):
                     b = raw[i]
 
@@ -207,14 +214,18 @@ class UWBPosition:
                         self._rx_line = bytearray()
         else:
             if self._step_count > 0 and self._step_count % 200 == 0:
-                print("[diag] step={} frame={} uart_bytes={} rx_total={} rej_raw={} rej_med={}".format(
+                rx_age = time.ticks_diff(time.ticks_ms(), self._last_rx_ticks)
+                print("[diag] step={} frame={} uart_bytes={} rx_total={} rx_age={}ms rej_raw={} rej_med={}".format(
                     self._step_count, self._frame_count,
                     self._uart.any() if self._uart else -1,
-                    self._uart_rx_count,
+                    self._uart_rx_count, rx_age,
                     self._reject_raw_jump, self._reject_med_jump))
 
         self._step_count += 1
-        if self._step_count % 200 == 0:
+        if self._step_count % 500 == 0:  # 从200延长到500，降低GC频率减少UART数据丢失风险
+            uart_pending = self._uart.any() if self._uart else 0
+            if uart_pending > 32:
+                print("[diag] GC with uart_pending={} — possible buffer pressure".format(uart_pending))
             gc.collect()
         return True
 
@@ -235,28 +246,34 @@ class UWBPosition:
         if self._target_anchor is not None and str(anchor) != self._target_anchor:
             return
 
-        # ── 第 1 层：原始值跳变检测 ──
+        # ── 第 1 层：原始值跳变检测（参考值过期则跳过，打破拒绝死锁） ──
         if self._last_raw_x is not None:
-            if abs(x_cm - self._last_raw_x) > self.OUTLIER_RAW_XY_CM or \
-               abs(y_cm - self._last_raw_y) > self.OUTLIER_RAW_XY_CM:
-                self._reject_raw_jump += 1
-                return  # 跳变过大拒绝本帧
+            raw_stale = time.ticks_diff(time.ticks_ms(), self._last_raw_ticks) > self.OUTLIER_STALE_MS
+            if not raw_stale:
+                if abs(x_cm - self._last_raw_x) > self.OUTLIER_RAW_XY_CM or \
+                   abs(y_cm - self._last_raw_y) > self.OUTLIER_RAW_XY_CM:
+                    self._reject_raw_jump += 1
+                    return  # 跳变过大拒绝本帧
         # [Fix 1] 此处不再直接赋值原始参考值，而是将赋值移至所有检测通过（L285 附近）
 
         # ── [Fix 3] 第 2 层：在数据污染中值滤波器前，先用原始值完成基于最后有效帧的突变检测 ──
         # 此处适当放宽 1.2 倍阈值作为补偿
+        # [Fix 9] 参考值过期保护：若上一有效帧超过 OUTLIER_STALE_MS，跳过突变检测
         if self._last_valid_d is not None:
-            if abs(d_cm - self._last_valid_d) > self.OUTLIER_DIST_CM * 1.2:
-                self._reject_med_jump += 1
-                return  
-            if abs(x_cm - self._last_valid_x) > self.OUTLIER_XY_CM * 1.2 or \
-               abs(y_cm - self._last_valid_y) > self.OUTLIER_XY_CM * 1.2:
-                self._reject_med_jump += 1
-                return  
+            valid_stale = time.ticks_diff(time.ticks_ms(), self._last_valid_ticks) > self.OUTLIER_STALE_MS
+            if not valid_stale:
+                if abs(d_cm - self._last_valid_d) > self.OUTLIER_DIST_CM * 1.2:
+                    self._reject_med_jump += 1
+                    return  
+                if abs(x_cm - self._last_valid_x) > self.OUTLIER_XY_CM * 1.2 or \
+                   abs(y_cm - self._last_valid_y) > self.OUTLIER_XY_CM * 1.2:
+                    self._reject_med_jump += 1
+                    return  
 
         # [Fix 1] 校验全通过，安全地更新 Layer 1 参考基准，防止误杀
         self._last_raw_x = x_cm
         self._last_raw_y = y_cm
+        self._last_raw_ticks = time.ticks_ms()  # [Fix 9] 记录参考值更新时间
 
         self._frame_count += 1
         self._last_data_ticks = time.ticks_ms()
@@ -289,6 +306,7 @@ class UWBPosition:
         self._last_valid_d = d_med
         self._last_valid_x = x_med
         self._last_valid_y = y_med
+        self._last_valid_ticks = time.ticks_ms()  # [Fix 9] 记录有效帧时间戳，供Layer2过期判断
 
         # ── 更新对外的当前坐标 ──
         self._current_x = self._x_filt
@@ -364,14 +382,23 @@ class UWBPosition:
         """[Fix 7] 纯只读属性查询方法，不再掺杂状态改变的副作用"""
         return time.ticks_diff(time.ticks_ms(), self._last_data_ticks) > self.TIMEOUT_MS
 
+    def is_uart_alive(self):
+        """[Fix 9] 检查UART硬件层是否仍有数据流入。
+        用于区分'硬件真正断连'与'数据帧校验拒绝'两种场景。
+        若UART仍有字节流入但is_timeout()为True，说明是校验层问题而非硬件断连。"""
+        return time.ticks_diff(time.ticks_ms(), self._last_rx_ticks) <= self.RAW_TIMEOUT_MS
+
     def _handle_timeout(self, now_ms):
         """[Fix 7] 剥离出的超时动作处理内部私有方法"""
         if not self._timeout_stopped:
             self._timeout_stopped = True
             self._timeout_start_ms = now_ms
             uart_bytes = self._uart.any() if self._uart else -1
-            print("UWBPosition: timeout — uart_bytes={} frame={}".format(
-                uart_bytes, self._frame_count))
+            rx_age = time.ticks_diff(now_ms, self._last_rx_ticks)
+            alive = "UART_ALIVE" if self.is_uart_alive() else "UART_DEAD"
+            print("UWBPosition: timeout — uart_bytes={} frame={} rx_age={}ms {} rej={}/{}".format(
+                uart_bytes, self._frame_count, rx_age, alive,
+                self._reject_raw_jump, self._reject_med_jump))
 
     def get_frame_count(self):
         return self._frame_count
@@ -415,6 +442,9 @@ class UWBPosition:
         self._uart.init(baudrate=115200, bits=8, parity=None, stop=1)
         self._rx_line = bytearray()
         self._last_data_ticks = time.ticks_ms()
+        self._last_rx_ticks = time.ticks_ms()     # 重置UART活跃时间戳
+        self._last_raw_ticks = 0
+        self._last_valid_ticks = 0
         self._timeout_stopped = False
         self._timeout_start_ms = 0
         self._reject_raw_jump = 0
