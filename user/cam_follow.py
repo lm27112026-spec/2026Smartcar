@@ -19,20 +19,20 @@ from motor import stop_all, reset_wheel_pi
 #  跟踪参数
 # ═══════════════════════════════════════════════════════════════
 
-DIST       = 3          # 期望距离 (cm)  纵向目标
-E_X        = 5           # 期望横向距离 (cm)  正=偏左目标
+DIST       = 6          # 期望距离 (cm)  纵向目标
+E_X        = -0.1           # 期望横向距离 (cm)  正=偏左目标
 
 # ── 外环 PID 增益 ──
-PX  = 0.05                # 横向 P  (x_err → vy)
-IX  = 0.003                # 横向 I
+PX  = 0.08                # 横向 P  (x_err → vy)
+IX  = 0.04                # 横向 I
 DX  = 0.01                # 横向 D
 
-PY  = 0.05                 # 纵向 P  (y_err → vx)
-IY  = 0.003                # 纵向 I
+PY  = 0.03                 # 纵向 P  (y_err → vx)
+IY  = 0.0010                # 纵向 I
 DY  = 0.01                # 纵向 D
 
 # ── 死区 + 刹车带 ──
-DX0 = 0.5                  # 横向死区 (cm)  |x|<DX0 → 冻结PID/输出0
+DX0 = 0.3                  # 横向死区 (cm)  |x|<DX0 → 冻结PID/输出0
 DY0 = 0.5                  # 纵向死区 (cm)  |y|<DY0 → 冻结PID/输出0
 BX  = 1.0                  # 横向刹车带宽 (cm)  区间 DX0~DX0+BX → smoothstep
 BY  = 1.0                  # 纵向刹车带宽 (cm)  区间 DY0~DY0+BY → smoothstep
@@ -54,8 +54,8 @@ I_BUF  = 50                     # PID内部积分缓冲
 
 # ── 对齐 & 到达 ──
 ALGN_X = 1.0               # 横向对齐阈值 (cm)
-ALGN_Y = 1.0               # 纵向对齐阈值 (cm)
-ARRIV  = 2.0               # 到达判定 (cm) — 宽松于ALGN_Y，防主状态机前抢停
+ALGN_Y = 2.0               # 纵向对齐阈值 (cm)
+ARRIV  = 3.0               # 到达判定 (cm) — 宽松于ALGN_Y，防主状态机前抢停
 
 # ── 丢失 & 周期 ──
 LOST_T = 500               # 丢失超时 (ms)
@@ -246,4 +246,6 @@ def compute_control(x_cm, dist_cm, has_tgt, now_ms=None, dt=None):
         stop_all()
 
     return out
+
+
 

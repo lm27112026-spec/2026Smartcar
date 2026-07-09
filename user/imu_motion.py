@@ -207,8 +207,8 @@ def update_angle(ax, ay, az, gx, gy, gz):
 MAX_WZ_DPS = 384.0  # 标定值：wz=0.3 时实测 115.3 dps → 115.3/0.3 = 384
 
 # 角速度闭环 PID（工作在 dps 空间）
-ANG_VEL_KP = 0.6          # P 增益（从 0.5 调高，加快响应）
-ANG_VEL_KI = 0.6          # I 增益（从 0.3 调高，更快消除静差）
+ANG_VEL_KP = 0.4          # P 增益（从 0.5 调高，加快响应）
+ANG_VEL_KI = 0.01          # I 增益（从 0.3 调高，更快消除静差）
 ANG_VEL_KD = 0.0
 ANG_VEL_FF = 0.92         # 前馈系数（从 0.85 调高，正转偏低的问题）
 ANG_VEL_OUTPUT_LIMIT = 300   # PID 输出限幅 (dps)
