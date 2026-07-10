@@ -1,12 +1,27 @@
 """
-motor.py - 电机与编码器硬件抽象层
-【层】硬件抽象层
-【功能】
-  - 4 路 PWM + 方向引脚 → 驱动 4 个全向轮电机
-  - 4 路编码器读取（smartcar.encoder）→ 获取各轮转速
-【依赖】smartcar 库（encoder 类）、seekfree 库
-【使用】
-  from motor import set_motor, omni_drive, get_encoder_speeds
+motor.py — 电机与编码器硬件抽象层
+【层】硬件抽象层（HAL）
+【职责】4 路 PWM + 方向引脚驱动全向轮，4 路编码器速度采集，前馈 + PI 闭环控制
+
+── API ──
+  读编码器:
+    get_encoder_counts()          → [int×4] 脉冲增量
+    get_encoder_speeds(dt)        → [float×4] 原始速度 m/s
+    get_encoder_speeds_filtered(dt)→ [float×4] 低通滤波速度 m/s
+  驱动:
+    set_motor(motor_tuple, duty)   → 单轮 PWM + 方向控制
+    omni_drive(vx, vy, wz[, max])  → 开环全向驱动（无速度反馈）
+    omni_drive_closed_loop(vx,vy,wz,actual,dt) → 闭环前馈+PI驱动
+  工具:
+    omni_kinematics(vx, vy, wz)    → [float×4] 归一化轮速比
+    stop_all()                     → 急停
+    reset_wheel_pi()               → 清零 4 轮 PI 积分
+    reset_encoder_filter()         → 重置速度滤波器
+
+── 内部常量（模块级共享）──
+  MAX_SPEED_MPS[4], PWM_PER_MPS[4], MIN_PWM[4], MOTOR_LF/RF/LB/RB
+
+【依赖】machine, smartcar (encoder), seekfree, pid.PID
 """
 
 import gc, time, math
@@ -17,7 +32,6 @@ from smartcar import ticker
 from smartcar import encoder
 from pid import PID
 
-ANG_OFFSET = 0.0
 MAX_PWM = 50000
 LED_PIN = 'C4'
 SWITCH2_PIN = 'D9'
@@ -26,7 +40,7 @@ SWITCH2_PIN = 'D9'
 # ⚠ 实测编码器在轮轴侧（减速后），PPR=7，无减速比倍乘
 #   7 脉冲/轮圈 ÷ (π × 0.05m/轮圈) = 44.6 脉冲/米
 #   各轮独立标定方法：让车轮空转 N 圈 → total_pulses / (N * 0.1571)
-ENC_SCALE = [1625, 2032, 1903, 1683]  # [rf, lf, lb, rb] — 2026-06-28 实跑 0.155m 重标定
+ENC_SCALE = [840, 833, 853, 817]  # [lf, rf, lb, rb] — 校准脚本用此值，与 MAX_SPEED / PWM_PER_MPS 一致
 
 # ============================================================
 #  一、编码器引脚定义 & 初始化
@@ -49,38 +63,68 @@ encoder_lb = encoder(ENCODER_LB_A, ENCODER_LB_B)
 encoder_rb = encoder(ENCODER_RB_A, ENCODER_RB_B)
 
 
-enc_ticker = ticker(1) 
-# 将四个编码器统统挂载到定时器的自动采集列表上
-enc_ticker.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-# 启动定时器，底层开始以 10ms 为周期疯狂帮你采集数据
-enc_ticker.start(10)
-
 def get_encoder_counts():
     """
-    返回 4 个编码器脉冲增量 [rf, lf, lb, rb]
+    返回 4 个编码器脉冲增量 [lf, rf, lb, rb]
     每次调用返回自上次 get() 以来的脉冲变化量，停止时为 0
     """
-    encoder_rf.capture()
     encoder_lf.capture()
+    encoder_rf.capture()
     encoder_lb.capture()
     encoder_rb.capture()
 
-    return [encoder_rf.get(), encoder_lf.get(), encoder_lb.get(), encoder_rb.get()]
+    return [encoder_lf.get(), encoder_rf.get(), encoder_lb.get(), encoder_rb.get()]
 
 
 def get_encoder_speeds(dt):
     """
-    返回 4 个编码器转速（米/秒）[rf, lf, lb, rb]
+    返回 4 个编码器转速（米/秒）[lf, rf, lb, rb]
     dt: 采样间隔（秒），应与主控制循环周期一致
     """
     counts = get_encoder_counts()
     return [c / ENC_SCALE[i] / dt for i, c in enumerate(counts)]
 
 
-def reset_encoders():
-    """空函数（保留接口兼容，encoder.get() 自带增量特性无需清零）"""
-    pass
+def get_chassis_speeds(dt):
+    """
+    正运动学：通过读取编码器，推算底盘当前的实际线速度 (vx, vy)。
+    返回: (vx, vy) 单位 m/s (基于车体坐标系)
+    
+    依据 omni_kinematics 逆解公式反推：
+      w_rf =  vx - vy + wz
+      w_lf = -vx - vy + wz
+      w_lb = -vx + vy + wz
+      w_rb =  vx + vy + wz
+    假设纯平移 (wz≈0)，正解：
+      vx = (w_rf - w_lf - w_lb + w_rb) / 4.0
+      vy = (-w_rf - w_lf + w_lb + w_rb) / 4.0
+    """
+    counts = get_encoder_counts()
+    
+    # 将脉冲转换为各个轮子的线速度 (m/s)
+    w_lf = counts[0] / ENC_SCALE[0] / dt if ENC_SCALE[0] != 0 else 0
+    w_rf = counts[1] / ENC_SCALE[1] / dt if ENC_SCALE[1] != 0 else 0
+    w_lb = counts[2] / ENC_SCALE[2] / dt if ENC_SCALE[2] != 0 else 0
+    w_rb = counts[3] / ENC_SCALE[3] / dt if ENC_SCALE[3] != 0 else 0
 
+    vx = (w_rf - w_lf - w_lb + w_rb) / 4.0
+    vy = (-w_rf - w_lf + w_lb + w_rb) / 4.0
+    
+    return vx, vy
+
+
+def get_chassis_speeds_from_raw(wheel_speeds):
+    """
+    正运动学纯函数版本：从已计算的 4 轮速度直接推底盘 vx, vy。
+    wheel_speeds: [w_lf, w_rf, w_lb, w_rb] 单位 m/s
+    返回: (vx, vy) 单位 m/s (基于车体坐标系)
+    
+    用于 goto_location 中避免重复读取编码器（与驱动闭环共享同一组编码器计数）。
+    """
+    w_lf, w_rf, w_lb, w_rb = wheel_speeds
+    vx = (w_rf - w_lf - w_lb + w_rb) / 4.0
+    vy = (-w_rf - w_lf + w_lb + w_rb) / 4.0
+    return vx, vy
 
 # ============================================================
 #  二-a、编码器速度滤波（一阶低通）
@@ -92,7 +136,7 @@ SPD_FILTER_ALPHA = 0.4
 
 def get_encoder_speeds_filtered(dt):
     """
-    返回低通滤波后的 4 轮速度 [rf, lf, lb, rb]（米/秒）
+    返回低通滤波后的 4 轮速度 [lf, rf, lb, rb]（米/秒）
     第一次调用直接返回原始值，后续做一阶低通
     """
     global _prev_spd, _spd_first
@@ -118,14 +162,15 @@ def reset_encoder_filter():
 #  二-b、闭环驱动（前馈 + PI 反馈）
 # ============================================================
 WHEEL_PI = [
-    PID(kp=40000, ki=0, kd=0.0, integral_limit=5000, output_limit=MAX_PWM)
+    PID(kp=25000, ki=5000, kd=0.00, integral_limit=5000, output_limit=MAX_PWM)
     for _ in range(4)
 ]
 
-SPD_DEADBAND = 0.005           # 5mm/s 以下视为静止，清零积分
+SPD_DEADBAND = 0.05            # 5cm/s 以下视为静止（防 PID 低目标速度极限环震荡）
 
-MAX_SPEED_MPS = [0.425, 0.431, 0.437, 0.424]  # [rf, lf, lb, rb] — (MAX_PWM-MIN_PWM)/PWM_PER_MPS
-PWM_PER_MPS   = [105985, 104300, 102874, 106076]  # [rf, lf, lb, rb] — 2026-06-11 04标定
+
+MAX_SPEED_MPS = [1.771, 1.803, 1.768, 1.700]  # [lf, rf, lb, rb] — 架空校准实测 (2026-06-30)
+PWM_PER_MPS   = [28226, 27730, 28282, 29410]
 
 
 def reset_wheel_pi():
@@ -133,17 +178,24 @@ def reset_wheel_pi():
     for pi in WHEEL_PI:
         pi.reset()
 
-# 新增电机死区补偿参数（需要实测，填入电机刚开始转动的最小 PWM）
-MIN_PWM_POS = 5000   # 正转起步 PWM（后轮需要更大死区补偿）
-MIN_PWM_NEG = 5000   # 反转起步 PWM（前轮反转超速，降低死区补偿）
+# 各轮死区补偿（PWM阈值，电机刚开始转动的最小占空比）
+# [lf, rf, lb, rb] — 实测值，正反转取均值
+MIN_PWM = [8600, 6100, 8300, 9700]          # 死区扫描实测 (2026-06-30): 正反转均值取整
 
 # 闭环控制函数：根据目标速度和实际速度计算 PWM 输出
 def omni_drive_closed_loop(vx, vy, wz, actual_speeds, dt):
-    # 运动学解算获取各轮目标速度 (米/秒)
+    # 运动学解算获取各轮基础倍率
     norms = omni_kinematics(vx, vy, wz)
-    motor_list = [MOTOR_RF, MOTOR_LF, MOTOR_LB, MOTOR_RB]
+    
+    # 若合成速度超限，等比缩放（保持方向不变）
+    max_norm = max(abs(n) for n in norms)
+    if max_norm > 1.0:
+        norms = [n / max_norm for n in norms]
+        
+    motor_list = [MOTOR_LF, MOTOR_RF, MOTOR_LB, MOTOR_RB]
 
     for i in range(4):
+        # 此时 target_mps 绝不会超过该轮的 MAX_SPEED_MPS
         target_mps = norms[i] * MAX_SPEED_MPS[i]
 
         # 速度死区：指令极小时直接刹车，清空 PID
@@ -152,13 +204,13 @@ def omni_drive_closed_loop(vx, vy, wz, actual_speeds, dt):
             set_motor(motor_list[i], 0)
             continue
 
-        # 【核心改进】：前馈计算引入死区补偿
+        # 前馈计算引入死区补偿
         if target_mps > 0:
-            feedforward = MIN_PWM_POS + (target_mps * PWM_PER_MPS[i])
+            feedforward = MIN_PWM[i] + (target_mps * PWM_PER_MPS[i])
         else:
-            feedforward = -MIN_PWM_NEG + (target_mps * PWM_PER_MPS[i])
+            feedforward = -MIN_PWM[i] + (target_mps * PWM_PER_MPS[i])
 
-        # PID 反馈修正 (基于重构后的 pid.py)
+        # PID 反馈修正
         correction = WHEEL_PI[i].compute(target_mps, actual_speeds[i], dt)
         
         # 总输出 = 基础前馈 + 反馈动态调整
@@ -177,7 +229,7 @@ def omni_kinematics(vx, vy, wz):
     w_lf = -vx - vy + wz
     w_lb = -vx + vy + wz
     w_rb =  vx + vy + wz
-    return [w_rf, w_lf, w_lb, w_rb]
+    return [w_lf, w_rf, w_lb, w_rb]
 
 
 
@@ -205,17 +257,10 @@ def omni_drive(vx, vy, wz, max_pwm=MAX_PWM):
     if max_speed > 1.0:
         scale = 1.0 / max_speed
     pwm_vals = [int(s * scale * max_pwm) for s in speeds]
-    set_motor(MOTOR_RF, pwm_vals[0])
-    set_motor(MOTOR_LF, pwm_vals[1])
+    set_motor(MOTOR_LF, pwm_vals[0])
+    set_motor(MOTOR_RF, pwm_vals[1])
     set_motor(MOTOR_LB, pwm_vals[2])
     set_motor(MOTOR_RB, pwm_vals[3])
-
-
-def omni_move_by_angle(speed, angle_deg, rotation=0, max_pwm=MAX_PWM):
-    rad = math.radians(angle_deg)
-    vx = speed * math.sin(rad)
-    vy = speed * math.cos(rad)
-    omni_drive(vx, vy, rotation, max_pwm)
 
 # ============================================================
 #  四、硬件初始化（PWM + 方向引脚）
@@ -247,16 +292,6 @@ MOTOR_RF = (pwm_4, pin_d6,  pin_d7)   # C26 + D6/D7
 MOTOR_LB = (pwm_2, pin_c30, pin_c31)  # C20 + C30/C31
 MOTOR_RB = (pwm_1, pin_c28, pin_c29)  # B26 + C28/C29
 
-def pause_encoder_ticker():
-    """暂停编码器自动采集 — 用于手动接管编码器读取的模块调用。
-    调用者必须在完成后调用 resume_encoder_ticker() 恢复。"""
-    enc_ticker.stop()
-
-def resume_encoder_ticker():
-    """恢复编码器自动采集（10ms 周期）。"""
-    enc_ticker.start(10)
-
-
 def stop_all():
     """急停：所有电机方向引脚置 0，PWM 置 0"""
     for pin in (pin_c28, pin_c29, pin_c30, pin_c31, pin_d4, pin_d5, pin_d6, pin_d7):
@@ -267,5 +302,4 @@ def stop_all():
 
 # 导入完成后立即强制停机一次
 stop_all()
-
 

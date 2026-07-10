@@ -1,8 +1,7 @@
 """
-motor_test.py — 6 方向全向运动开环测试
-【功能】逐一测试 6 个基本运动方向（前进/后退/左移/右移/左自转/右自转）
-        开环 PWM 驱动，无需编码器，直接观察小车运动方向
-【用法】将小车放在地面，运行脚本观察每段运动方向是否正确
+motor_test.py — 4 电机正反转逐个测试
+【功能】依次驱动每个电机：正转 2s → 停 0.5s → 反转 2s → 停 0.5s
+【用法】将小车架空（轮子悬空），运行此脚本，观察每个轮子是否正常正反转
 【安全】拨码开关 D9 随时中止
 """
 import time
@@ -13,7 +12,7 @@ from seekfree import *
 time.sleep_ms(100)
 
 print("=" * 60)
-print("  6-Direction Omni Motion Test")
+print("  Motor Test — 4 电机正反转逐个测试")
 print("=" * 60)
 print("  REAL TYPE    : " + BOARD_TYPE)
 print("  BOARD VERSION: " + BOARD_VERSION)
@@ -24,7 +23,7 @@ SWITCH2_PIN = 'D9'
 switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()
 
-# ── 电机引脚定义（TB6612）───────────────────────────────────
+# ── 电机引脚定义（TB6612，与 motor.py 完全一致）─────────────
 # 电机位置     PWM脚      方向A      方向B      电机编号
 # 左前 (LF)    C24        D4         D5         M3
 # 右前 (RF)    C26        D6         D7         M4
@@ -45,10 +44,14 @@ pin_c31 = Pin("C31", Pin.OUT, value=0)
 pin_c28 = Pin("C28", Pin.OUT, value=0)
 pin_c29 = Pin("C29", Pin.OUT, value=0)
 
+# 电机元组 (PWM, 方向A, 方向B)
 MOTOR_LF = (pwm_lf, pin_d4,  pin_d5)
 MOTOR_RF = (pwm_rf, pin_d6,  pin_d7)
 MOTOR_LB = (pwm_lb, pin_c30, pin_c31)
 MOTOR_RB = (pwm_rb, pin_c28, pin_c29)
+
+MOTOR_LIST  = [MOTOR_LF, MOTOR_RF, MOTOR_LB, MOTOR_RB]
+MOTOR_NAMES = ['LF (左前 M3)', 'RF (右前 M4)', 'LB (左后 M2)', 'RB (右后 M1)']
 
 # ── 电机控制函数 ────────────────────────────────────────────
 def set_motor(motor, duty_val):
@@ -68,107 +71,71 @@ def set_motor(motor, duty_val):
         pwm.duty_u16(0)
 
 def stop_all():
-    for m in (MOTOR_LF, MOTOR_RF, MOTOR_LB, MOTOR_RB):
+    for m in MOTOR_LIST:
         set_motor(m, 0)
 
-# ── 全向运动学（开环）───────────────────────────────────────
-MAX_PWM = 50000
-
-def omni_kinematics(vx, vy, wz):
-    """逆运动学：底盘速度 → 四轮归一化速度比"""
-    w_rf =  vx - vy + wz
-    w_lf = -vx - vy + wz
-    w_lb = -vx + vy + wz
-    w_rb =  vx + vy + wz
-    return [w_lf, w_rf, w_lb, w_rb]
-
-def omni_drive(vx, vy, wz, max_pwm=MAX_PWM):
-    """开环全向驱动：直接根据 vx,vy,wz 计算 PWM 输出"""
-    speeds = omni_kinematics(vx, vy, wz)
-    max_speed = max(abs(s) for s in speeds)
-    scale = 1.0
-    if max_speed > 1.0:
-        scale = 1.0 / max_speed
-    pwm_vals = [int(s * scale * max_pwm) for s in speeds]
-    set_motor(MOTOR_LF, pwm_vals[0])
-    set_motor(MOTOR_RF, pwm_vals[1])
-    set_motor(MOTOR_LB, pwm_vals[2])
-    set_motor(MOTOR_RB, pwm_vals[3])
-
 # ── 测试参数 ────────────────────────────────────────────────
-SPEED  = 1       # 平移速度比例 (0~1)
-TURN   = 0.3       # 旋转速度比例 (0~1)
-MAX_PWM_RUN = 50000 # 运行 PWM 上限
-RUN_TIME = 3000     # 每段运行 ms
-PAUSE    = 1000     # 段间暂停 ms
-
-# ── 六向测试序列 ────────────────────────────────────────────
-SEQUENCE = [
-    ("前进 ↑",     SPEED,  0,      0,      "四轮同向转动，车体向前"),
-    ("后退 ↓",    -SPEED,  0,      0,      "四轮同向转动，车体向后"),
-    ("右移 →",     0,       SPEED,  0,      "对角轮对转，车体右移"),
-    ("左移 ←",     0,      -SPEED,  0,      "对角轮对转，车体左移"),
-    ("左自转 ↺",   0,       0,      TURN,   "四轮同向，车体逆时针转"),
-    ("右自转 ↻",   0,       0,     -TURN,   "四轮同向，车体顺时针转"),
-]
-
-LOOP = True  # True=循环, False=跑一轮
+TEST_DUTY = 20000       # PWM 占空比 (~30%)
+FWD_TIME  = 2000        # 正转时长 ms
+REV_TIME  = 2000        # 反转时长 ms
+PAUSE     = 500         # 段间暂停 ms
 
 print("-" * 60)
-print("  测试参数: SPEED={:.2f}  TURN={:.2f}  PWM_MAX={}".format(SPEED, TURN, MAX_PWM_RUN))
-print("  每段运行 {}s，间隔 {}s".format(RUN_TIME / 1000, PAUSE / 1000))
+print("  测试参数: PWM={} (~{:.0f}%)".format(TEST_DUTY, TEST_DUTY / 65535 * 100))
+print("  请将小车架空，确保轮子可以自由转动")
 print("  拨动 SW2 (D9) 可随时中止")
 print("-" * 60)
 print("")
 
-# ── 测试主循环 ──────────────────────────────────────────────
-stop_all()
-round_num = 0
-
-while True:
-    round_num += 1
-    print("=" * 60)
-    print("  Round {}".format(round_num))
-    print("=" * 60)
-
-    for name, vx, vy, wz, desc in SEQUENCE:
-        if switch2.value() != state2:
-            print("\n  [SW2] 用户中止。")
-            stop_all()
-            raise SystemExit
-
-        print("")
-        print("  ── [{}] {} ──".format(name, desc))
-        print("  vx={:+.2f}  vy={:+.2f}  wz={:+.2f}".format(vx, vy, wz))
-
-        # 驱动电机
-        omni_drive(vx, vy, wz, MAX_PWM_RUN)
-        start = time.ticks_ms()
-
-        while time.ticks_diff(time.ticks_ms(), start) < RUN_TIME:
-            if switch2.value() != state2:
-                print("  [SW2] 中止。")
-                stop_all()
-                raise SystemExit
-            time.sleep_ms(100)
-
-        # 停车 + 暂停
-        stop_all()
-        print("  -> 停车，暂停 {}s...".format(PAUSE / 1000))
-
-        pause_start = time.ticks_ms()
-        while time.ticks_diff(time.ticks_ms(), pause_start) < PAUSE:
-            if switch2.value() != state2:
-                print("  [SW2] 中止。")
-                stop_all()
-                raise SystemExit
-            time.sleep_ms(100)
-
-    print("")
-    if not LOOP:
+# ── 测试流程 ────────────────────────────────────────────────
+for i in range(4):
+    if switch2.value() != state2:
+        print("\n  [SW2] 用户中止。")
         break
+
+    motor = MOTOR_LIST[i]
+    name  = MOTOR_NAMES[i]
+
+    print("=" * 60)
+    print("  [{}] {}".format(i + 1, name))
+    print("=" * 60)
+
+    # ── 正转 ──
+    print("  正转 +{} duty，持续 {}s...".format(TEST_DUTY, FWD_TIME / 1000))
+    set_motor(motor, TEST_DUTY)
+    start = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), start) < FWD_TIME:
+        if switch2.value() != state2:
+            break
+        time.sleep_ms(100)
+    set_motor(motor, 0)
+    time.sleep_ms(PAUSE)
+    print("  -> 正转结束。")
+
+    # ── 反转 ──
+    print("  反转 -{} duty，持续 {}s...".format(TEST_DUTY, REV_TIME / 1000))
+    set_motor(motor, -TEST_DUTY)
+    start = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), start) < REV_TIME:
+        if switch2.value() != state2:
+            break
+        time.sleep_ms(100)
+    set_motor(motor, 0)
+    time.sleep_ms(PAUSE)
+    print("  -> 反转结束。")
+    print("")
+
+# ── 完成 ────────────────────────────────────────────────────
+stop_all()
 
 print("=" * 60)
 print("  测试完成！")
 print("=" * 60)
-stop_all()
+print("")
+print("  确认清单：")
+print("  [ ] LF (左前 M3) — 正转 √  反转 √")
+print("  [ ] RF (右前 M4) — 正转 √  反转 √")
+print("  [ ] LB (左后 M2) — 正转 √  反转 √")
+print("  [ ] RB (右后 M1) — 正转 √  反转 √")
+print("")
+print("=" * 60)
