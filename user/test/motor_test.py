@@ -96,7 +96,7 @@ def omni_drive(vx, vy, wz, max_pwm=MAX_PWM):
     set_motor(MOTOR_RB, pwm_vals[3])
 
 # ── 测试参数 ────────────────────────────────────────────────
-SPEED  = 0.30       # 平移速度比例 (0~1)
+SPEED  = 1       # 平移速度比例 (0~1)
 TURN   = 0.3       # 旋转速度比例 (0~1)
 MAX_PWM_RUN = 50000 # 运行 PWM 上限
 RUN_TIME = 3000     # 每段运行 ms
