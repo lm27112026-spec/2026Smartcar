@@ -24,9 +24,14 @@ HOLD_I_LIMIT  = 0.40     # 积分限幅（KI=0 时无效，保留兼容）
 
 
 class HeadingHold:
-    """IMU 偏航保持 P 控制器。"""
+    """IMU 偏航保持 P 控制器。
 
-    def __init__(self, imu: IMU,
+    两种使用模式:
+      1. 外部喂 yaw（main.py）:  HeadingHold() + hold.update(yaw, dt, deadband)
+      2. 内部自读 IMU（新）:      HeadingHold(imu) + hold.compute(dt)
+    """
+
+    def __init__(self, imu: IMU = None,
                  target_yaw_deg: float = 0.0,
                  kp: float = HOLD_KP, ki: float = HOLD_KI, kd: float = HOLD_KD,
                  deadband: float = HOLD_DEADBAND, wz_max: float = HOLD_WZ_MAX,
@@ -37,6 +42,7 @@ class HeadingHold:
         self._pid = PID(kp=kp, ki=ki, kd=kd,
                         integral_limit=integral_limit,
                         output_limit=wz_max)
+        self._yaw = 0.0  # 外部喂入的 yaw 缓存
 
     @property
     def target(self) -> float:
@@ -46,8 +52,23 @@ class HeadingHold:
         self._target = deg
         self._pid.reset()
 
+    def update(self, yaw: float, dt: float, deadband: float = None):
+        """外部喂入 yaw，计算航向修正 wz（main.py 兼容接口）。
+        返回 (wz, yaw, yaw_err)。"""
+        db = deadband if deadband is not None else self._deadband
+        raw_err = yaw - self._target
+        yaw_err = ((raw_err + 180) % 360) - 180
+
+        if abs(yaw_err) <= db:
+            return 0.0, yaw, yaw_err
+
+        wz = self._pid.compute(0.0, yaw_err, dt)
+        return wz, yaw, yaw_err
+
     def compute(self, dt: float):
-        """每帧调用：读 IMU → 算误差 → PID 输出 wz。返回 (wz, yaw, yaw_err)。"""
+        """内部自读 IMU → 算误差 → PID 输出 wz。返回 (wz, yaw, yaw_err)。"""
+        if self._imu is None:
+            raise RuntimeError("HeadingHold: imu 未传入，请使用 update() 外部喂 yaw")
         self._imu.update()
         _, _, yaw = self._imu.get_angles()
 
@@ -55,7 +76,6 @@ class HeadingHold:
         yaw_err = ((raw_err + 180) % 360) - 180
 
         if abs(yaw_err) <= self._deadband:
-            # 不 reset — 保留积分/微分状态，避免边界冷启动震荡
             return 0.0, yaw, yaw_err
 
         wz = self._pid.compute(0.0, yaw_err, dt)

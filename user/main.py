@@ -661,9 +661,9 @@ def see_and_push():
     def _lock_fn():
         return _lock_yaw()
 
-    def _wz_fn(target, deadband):
-        # 保持 100Hz (10ms) 的高响应航向更新
-        return _heading_correction(target, deadband=deadband, dt=0.01)
+    def _wz_fn(target):
+        # 保持 100Hz (10ms) 的高响应航向更新（deadband 由 IMU_hold 全局管理）
+        return _heading_correction(target, dt=0.01)
 
     def _abort_fn():
         pet_watchdog()
