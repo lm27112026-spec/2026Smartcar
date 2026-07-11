@@ -45,37 +45,12 @@ def _to_signed16(v):
 
 
 def y_to_distance(y):
-    """
-    返回摄像头 Y 坐标对应的实际距离
-    
-    参数:
-        y: 摄像头返回的 Y 坐标 (cm)
-    
-    返回:
-        float: 目标到摄像头的实际距离 (cm)
-    
-    说明:
-        摄像头协议: Y = 纵向距离 (单位: cm)
-        Y 已经是距离值，直接返回即可
-    """
+    """返回相机 Y 原始值 (cm)"""
     return y
 
-
 def x_to_cm(x):
-    """
-    将摄像头 X 坐标转换为 cm
-    
-    参数:
-        x: 摄像头返回的 X 值 (单位: mm)
-    
-    返回:
-        float: 横向偏移 (cm)
-    
-    说明:
-        X>0 → 目标在右侧
-        X<0 → 目标在左侧
-    """
-    return x / 10.0
+    """返回相机 X 原始值 (已由 _parse_frame ÷10, 单位 cm)"""
+    return x
 
 
 class CamDataReceiver:
@@ -268,49 +243,11 @@ class CamDataReceiver:
             self._uart.read()
         self._buf = bytearray()
 
-
-# ── 独立运行测试 ─────────────────────────────────────────────
-if __name__ == '__main__':
-    from machine import Pin
-    
-    switch2 = Pin('D9', Pin.IN, pull=Pin.PULL_UP_47K)
-    state2 = switch2.value()
-    
-    recv = CamDataReceiver(uart_id=7)
-    
-    print("=" * 50)
-    print("CamDataReceiver Test (Adapted Protocol)")
-    print("SW2 toggle = exit")
-    print("=" * 50)
-    
-    last_print_ms = time.ticks_ms()
-    
-    while True:
-        if switch2.value() != state2:
-            print("\n[EXIT] SW2 toggled.")
-            break
-        
-        data = recv.read()
-        if data is None:
-            continue
-        
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 200:
-            state = "TGT" if data['is_target'] else "---"
-            print("[#{:04d} {:s}] X:{:+7.1f} Y:{:6.1f} flag:{:02X} id:{:04X} line:{:+d}".format(
-                recv.frame_count, state, data['x'], data['y'], data['flag'], data['id'], data['line_flag']))
-            last_print_ms = now
-        
-        if recv.frame_count % 200 == 0 and recv.frame_count > 0:
-            print("--- stats: frames={:d}  target={:d}  lost={:d}  errors={:d} ---".format(
-                recv.frame_count, recv.target_count, recv.lost_count, recv.error_count))
-        
-        time.sleep_ms(1)
-    
-    print("\n" + "=" * 50)
-    print("Session summary:")
-    print("  Total frames  : {:d}".format(recv.frame_count))
-    print("  Target frames : {:d}".format(recv.target_count))
-    print("  Lost frames   : {:d}".format(recv.lost_count))
-    print("  Errors        : {:d}".format(recv.error_count))
-    print("=" * 50)
+    def deinit(self):
+        """释放 UART 资源（调用后方可被其他模块重新打开）"""
+        if self._uart is not None:
+            try:
+                self._uart.deinit()
+            except Exception:
+                pass
+            self._uart = None

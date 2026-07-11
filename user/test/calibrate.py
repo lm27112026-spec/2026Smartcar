@@ -9,17 +9,17 @@ import time
 from motor import (
     set_motor, stop_all, MOTOR_LF, MOTOR_RF, MOTOR_LB, MOTOR_RB,
     get_encoder_counts, get_encoder_speeds,
-    ENC_SCALE,
+    ENC_SCALE, enc_ticker,
 )
 
 switch2 = Pin('D9', Pin.IN, pull=Pin.PULL_UP_47K)
 state2  = switch2.value()
 
 MOTORS = [
-    ("LF", MOTOR_LF, 0),
-    ("RF", MOTOR_RF, 1),
-    ("LB", MOTOR_LB, 2),
-    ("RB", MOTOR_RB, 3),
+    ("LF", MOTOR_LF, 1),   # 编码器索引: 1=LF
+    ("RF", MOTOR_RF, 0),   # 编码器索引: 0=RF
+    ("LB", MOTOR_LB, 2),   # 编码器索引: 2=LB
+    ("RB", MOTOR_RB, 3),   # 编码器索引: 3=RB
 ]
 
 PWM_STEPS = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000, 45000, 50000]
@@ -57,6 +57,12 @@ def main():
 
     stop_all()
 
+    # 暂停 ticker 防止偷脉冲
+    enc_ticker.stop()
+    for _ in range(5):
+        get_encoder_counts()
+        time.sleep_ms(10)
+
     for name, motor, idx in MOTORS:
         if switch2.value() != state2:
             break
@@ -91,6 +97,7 @@ def main():
         print("  >>> 建议 PWM_PER_MPS  = {:.0f}".format(
             50000 / max_speed if max_speed > 0 else 0))
 
+    enc_ticker.start(10)
     print("\n" + "=" * 60)
     print("  标定完成。将上述值填入 motor.py")
     print("=" * 60)
@@ -103,3 +110,7 @@ except KeyboardInterrupt:
     print("\n  用户中止。")
 finally:
     stop_all()
+    try:
+        enc_ticker.start(10)
+    except:
+        pass
