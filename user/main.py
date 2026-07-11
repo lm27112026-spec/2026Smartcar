@@ -46,7 +46,7 @@ UWB_CTRL_DT      = 0.02    # 控制周期 (s)
 _heading_hold = None        # HeadingHold 实例（首次 _lock_yaw 时懒初始化）
 
 # ── 蓝牙信号 ──
-BT_WAIT_DEADLINE_S       = 15.0    # 蓝牙阻塞等待兜底超时 (s)，防止死锁
+BT_WAIT_DEADLINE_S       = 10.0     # 蓝牙单次等待超时 (s)，超时后重发消息重试，永不因蓝牙触发返航
 
 # ── 启动: 收到 ok 后全速前进至 UWB X 距离 < -130cm ──
 STARTUP_FULL_SPEED     = 1.00     # 全速前进速度（绝对值，m/s）
@@ -795,25 +795,29 @@ def see_and_push():
         return True
 
     print("  [APPROACH] 向从车发送数字 0 (turn_right)...")
+    target_heading = _lock_yaw()
+    retry_count = 0
     try:
-        bt.turn_right()
-        target_heading = _lock_yaw()
-        print("  [APPROACH] 指令已发，等待从车 ok（兜底 {}s）...".format(BT_WAIT_DEADLINE_S))
-        bt_wait_start = time.ticks_ms()
         while True:
-            pet_watchdog()
-            _maintain_yaw(target_heading)  # 等待期间持续修正航向
-            if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
-                print("  [APPROACH] 等待从车 ok 兜底超时 ({}s)，继续执行".format(BT_WAIT_DEADLINE_S))
-                return True
-            if check_sw2():
-                print("  [APPROACH] SW2 中断，强制跳过")
-                return True
-            resp = bt.read_response()
-            if resp == "ok":
-                print("  [APPROACH] 从车确认完毕 (ok)")
-                return True
-            time.sleep_ms(10)
+            bt.turn_right()
+            retry_count += 1
+            suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
+            print("  [APPROACH] 指令已发{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
+            bt_wait_start = time.ticks_ms()
+            while True:
+                pet_watchdog()
+                _maintain_yaw(target_heading)  # 等待期间持续修正航向
+                if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
+                    print("  [APPROACH] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
+                    break  # 退出内层等待循环，重新发送
+                if check_sw2():
+                    print("  [APPROACH] SW2 中断，跳过蓝牙等待")
+                    return True
+                resp = bt.read_response()
+                if resp == "ok":
+                    print("  [APPROACH] 从车确认完毕 (ok)")
+                    return True
+                time.sleep_ms(10)
     except Exception as e:
         print("  [APPROACH] 蓝牙发送异常:", e)
         return False
@@ -1445,9 +1449,9 @@ def main():
     print("  [MAIN] 航向已锁定，执行初始路径移动...")
     move_toward_fixed_point()
 
-#     # ═══════════════════════════════════════════════════════
-#     #  主循环：右移搜索（累计1.2m）+ 取物流程
-#     # ═══════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════
+    #  主循环：右移搜索（累计1.2m）+ 取物流程
+    # ═══════════════════════════════════════════════════════
     while True:
         _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
@@ -1469,16 +1473,22 @@ def main():
 
         # ② 离开平移路径，向前视觉靠近（移动期间已通过 _drive_fn 实时累加前进距离）
         if not see_and_push():
-            print("  [MAIN] 视觉靠近中断，触发返航...")
-            break
+            print("  [MAIN] 视觉靠近中断，沿原路倒退回到搜索路径...")
+            _reverse_to_rightward_path()
+            _pause_with_yaw_hold(_TARGET_HEADING, 300)
+            _encoder_reset()
+            continue
 
         _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
         # ③ 全速推送过 UWB 边界（移动期间已在内部实时累加前进距离）
         if not _action_forward_until_uwb_x():
-            print("  [MAIN] UWB 推送中断，触发返航...")
-            break
+            print("  [MAIN] UWB 推送中断，沿原路倒退回到搜索路径...")
+            _reverse_to_rightward_path()
+            _pause_with_yaw_hold(_TARGET_HEADING, 300)
+            _encoder_reset()
+            continue
 
         # 执行 20cm 倒退（避开障碍物/边界线）
         _execute_backup(_TARGET_HEADING)
@@ -1491,40 +1501,40 @@ def main():
         _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
 
-        # ④ 蓝牙通知从车
-        bt_success = False
+        # ④ 蓝牙通知从车（永不因蓝牙超时触发返航）
         if check_sw2():
             print("  [MAIN] SW2 手动旁路，跳过蓝牙")
-            bt_success = True
         else:
+            target_heading = _lock_yaw()
+            retry_count = 0
             try:
-                bt.turn_left()
-                target_heading = _lock_yaw()
-                print("  [MAIN] turn_left 已发出，等待从车 ok（兜底 {}s）...".format(BT_WAIT_DEADLINE_S))
-                bt_wait_start = time.ticks_ms()
                 while True:
-                    pet_watchdog()
-                    _maintain_yaw(target_heading)
-                    if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
-                        print("  [MAIN] 等待从车 ok 兜底超时 ({}s)".format(BT_WAIT_DEADLINE_S))
-                        bt_success = True
+                    bt.turn_left()
+                    retry_count += 1
+                    suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
+                    print("  [MAIN] turn_left 已发出{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
+                    bt_wait_start = time.ticks_ms()
+                    received_ok = False
+                    while True:
+                        pet_watchdog()
+                        _maintain_yaw(target_heading)
+                        if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
+                            print("  [MAIN] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
+                            break  # 退出内层等待循环，重新发送
+                        if check_sw2():
+                            print("  [MAIN] SW2 中断等待")
+                            break
+                        resp = bt.read_response()
+                        if resp == "ok":
+                            print("  [MAIN] 从车确认完毕")
+                            received_ok = True
+                            break
+                        time.sleep_ms(10)
+                    if received_ok or check_sw2():
                         break
-                    if check_sw2():
-                        print("  [MAIN] SW2 中断等待")
-                        bt_success = True
-                        break
-                    resp = bt.read_response()
-                    if resp == "ok":
-                        print("  [MAIN] 从车确认完毕")
-                        bt_success = True
-                        break
-                    time.sleep_ms(10)
             except Exception as e:
                 print("  [MAIN] 蓝牙通信异常:", e)
-
-        if not bt_success:
-            print("  [MAIN] 蓝牙通信失败，触发返航...")
-            break
+                # 蓝牙硬件异常也直接继续，不触发返航
 
         _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
