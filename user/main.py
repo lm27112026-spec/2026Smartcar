@@ -5,7 +5,7 @@ from machine import Pin
 from motor import (stop_all, omni_drive_closed_loop,
                    get_encoder_counts, reset_encoder_filter, reset_wheel_pi,
                    pause_encoder_ticker, resume_encoder_ticker, ENC_SCALE,
-                   get_encoder_speeds_filtered)
+                   )
 gc.collect()  # 导入关键模块前回收内存
 
 from imu_motion import (update_angle, imu_read_safe,
@@ -91,6 +91,35 @@ _TARGET_HEADING = None  # 全程锁定的目标航向
 _approach_forward_dist = 0.0   # 取物流程净前进距离 (m)
 _rightward_cumulative  = 0.0   # 累计右移距离 (m)，跨多次调用持久化
 
+# ── 本地一阶低通滤波器（单次读取编码器 + 滤波，杜绝双读隐患）──
+_SPD_FILTER_ALPHA = 0.4
+_local_prev_speeds = [0.0, 0.0, 0.0, 0.0]
+_local_speeds_initialized = False
+
+
+def _get_local_filtered_speeds(raw_counts, dt):
+    """基于外部传入的 counts 数组计算一阶低通滤波速度 [rf, lf, lb, rb] (m/s)。
+    不调用 get_encoder_counts()，杜绝二次读取导致增量清零。"""
+    global _local_prev_speeds, _local_speeds_initialized
+
+    if raw_counts is None or len(raw_counts) < 4:
+        return _local_prev_speeds
+
+    raw_speeds = [raw_counts[i] / ENC_SCALE[i] / dt if ENC_SCALE[i] != 0 else 0
+                  for i in range(4)]
+
+    if not _local_speeds_initialized:
+        _local_prev_speeds = raw_speeds[:]
+        _local_speeds_initialized = True
+        return _local_prev_speeds
+
+    _local_prev_speeds = [
+        _SPD_FILTER_ALPHA * p + (1 - _SPD_FILTER_ALPHA) * r
+        for p, r in zip(_local_prev_speeds, raw_speeds)
+    ]
+    return _local_prev_speeds
+
+
 # ═══════════════════════════════════════════════════════════════
 #  硬件初始化
 # ═══════════════════════════════════════════════════════════════
@@ -112,7 +141,8 @@ def check_sw2():
         _sw2_stable_start = time.ticks_ms()
     if _sw2_changed and time.ticks_diff(time.ticks_ms(), _sw2_stable_start) >= SW2_DEBOUNCE_MS:
         _sw2_changed = False
-        return True
+        if val == 0:             # 仅按下（低电平）触发，松开不触发
+            return True
     return False
 
 
@@ -219,9 +249,8 @@ def _maintain_yaw(target_heading):
     try:
         rc = get_encoder_counts()
         if rc is not None and len(rc) >= 4:
-            rs = [rc[i] / ENC_SCALE[i] / 0.02 if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(0, 0, wz, rs, 0.02)
+            speeds = _get_local_filtered_speeds(rc, 0.02)
+            omni_drive_closed_loop(0, 0, wz, speeds, 0.02)
     except Exception as e:
         _maintain_yaw_fail += 1
         if _maintain_yaw_fail == 1:
@@ -244,12 +273,16 @@ def _pause_with_yaw_hold(target_heading, duration_ms):
 
 
 def _encoder_reset():
+    global _local_prev_speeds, _local_speeds_initialized
     reset_encoder_filter()
     reset_wheel_pi()
     reset_ang_vel_pid()
     # 每步结束清零 HeadingHold PID 积分，防止碰撞后积分饱和扭动
     if _heading_hold is not None:
         _heading_hold.reset()
+    # 重置本地滤波器状态机，防止阶段切换时残留速度产生"推背感"
+    _local_prev_speeds = [0.0, 0.0, 0.0, 0.0]
+    _local_speeds_initialized = False
     for _ in range(5):
         _ = get_encoder_counts()
         time.sleep_ms(10)
@@ -334,10 +367,19 @@ def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FW
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
 
     led.value(1)
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
+
         if _abort_check():
             led.value(0)
             return False
@@ -374,12 +416,11 @@ def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FW
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading, deadband=heading_deadband)
+        wz = _heading_correction(target_heading, deadband=heading_deadband, dt=actual_dt)
 
         try:
-            rs = [counts[i] / ENC_SCALE[i] / FWD_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(speed, 0, wz, rs, FWD_CTRL_DT)
+            speeds = _get_local_filtered_speeds(counts, actual_dt)
+            omni_drive_closed_loop(speed, 0, wz, speeds, actual_dt)
         except Exception as e:
             print("  [{}] 驱动错误:".format(label), e)
 
@@ -404,8 +445,17 @@ def _execute_backup(target_heading):
     backup_dist_m = UWB_BACKUP_DIST_CM / 100.0
     backup_dists = [0.0, 0.0, 0.0, 0.0]
     backup_start_ms = time.ticks_ms()
+    last_loop_ms = backup_start_ms
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
+
         if _abort_check():
             return
 
@@ -429,11 +479,10 @@ def _execute_backup(target_heading):
             print("  [BACKUP] 倒退完成 dist={:.2f}m".format(abs(avg_backup)))
             break
 
-        wz_b = _heading_correction(target_heading)
+        wz_b = _heading_correction(target_heading, dt=actual_dt)
         try:
-            brs = [bcounts[i] / ENC_SCALE[i] / FWD_CTRL_DT
-                   if ENC_SCALE[i] != 0 else 0 for i in range(4)]
-            omni_drive_closed_loop(-UWB_BACKUP_SPEED, 0, wz_b, brs, FWD_CTRL_DT)
+            speeds = _get_local_filtered_speeds(bcounts, actual_dt)
+            omni_drive_closed_loop(-UWB_BACKUP_SPEED, 0, wz_b, speeds, actual_dt)
         except Exception as e:
             print("  [BACKUP] 倒退驱动错误:", e)
 
@@ -477,12 +526,21 @@ def _action_rightward_search():
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
     cam = _ensure_cam()
 
     # 指示灯开启
     led.value(1)
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = RIGHTWARD_CTRL_DT
+        if actual_dt > 3 * RIGHTWARD_CTRL_DT:
+            actual_dt = RIGHTWARD_CTRL_DT
+        last_loop_ms = now_ms
+
         # A. SW2 中断检查
         if _abort_check():
             stop_all()
@@ -547,13 +605,12 @@ def _action_rightward_search():
             gc.collect()
 
         # J. 航向修正
-        wz = _heading_correction(target_heading)
+        wz = _heading_correction(target_heading, dt=actual_dt)
 
         # K. 驱动：执行闭环右平移 (vx=0, vy=+RIGHTWARD_SPEED)
         try:
-            rs = [counts[i] / ENC_SCALE[i] / RIGHTWARD_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(0, RIGHTWARD_SPEED, wz, rs, RIGHTWARD_CTRL_DT)
+            speeds = _get_local_filtered_speeds(counts, actual_dt)
+            omni_drive_closed_loop(0, RIGHTWARD_SPEED, wz, speeds, actual_dt)
         except Exception as e:
             print("  [RIGHT] 驱动异常:", e)
 
@@ -585,8 +642,17 @@ def _reverse_to_rightward_path():
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
+
         if _abort_check():
             stop_all()
             _approach_forward_dist = 0
@@ -625,12 +691,11 @@ def _reverse_to_rightward_path():
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading)
+        wz = _heading_correction(target_heading, dt=actual_dt)
 
         try:
-            rs = [counts[i] / ENC_SCALE[i] / FWD_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(-BACKUP_PATH_SPEED, 0, wz, rs, FWD_CTRL_DT)
+            speeds = _get_local_filtered_speeds(counts, actual_dt)
+            omni_drive_closed_loop(-BACKUP_PATH_SPEED, 0, wz, speeds, actual_dt)
         except Exception as e:
             print("  [REV] 驱动错误:", e)
 
@@ -682,6 +747,8 @@ def see_and_push():
             actual_dt = time.ticks_diff(now, last_ms) / 1000.0
             if actual_dt <= 0.001:  # 防止极限除零
                 actual_dt = dt
+            if actual_dt > 3 * dt:  # 🟢 新增：GC尖峰钳位
+                actual_dt = dt
         drive_state["last_ms"] = now
 
         rc = get_encoder_counts()
@@ -697,8 +764,8 @@ def see_and_push():
             if valid > 0:
                 _approach_forward_dist += (wheel_sum / valid)
 
-            # ── 🟢 核心：完全复用 test_follow.py 的一阶低通滤波反馈 speeds ──
-            speeds = get_encoder_speeds_filtered(actual_dt)
+            # ── 🟢 核心：使用单次读取的 rc 计算本地一阶低通滤波 speeds ──
+            speeds = _get_local_filtered_speeds(rc, actual_dt)
             omni_drive_closed_loop(vx, vy, wz, speeds, actual_dt)
 
     def _stop_fn():
@@ -775,6 +842,7 @@ def _action_forward_until_uwb_x():
     last_print_ms = start_ms
     last_uwb_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
     uwb_dead_start = 0
     uwb_dead_reconnect = 0
 
@@ -790,6 +858,13 @@ def _action_forward_until_uwb_x():
     led.value(1)
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
         if _abort_check():
             led.value(0)
             return False
@@ -913,12 +988,11 @@ def _action_forward_until_uwb_x():
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading)
+        wz = _heading_correction(target_heading, dt=actual_dt)
 
         try:
-            rs = [counts[i] / ENC_SCALE[i] / FWD_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(fwd_speed, 0, wz, rs, FWD_CTRL_DT)
+            speeds = _get_local_filtered_speeds(counts, actual_dt)
+            omni_drive_closed_loop(fwd_speed, 0, wz, speeds, actual_dt)
         except Exception as e:
             print("  [UWBX] 驱动运行错误:", e)
 
@@ -966,9 +1040,8 @@ def _action_return_to_origin():
     def _drive_fn(vx, vy, wz, dt):
         rc = get_encoder_counts()
         if rc is not None and len(rc) >= 4:
-            rs = [rc[i] / ENC_SCALE[i] / dt if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(vx, vy, wz, rs, dt)
+            speeds = _get_local_filtered_speeds(rc, dt)
+            omni_drive_closed_loop(vx, vy, wz, speeds, dt)
 
     def _stop_fn():
         stop_all()
@@ -1002,6 +1075,7 @@ def _action_uwb_translate():
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
     uwb_dead_start = 0
     uwb_dead_reconnect = 0
 
@@ -1010,6 +1084,13 @@ def _action_uwb_translate():
     last_fwd_speed = 0.0
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = UWB_CTRL_DT
+        if actual_dt > 3 * UWB_CTRL_DT:
+            actual_dt = UWB_CTRL_DT
+        last_loop_ms = now_ms
         if _abort_check():
             led.value(0)
             return False
@@ -1089,16 +1170,15 @@ def _action_uwb_translate():
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading)
+        wz = _heading_correction(target_heading, dt=actual_dt)
 
         try:
             rc = get_encoder_counts()
             if rc is None or len(rc) < 4:
                 time.sleep_ms(5)
                 continue
-            rs = [rc[i] / ENC_SCALE[i] / UWB_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(fwd_speed, 0, wz, rs, UWB_CTRL_DT)
+            speeds = _get_local_filtered_speeds(rc, actual_dt)
+            omni_drive_closed_loop(fwd_speed, 0, wz, speeds, actual_dt)
         except Exception as e:
             print("  [UWB] 驱动错误:", e)
 
@@ -1133,8 +1213,17 @@ def move_toward_fixed_point():
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = MFP_CTRL_DT
+        if actual_dt > 3 * MFP_CTRL_DT:
+            actual_dt = MFP_CTRL_DT
+        last_loop_ms = now_ms
+
         if _abort_check():
             stop_all()
             resume_encoder_ticker()
@@ -1173,12 +1262,11 @@ def move_toward_fixed_point():
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading)
+        wz = _heading_correction(target_heading, dt=actual_dt)
 
         try:
-            rs = [counts[i] / ENC_SCALE[i] / MFP_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(MFP_SPEED, 0, wz, rs, MFP_CTRL_DT)
+            speeds = _get_local_filtered_speeds(counts, actual_dt)
+            omni_drive_closed_loop(MFP_SPEED, 0, wz, speeds, actual_dt)
         except Exception as e:
             print("  [MFP] 驱动错误:", e)
 
@@ -1195,8 +1283,17 @@ def move_toward_fixed_point():
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     loop_cnt = 0
+    last_loop_ms = start_ms
 
     while True:
+        now_ms = time.ticks_ms()
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = MFP_CTRL_DT
+        if actual_dt > 3 * MFP_CTRL_DT:
+            actual_dt = MFP_CTRL_DT
+        last_loop_ms = now_ms
+
         if _abort_check():
             stop_all()
             resume_encoder_ticker()
@@ -1235,12 +1332,11 @@ def move_toward_fixed_point():
         if loop_cnt % 50 == 0:
             gc.collect()
 
-        wz = _heading_correction(target_heading)
+        wz = _heading_correction(target_heading, dt=actual_dt)
 
         try:
-            rs = [counts[i] / ENC_SCALE[i] / MFP_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-            omni_drive_closed_loop(0, MFP_SPEED, wz, rs, MFP_CTRL_DT)
+            speeds = _get_local_filtered_speeds(counts, actual_dt)
+            omni_drive_closed_loop(0, MFP_SPEED, wz, speeds, actual_dt)
         except Exception as e:
             print("  [MFP] 驱动错误:", e)
 
@@ -1295,15 +1391,9 @@ def action_c14():
 
 def action_c8():
     print("\n" + "=" * 50)
-    print("[C8] 蓝牙发送从车消息")
+    print("[C8] move_toward_fixed_point 前进50cm → 右移110cm")
     print("=" * 50)
-
-    try:
-        bt.send_sync_move(0, 0, 0)
-        print("[C8] 消息已发送")
-    except Exception as e:
-        print("[C8] 发送失败:", e)
-
+    move_toward_fixed_point()
     print("=" * 50 + "\n")
 
 
@@ -1316,67 +1406,7 @@ def action_c9():
     print("[C9] 摄像头跟随靠近")
     print("=" * 50)
 
-    C9_TIMEOUT_S = 10.0
-    C9_CTRL_DT   = 0.02
-
-    pause_encoder_ticker()
-    _encoder_reset()
-
-    cam = _ensure_cam()
-    cam.reset()
-
-    target_heading = _lock_yaw()
-    print("  [C9] 航向锁定: {:.1f}°".format(target_heading))
-
-    start_ms = time.ticks_ms()
-    loop_cnt = 0
-
-    led.value(1)
-
-    try:
-        while True:
-            if _abort_check():
-                print("  [C9] SW2 中断")
-                break
-
-            elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-            if elapsed > C9_TIMEOUT_S:
-                print("  [C9] 超时 ({:.1f}s)".format(elapsed))
-                break
-
-            ctrl = cam.step()
-
-            if ctrl['arrived']:
-                stop_all()
-                print("  [C9] 已到达目标！")
-                break
-
-            if ctrl['vx'] is not None and ctrl['vy'] is not None:
-                wz = _heading_correction(target_heading)
-                try:
-                    rc = get_encoder_counts()
-                    if rc is not None and len(rc) >= 4:
-                        rs = [rc[i] / ENC_SCALE[i] / C9_CTRL_DT if ENC_SCALE[i] != 0 else 0
-                              for i in range(4)]
-                        omni_drive_closed_loop(ctrl['vx'], ctrl['vy'], wz, rs, C9_CTRL_DT)
-                except Exception as e:
-                    print("  [C9] 驱动错误:", e)
-            else:
-                _maintain_yaw(target_heading)  # 丢目标时仅维持航向
-
-            loop_cnt += 1
-            if loop_cnt % 50 == 0:
-                gc.collect()
-
-            time.sleep_ms(int(C9_CTRL_DT * 1000))
-
-    finally:
-        stop_all()
-        resume_encoder_ticker()
-        led.value(0)
-
-    print("=" * 50 + "\n")
-
+ 
 
 # ═══════════════════════════════════════════════════════════════
 #  主程序流程控制（main）
@@ -1388,8 +1418,8 @@ def main():
     print("  RT1021 — 按键驱动控制（右移搜索+取物返航版）")
     print("=" * 50)
     print("  C14 (KEY3): 前进 20cm → UWB 平移")
-    print("  C8  (KEY1): 蓝牙发送从车消息")
-    print("  C9  (KEY2): 摄像头跟随靠近")
+    print("  C8  (KEY1): 前进 50cm → 右移 110cm")
+    print("  C9  (KEY2): ")
     print("  SW2 (D9)  : 强制退出")
     print("=" * 50)
     print("")
@@ -1415,9 +1445,9 @@ def main():
     print("  [MAIN] 航向已锁定，执行初始路径移动...")
     move_toward_fixed_point()
 
-    # ═══════════════════════════════════════════════════════
-    #  主循环：右移搜索（累计1.2m）+ 取物流程
-    # ═══════════════════════════════════════════════════════
+#     # ═══════════════════════════════════════════════════════
+#     #  主循环：右移搜索（累计1.2m）+ 取物流程
+#     # ═══════════════════════════════════════════════════════
     while True:
         _pause_with_yaw_hold(_TARGET_HEADING, 300)
         _encoder_reset()
