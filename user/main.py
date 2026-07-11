@@ -41,16 +41,7 @@ UWB_LAT_SPEED    = 0.50    # 最大平移速度 (m/s)
 UWB_X_DEADBAND   = 3.0     # X 方向死区 (cm)
 UWB_LAT_P_GAIN   = 0.02    # X 误差 → 平移速度 P 增益
 UWB_TIMEOUT_S    = 10.0    # 超时 (s)
-UWB_INIT_TIMEOUT_S = 3.0   # UWB 初始化超时 (s)
 UWB_CTRL_DT      = 0.02    # 控制周期 (s)
-
-# ── 航向保持（委托给 IMU_hold.HeadingHold）──
-#   以下常量为旧版遗留，保留供参考；实际参数由 HeadingHold 管理
-HEADING_KP       = 0.15    # 航向偏差 → wz P 增益
-HEADING_KI       = 0.003   # 航向积分增益
-HEADING_I_LIMIT  = 0.06    # 积分项限幅
-HEADING_DEADBAND = 2.0     # 航向死区 (度)
-WZ_LIMIT         = 0.3     # wz 限幅 (归一化值)
 
 _heading_hold = None        # HeadingHold 实例（首次 _lock_yaw 时懒初始化）
 
@@ -75,14 +66,6 @@ ORIGIN_CTRL_DT      = 0.01    # 控制周期 (s)
 # ── 倒车回到右移路径 ──
 BACKUP_PATH_SPEED   = 0.50    # 倒车回到路径速度 (m/s)
 BACKUP_PATH_TIMEOUT = 15.0    # 倒车回到路径超时 (s)
-
-# ── 物质区之字形搜索 ──
-SEARCH_AREA_SIZE_CM      = 100.0   # 搜索区域边长 (cm)
-SEARCH_ROW_STEP_CM       = 40.0    # 行间步进距离 (cm)
-SEARCH_SPEED             = 0.40    # 搜索速度 (m/s)
-SEARCH_ROW_TIMEOUT_S     = 30.0    # 单行搜索超时 (s)
-SEARCH_STEP_TIMEOUT_S    = 10.0    # 步进超时 (s)
-SEARCH_CTRL_DT           = 0.02    # 控制周期 (s)
 
 # ── move_toward_fixed_point: 前进 50cm → 右平移 110cm ──
 MFP_FORWARD_DIST_CM  = 50.0    # 前进距离 (cm)
@@ -131,12 +114,6 @@ def check_sw2():
         _sw2_changed = False
         return True
     return False
-
-
-def is_sw2_active():
-    """直接读取 SW2 拨码物理电平（拉低=激活），用于旁路判断。
-    与 check_sw2() 不同：此函数不消费边缘事件，任何时刻调用都反映当前物理状态。"""
-    return sw2.value() == 0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -276,22 +253,6 @@ def _encoder_reset():
     for _ in range(5):
         _ = get_encoder_counts()
         time.sleep_ms(10)
-
-
-def _snapshot_forward_dist():
-    """读取编码器并累加到 _approach_forward_dist（取物流程净前进距离）。
-    在 _encoder_reset() 之前调用，捕获本轮移动距离。"""
-    global _approach_forward_dist
-    counts = get_encoder_counts()
-    if counts is not None and len(counts) >= 4:
-        wheel_sum = 0.0
-        valid = 0
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                wheel_sum += abs(counts[i]) / abs(ENC_SCALE[i])
-                valid += 1
-        if valid > 0:
-            _approach_forward_dist += wheel_sum / valid
 
 
 def _abort_check():
@@ -1022,178 +983,6 @@ def _action_return_to_origin():
         _led_fn, label="RTN"
     )
     return arrived
-
-
-# ═══════════════════════════════════════════════════════════════
-#  启动步骤: 之字形搜索 100cm×100cm 物质区
-# ═══════════════════════════════════════════════════════════════
-
-def _action_search_supplies_area():
-    target_heading = _lock_yaw()
-    print("\n  [SEARCH] === 之字形搜索 100cm×100cm 物质区 ===")
-    print("  [SEARCH] 航向锁定: {:.1f}°".format(target_heading))
-
-    AREA_CM   = SEARCH_AREA_SIZE_CM     
-    STEP_CM   = SEARCH_ROW_STEP_CM      
-    MAX_ROWS  = int(AREA_CM / STEP_CM)  
-
-    led.value(1)
-
-    for row in range(MAX_ROWS):
-        direction   = "RIGHT" if (row % 2 == 0) else "LEFT"
-        vy_sign     = 1.0 if direction == "RIGHT" else -1.0
-        row_dist_m  = AREA_CM / 100.0   
-        row_label   = "{}/{}".format(row + 1, MAX_ROWS)
-
-        print("\n  [SEARCH] --- 第 {} 行 {} {:.0f}cm ---".format(
-            row_label, direction, AREA_CM))
-
-        # ── 本行横向搜索 ──
-        total_dists = [0.0, 0.0, 0.0, 0.0]
-        row_start_ms = time.ticks_ms()
-        row_last_print_ms = row_start_ms
-        row_loop_cnt = 0
-
-        while True:
-            if _abort_check():
-                led.value(0)
-                return False
-
-            elapsed = time.ticks_diff(time.ticks_ms(), row_start_ms) / 1000.0
-            if elapsed > SEARCH_ROW_TIMEOUT_S:
-                print("  [SEARCH] 行 {} 超时 ({:.1f}s)".format(row_label, elapsed))
-                led.value(0)
-                return False
-
-            counts = get_encoder_counts()
-            if counts is None or len(counts) < 4:
-                time.sleep_ms(5)
-                continue
-
-            # 对单次增量脉冲取绝对值累加，规避镜像接线极性抵消
-            for i in range(4):
-                if ENC_SCALE[i] != 0:
-                    total_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-            avg_dist = sum(total_dists) / len(total_dists)
-
-            # ── 摄像头物品检测 ──
-            cam = _ensure_cam()
-            ctrl = cam.step()
-            if ctrl['has_target']:
-                stop_all()
-                print("  [SEARCH] 摄像头识别到物品！")
-                led.value(0)
-                return True
-
-            if avg_dist >= row_dist_m:
-                print("  [SEARCH] 第 {} 行完成 dist={:.2f}m".format(row_label, avg_dist))
-                break
-
-            now = time.ticks_ms()
-            if time.ticks_diff(now, row_last_print_ms) >= 500:
-                row_last_print_ms = now
-                print("  [SEARCH] 行{0} {1} dist={2:.2f}m / {3:.0f}cm yaw={4:.2f}°".format(
-                    row_label, direction, avg_dist, AREA_CM, _yaw()))
-
-            wz = _heading_correction(target_heading)
-
-            try:
-                rs = [counts[i] / ENC_SCALE[i] / SEARCH_CTRL_DT
-                      if ENC_SCALE[i] != 0 else 0 for i in range(4)]
-                omni_drive_closed_loop(0, vy_sign * SEARCH_SPEED, wz, rs, SEARCH_CTRL_DT)
-            except Exception as e:
-                print("  [SEARCH] 驱动错误:", e)
-
-            row_loop_cnt += 1
-            if row_loop_cnt % 20 == 0:
-                gc.collect()
-
-            time.sleep_ms(int(SEARCH_CTRL_DT * 1000))
-
-        # ── 行间步进 ──
-        if row >= MAX_ROWS - 1:
-            break  
-
-        print("  [SEARCH] 行间步进 {:.0f}cm...".format(STEP_CM))
-        stop_all()
-        time.sleep_ms(200)
-
-        step_dist_m = STEP_CM / 100.0  
-        step_dists = [0.0, 0.0, 0.0, 0.0]
-        step_start_ms = time.ticks_ms()
-        step_last_print_ms = step_start_ms
-        step_loop_cnt = 0
-
-        while True:
-            if _abort_check():
-                led.value(0)
-                return False
-
-            elapsed = time.ticks_diff(time.ticks_ms(), step_start_ms) / 1000.0
-            if elapsed > SEARCH_STEP_TIMEOUT_S:
-                print("  [SEARCH] 步进超时 ({:.1f}s)".format(elapsed))
-                led.value(0)
-                return False
-
-            counts = get_encoder_counts()
-            if counts is None or len(counts) < 4:
-                time.sleep_ms(5)
-                continue
-
-            # 对单次增量脉冲取绝对值累加，规避镜像接线极性抵消
-            for i in range(4):
-                if ENC_SCALE[i] != 0:
-                    step_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-            avg_dist = sum(step_dists) / len(step_dists)
-
-            # ── 摄像头检测 ──
-            cam = _ensure_cam()
-            ctrl = cam.step()
-            if ctrl['has_target']:
-                stop_all()
-                print("  [SEARCH] 步进中识别到物品！")
-                led.value(0)
-                return True
-
-            if avg_dist >= step_dist_m:
-                print("  [SEARCH] 步进完成 dist={:.2f}m".format(avg_dist))
-                break
-
-            now = time.ticks_ms()
-            if time.ticks_diff(now, step_last_print_ms) >= 500:
-                step_last_print_ms = now
-                print("  [SEARCH] 步进 dist={0:.2f}m / {1:.0f}cm yaw={2:.2f}°".format(avg_dist, STEP_CM, _yaw()))
-
-            wz = _heading_correction(target_heading)
-
-            try:
-                rs = [counts[i] / ENC_SCALE[i] / SEARCH_CTRL_DT
-                      if ENC_SCALE[i] != 0 else 0 for i in range(4)]
-                omni_drive_closed_loop(SEARCH_SPEED, 0, wz, rs, SEARCH_CTRL_DT)
-            except Exception as e:
-                print("  [SEARCH] 驱动错误:", e)
-
-            step_loop_cnt += 1
-            if step_loop_cnt % 20 == 0:
-                gc.collect()
-
-            time.sleep_ms(int(SEARCH_CTRL_DT * 1000))
-
-        stop_all()
-        time.sleep_ms(200)
-
-    print("  [SEARCH] 全部 {:.0f}cm×{:.0f}cm 区域搜索完成，未检测到物品".format(
-        AREA_CM, AREA_CM))
-    led.value(0)
-    return False
-
-
-# ═══════════════════════════════════════════════════════════════
-#  物资区搜索流
-# ═══════════════════════════════════════════════════════════════
-
-def _execute_supplies_search_flow():
-    return _action_search_supplies_area()
 
 
 # ═══════════════════════════════════════════════════════════════
