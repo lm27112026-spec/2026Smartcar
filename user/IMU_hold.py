@@ -18,7 +18,7 @@ from pid import PID
 HOLD_KP       = 0.01	 # P 增益 — 2°误差时 wz≈0.002（
 HOLD_KI       = 0.0      # I 增益 — 偏航保持无需积分
 HOLD_KD       = 0.001    # D 增益 — 阻尼抑制过冲震荡
-HOLD_DEADBAND = 3.0      # 死区(°) — 误差≤3°不反应
+HOLD_DEADBAND = 1.0      # 死区(°) — 误差≤1°不反应，防止高频微震
 HOLD_WZ_MAX   = 0.45     # wz 输出限幅
 HOLD_I_LIMIT  = 0.40     # 积分限幅（KI=0 时无效，保留兼容）
 

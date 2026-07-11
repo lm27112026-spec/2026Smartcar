@@ -105,6 +105,10 @@ def _get_local_filtered_speeds(raw_counts, dt):
     if raw_counts is None or len(raw_counts) < 4:
         return _local_prev_speeds
 
+    # ── 防御性阈值守护：防止外部库传入 dt=0 或时钟抖动导致的除零崩溃 ──
+    if dt <= 0.0001:
+        dt = FWD_CTRL_DT  # 容错回退到默认控制周期 0.02s
+
     raw_speeds = [raw_counts[i] / ENC_SCALE[i] / dt if ENC_SCALE[i] != 0 else 0
                   for i in range(4)]
 
@@ -217,31 +221,54 @@ def _lock_yaw():
     return _TARGET_HEADING
 
 
-def _heading_correction(target_yaw, deadband=None, dt=None):
-    """PI 航向修正：委托给 IMU_hold.HeadingHold"""
+def _heading_correction(target_yaw, deadband=1.0, dt=None):
+    """PI 航向修正：应用层角度环回强校验 + 委托 HeadingHold。
+    
+    双重保险:
+      1. 本层先做 wrap-around 角度差检查，|diff|≤deadband 直接返回 0
+      2. HeadingHold.update() 内部同样有死区兜底
+    """
     if dt is None:
         dt = FWD_CTRL_DT
-    _read_imu_update_yaw()  
+    if deadband is None:
+        deadband = 1.0
+    _read_imu_update_yaw()
+    current_yaw = _yaw()
+
+    # ── 应用层物理强锁：角度环回差值 ≤ deadband 时严格释放 ──
+    diff = (target_yaw - current_yaw + 180) % 360 - 180
+    if abs(diff) <= deadband:
+        return 0.0
+
     hold = _get_heading_hold()
     if target_yaw != hold.target:
         hold.set_target(target_yaw)
-    wz, _, _ = hold.update(_yaw(), dt, deadband=deadband)
+    wz, _, _ = hold.update(current_yaw, dt, deadband=deadband)
     return wz
 
 
 def _maintain_yaw(target_heading):
-    """单次 yaw 保持迭代：委托给 HeadingHold 计算 wz → 驱动电机。
-    返回: True=已驱动, False=在死区内无需驱动
+    """单次 yaw 保持迭代：应用层角度环回强校验 + 委托 HeadingHold → 驱动电机。
+    返回: True=已驱动/已在死区, False=驱动异常
     """
     global _maintain_yaw_fail
+
+    _read_imu_update_yaw()
+    current_yaw = _yaw()
+
+    # ── 应用层物理强锁：角度环回差值 ≤ 1.0° 时释放电机，防高频微震 ──
+    diff = (target_heading - current_yaw + 180) % 360 - 180
+    if abs(diff) <= 1.0:
+        stop_all()
+        return True
+
     hold = _get_heading_hold()
     if target_heading != hold.target:
         hold.set_target(target_heading)
 
-    _read_imu_update_yaw()
-    wz, _, _ = hold.update(_yaw(), FWD_CTRL_DT)
+    wz, _, _ = hold.update(current_yaw, FWD_CTRL_DT)
 
-    # 死区内释放电机，避免零速闭环引起高频颤抖
+    # 兜底死区检查（HeadingHold.update 内部也会做，此处为安全网）
     if abs(wz) < 0.005:
         stop_all()
         return True
