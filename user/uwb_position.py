@@ -82,6 +82,9 @@ class UWBPosition:
     # ── 滤波窗口调优 ──
     MEDIAN_WINDOW = 5         
 
+    # ── [新增] 默认关闭自动轨迹记录，彻底消除 GC 碎片与约 80KB 内存开销 ──
+    ENABLE_LOCATION_HISTORY = False  # 调试或需要画轨迹时可手动改为 True
+
     # ── 突变剔除阈值（配合小车物理加速，防止数据断锁冻结） ──
     OUTLIER_DIST_CM = 35.0    # 距离突变阈值 (cm)
     OUTLIER_XY_CM = 30.0      # XY 突变阈值 (cm)
@@ -328,7 +331,9 @@ class UWBPosition:
         self._current_distance = self._d_filt
         self._current_angle = self._angle_filt
 
-        self._check_and_store()
+        # ── 🟢 修改点：仅在开启历史记录开关时，才进行位置差异比对与存储 ──
+        if self.ENABLE_LOCATION_HISTORY:
+            self._check_and_store()
 
         if self._frame_count % 10 == 0:
             print("[{}] a={} D={:.1f} X={:.1f} Y={:.1f} ang={:+.0f}° loc_cnt={} [NO_KF]".format(
@@ -490,14 +495,8 @@ class UWBPosition:
         return not self._timeout_stopped
 
     def stop(self):
-        print("UWBPosition: stopping...")
-        if self._uart is not None:
-            try:
-                self._uart.deinit()
-            except Exception:
-                pass
-            self._uart = None
-        print("UWBPosition: stopped.")
+        """纯引用释放 — 仅置空 UART 引用，不触发物理 deinit，杜绝 GC 析构死锁"""
+        self._uart = None
 
     def __del__(self):
         self.stop()

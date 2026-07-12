@@ -107,5 +107,9 @@ def wait_any_key(timeout_ms=0):
 
 
 def stop():
-    """停止按键扫描（无 PIT ticker 需要停止，保留兼容 main.py 调用）。"""
-    pass
+    """停止按键扫描与看门狗，防止程序退出后触发复位"""
+    try:
+        _WWDG_PIT.stop()
+        print("  [WWDG] 看门狗已安全停止")
+    except Exception:
+        pass

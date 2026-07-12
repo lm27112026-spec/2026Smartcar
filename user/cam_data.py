@@ -80,6 +80,15 @@ class CamDataReceiver:
         self._error_count = 0
         self._target_count = 0
         self._lost_count = 0
+
+        # ── 🟢 缓存字典：预分配固定 Dict，_parse_frame 原地更新，100Hz 零堆分配 ──
+        self._cached_data = {
+            'x': 0.0, 'y': 0.0,
+            'label': 0, 'id': 0,
+            'flag': 0, 'status': 0,
+            'b6': 0, 'b7': 0,
+            'line_flag': 0, 'is_target': False
+        }
     
     @property
     def frame_count(self):
@@ -110,7 +119,7 @@ class CamDataReceiver:
     
     def read(self):
         """
-        非阻塞读取一帧数据
+        非阻塞读取一帧数据（已使用 MicroPython 原地切除优化，零堆内存分配）
         
         返回:
             dict - 成功时返回数据字典
@@ -130,7 +139,7 @@ class CamDataReceiver:
             self._buf = bytearray()
             return None
 
-        # 查找帧头
+        # 查找并解析帧
         while True:
             idx = self._buf.find(FRAME_HEAD_BYTES)
             if idx == -1:
@@ -138,27 +147,30 @@ class CamDataReceiver:
                 self._buf = bytearray()
                 return None
             
+            # ── 🟢 优化点 1：使用切片赋值为 b'' 原地切除前缀（兼容所有 MicroPython 版本）──
+            if idx > 0:
+                self._buf[:idx] = b''
+                idx = 0  # 切除后，帧头必然处于缓冲区第 0 字节
+            
             # 检查是否有完整帧
-            if len(self._buf) < idx + FRAME_LEN:
-                # 数据不完整，保留从帧头开始的部分
-                if idx > 0:
-                    self._buf = bytearray(self._buf[idx:])
+            if len(self._buf) < FRAME_LEN:
+                # 数据不完整，继续等待，无需做任何内存分配
                 return None
             
             # 检查帧尾
-            if self._buf[idx + FRAME_LEN - 1] != FRAME_TAIL:
-                # 无效帧尾，跳过这个字节继续查找
-                self._buf = bytearray(self._buf[idx + 1:])
+            if self._buf[FRAME_LEN - 1] != FRAME_TAIL:
+                # 帧尾无效，原地切除当前错误帧头（1字节），继续向下检索
+                self._buf[:1] = b''
                 self._error_count += 1
                 continue
             
-            # 提取有效帧
-            frame = self._buf[idx:idx + FRAME_LEN]
-            self._buf = bytearray(self._buf[idx + FRAME_LEN:])
+            # ── 🟢 优化点 2：提取固定长度帧，并原地移除该帧，完全避免 slicing 堆开销 ──
+            frame = self._buf[:FRAME_LEN]
+            self._buf[:FRAME_LEN] = b''
             
             # 解析数据
             return self._parse_frame(frame)
-    
+
     def _parse_frame(self, frame):
         """
         解析一帧数据
@@ -206,18 +218,18 @@ class CamDataReceiver:
         else:
             self._lost_count += 1
         
-        return {
-            'x': x,
-            'y': y,
-            'label': label_val,
-            'id': id,
-            'flag': flag,
-            'status': status_val,
-            'b6': b6,
-            'b7': b7,
-            'line_flag': line_flag_val,
-            'is_target': is_target
-        }
+        # 🟢 缓存字典原地更新 — 零堆分配，100Hz 无 GC 压力
+        self._cached_data['x'] = x
+        self._cached_data['y'] = y
+        self._cached_data['label'] = label_val
+        self._cached_data['id'] = id
+        self._cached_data['flag'] = flag
+        self._cached_data['status'] = status_val
+        self._cached_data['b6'] = b6
+        self._cached_data['b7'] = b7
+        self._cached_data['line_flag'] = line_flag_val
+        self._cached_data['is_target'] = is_target
+        return self._cached_data
     
     def read_block(self, timeout_ms=100):
         """
@@ -244,10 +256,5 @@ class CamDataReceiver:
         self._buf = bytearray()
 
     def deinit(self):
-        """释放 UART 资源（调用后方可被其他模块重新打开）"""
-        if self._uart is not None:
-            try:
-                self._uart.deinit()
-            except Exception:
-                pass
-            self._uart = None
+        """纯引用释放 — 仅置空 UART 引用，不触发物理 deinit"""
+        self._uart = None

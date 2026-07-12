@@ -73,8 +73,16 @@ def get_encoder_speeds(dt):
     返回 4 个编码器转速（米/秒）[rf, lf, lb, rb]
     dt: 采样间隔（秒），应与主控制循环周期一致
     """
+    # ── 物理防御：防止时间差极小、为零或负数引发的除零崩溃 ──
+    if dt <= 0.0001:
+        dt = 0.01  # 降级默认控制周期 10ms
+
     counts = get_encoder_counts()
-    return [c / ENC_SCALE[i] / dt for i, c in enumerate(counts)]
+    # ── 物理防御：防止 ENC_SCALE 被误写为 0 引发除零异常 ──
+    return [
+        (c / ENC_SCALE[i] / dt) if (ENC_SCALE[i] != 0) else 0.0 
+        for i, c in enumerate(counts)
+    ]
 
 
 def reset_encoders():
@@ -179,15 +187,42 @@ def omni_kinematics(vx, vy, wz):
     return [w_rf, w_lf, w_lb, w_rb]
 
 
+# 缓存 4 路电机的方向状态，用于反向死区消弧保护 [rf, lf, lb, rb]
+# 状态说明：1 = 前进, -1 = 后退, 0 = 停止
+_last_dirs = {}
 
 def set_motor(motor, duty_val):
+    global _last_dirs
     pwm, dir_a, dir_b = motor
     duty = int(abs(duty_val))
+    
+    # 1. 确定本次控制的目标方向
     if duty_val > 0:
+        curr_dir = 1
+    elif duty_val < 0:
+        curr_dir = -1
+    else:
+        curr_dir = 0
+
+    # 2. 极性反转检测（前向直接切后向，或后向直接切前向）
+    prev_dir = _last_dirs.get(motor, 0)
+    if prev_dir != 0 and curr_dir != 0 and prev_dir != curr_dir:
+        # ── 硬件安全保护网 ──
+        # 立即切断方向，PWM置零，维持一个极小的硬件死区过渡，消散热能与反向电动势
+        dir_a.value(0)
+        dir_b.value(0)
+        pwm.duty_u16(0)
+        time.sleep_us(500)  # 500us 硬件无感消弧延时
+        
+    # 3. 更新历史方向记录
+    _last_dirs[motor] = curr_dir
+
+    # 4. 执行实际物理输出
+    if curr_dir == 1:
         dir_a.value(0)
         dir_b.value(1)
         pwm.duty_u16(duty)
-    elif duty_val < 0:
+    elif curr_dir == -1:
         dir_a.value(1)
         dir_b.value(0)
         pwm.duty_u16(duty)
@@ -195,6 +230,7 @@ def set_motor(motor, duty_val):
         dir_a.value(0)
         dir_b.value(0)
         pwm.duty_u16(0)
+
 
 # 开环驱动函数：直接根据输入的 vx, vy, wz 计算 PWM 输出，无速度反馈
 def omni_drive(vx, vy, wz, max_pwm=MAX_PWM):
@@ -246,14 +282,29 @@ MOTOR_RF = (pwm_4, pin_d6,  pin_d7)   # C26 + D6/D7
 MOTOR_LB = (pwm_2, pin_c30, pin_c31)  # C20 + C30/C31
 MOTOR_RB = (pwm_1, pin_c28, pin_c29)  # B26 + C28/C29
 
+# 幂等性局部状态锁，确保暂停/恢复函数在多次冗余调用下依然安全运行
+_ticker_is_active = True
+
 def pause_encoder_ticker():
     """暂停编码器自动采集 — 用于手动接管编码器读取的模块调用。
     调用者必须在完成后调用 resume_encoder_ticker() 恢复。"""
-    enc_ticker.stop()
+    global _ticker_is_active
+    if _ticker_is_active:
+        try:
+            enc_ticker.stop()
+        except Exception:
+            pass
+        _ticker_is_active = False
 
 def resume_encoder_ticker():
     """恢复编码器自动采集（10ms 周期）。"""
-    enc_ticker.start(10)
+    global _ticker_is_active
+    if not _ticker_is_active:
+        try:
+            enc_ticker.start(10)
+        except Exception:
+            pass
+        _ticker_is_active = True
 
 
 def stop_all():
@@ -266,6 +317,3 @@ def stop_all():
 
 # 导入完成后立即强制停机一次
 stop_all()
-
-
-

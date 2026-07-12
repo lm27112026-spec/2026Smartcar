@@ -15,7 +15,7 @@ def _yaw():
     """动态获取 imu_motion.yaw（避免 from-import 值拷贝）"""
     return __import__('imu_motion').yaw
 
-from key import capture, key_triggered, pet_watchdog
+from key import capture, key_triggered, pet_watchdog, stop as stop_key
 from uwb_position import UWBPosition
 from IMU_hold import HeadingHold
 
@@ -39,6 +39,7 @@ FWD_CTRL_DT      = 0.02    # 控制周期 (s)
 # ── C14: UWB 平移 ──
 UWB_LAT_SPEED    = 0.50    # 最大平移速度 (m/s)
 UWB_X_DEADBAND   = 3.0     # X 方向死区 (cm)
+
 UWB_LAT_P_GAIN   = 0.02    # X 误差 → 平移速度 P 增益
 UWB_TIMEOUT_S    = 10.0    # 超时 (s)
 UWB_CTRL_DT      = 0.02    # 控制周期 (s)
@@ -122,6 +123,24 @@ def _get_local_filtered_speeds(raw_counts, dt):
         _local_prev_speeds[i] = _SPD_FILTER_ALPHA * _local_prev_speeds[i] + (1 - _SPD_FILTER_ALPHA) * raw_spd
 
     return _local_prev_speeds
+
+
+def _clean_globals_for_ide():
+    """
+    🟢 程序退出前将全局命名空间中所有自定义值置 None。
+    只保留 Thonny 必需的 __name__ / __file__ 和 stdlib 模块，
+    其余全部清空——杜绝任何 repr() 触发 C 扩展序列化报错。
+    """
+    print("  [IDE] 正在清理全局变量，防止 IDE 扫描冲突...")
+    g = globals()
+    keep = {'__name__', '__file__', 'gc', 'time', 'math', 'machine', 'sys', 'builtins'}
+    for name in list(g.keys()):
+        if name in keep:
+            continue
+        try:
+            g[name] = None
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -890,7 +909,7 @@ def see_and_push():
                 break
 
             # ── 8. 中断退出检测与 100Hz 严格节拍维持 ──
-            if check_sw2():
+            if _abort_check():
                 print("\n  [APPROACH] SW2 手动中断退出。")
                 stop_all()
                 break
@@ -1664,6 +1683,9 @@ def main():
     try:
         pause_encoder_ticker()
         stop_imu_ticker()
+        stop_key()  # 🟢 程序退出时，安全关闭看门狗定时器，防止其复位 MCU
+        # ── 纯引用抹除：置 None + 从 globals() 删除，不触发任何物理外设关断 ──
+        _clean_globals_for_ide()
     except Exception:
         pass
     

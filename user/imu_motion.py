@@ -15,7 +15,9 @@ import gc, time, math
 from machine import *
 from smartcar import *
 from seekfree import *
-from motor import omni_drive, SWITCH2_PIN, encoder_rf, encoder_lf, encoder_lb, encoder_rb, ENC_SCALE
+from motor import (omni_drive, SWITCH2_PIN, encoder_rf, encoder_lf, 
+                   encoder_lb, encoder_rb, ENC_SCALE, 
+                   resume_encoder_ticker, pause_encoder_ticker)
 from pid import PID
 
 # ============================================================
@@ -278,10 +280,8 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
     switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
     state2 = switch2.value()
     
-    # ===== 启动 ticker（编码器）=====
-    pit_enc = ticker(1)
-    pit_enc.capture_list(encoder_rf, encoder_lf, encoder_lb, encoder_rb)
-    pit_enc.start(10)
+    # ===== 🟢 修复点：不再重复创建 ticker(1)，直接调用 motor 的启动函数 =====
+    resume_encoder_ticker()
 
     
     # 清空残余值
@@ -320,7 +320,8 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
         avg_dist = sum(wheel_dist) / len(wheel_dist) if wheel_dist else 0.0
 
         if avg_dist >= max_dist:
-            pit_enc.stop()
+            # ===== 🟢 修复点：调用 motor 的暂停函数 =====
+            pause_encoder_ticker()
             omni_drive(0, 0, 0)
             return True
 
@@ -344,7 +345,8 @@ def drive_distance(speed, target_angle, max_dist=999.0, timeout_s=999.0):
         time.sleep_ms(20)
 
     # 超时/手动退出
-    pit_enc.stop()
+    # ===== 🟢 修复点：调用 motor 的暂停函数 =====
+    pause_encoder_ticker()
     omni_drive(0, 0, 0)
     return False
 
