@@ -19,8 +19,6 @@ imu.py - IMU660RX 实时角度读取与校准模块
 【校准流水线】
   imu.read() → 减去 gyro_offset → gz 低通滤波 → 互补滤波 → 减去 zero_reference → 输出
 """
-"""
-
 import gc, time, math
 from machine import Pin
 from smartcar import ticker as _ticker_cls
@@ -475,64 +473,3 @@ class IMU:
         print("=" * 50)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  快速使用入口（与现有 imu_motion.py / imu660rx.py 模式一致）
-# ═══════════════════════════════════════════════════════════════
-
-def demo():
-    """
-    imu.py 快速演示
-    实时打印 roll/pitch/yaw，SWITCH2 按下退出
-    """
-    gc.collect()
-
-    # 初始化 IMU（自动校准）
-    print("初始化 IMU...")
-    imu = IMU()
-
-    # 启动 ticker
-    imu.start()
-
-    # 归零参考
-    imu.set_zero_reference()
-
-    LED_PIN = 'C4'
-    SWITCH2_PIN = 'D9'
-
-    led     = Pin(LED_PIN, Pin.OUT, value=True)
-    switch2 = Pin(SWITCH2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
-    state2  = switch2.value()
-
-    loop_cnt = 0
-    print("实时角度输出 (SWITCH2 退出):")
-
-    try:
-        while True:
-            imu.update()
-            loop_cnt += 1
-
-            if loop_cnt % 10 == 0:  # 每 100ms 打印一次
-                r, p, y = imu.get_angles()
-                wz = imu._wz_dps
-                print("roll={:>6.1f}  pitch={:>6.1f}  yaw={:>6.1f}  wz={:>6.1f}".format(r, p, y, wz))
-                led.toggle()
-
-            if switch2.value() != state2:
-                break
-
-            time.sleep_ms(10)
-
-            if loop_cnt % 100 == 0:
-                gc.collect()
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        imu.stop()
-        led.value(1)
-        print("演示结束")
-
-
-# 直接运行此文件时进入演示
-if __name__ == "__main__":
-    demo()
