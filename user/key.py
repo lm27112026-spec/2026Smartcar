@@ -50,7 +50,7 @@ def _wwdg_isr(t):
 
 _WWDG_PIT = ticker(2)  # PIT2：仅供看门狗专用
 _WWDG_PIT.callback(_wwdg_isr)
-_WWDG_PIT.start(SCAN_PERIOD_MS)
+# _WWDG_PIT.start(SCAN_PERIOD_MS)  # 延迟启动，防止 Thonny 调试阶段误复位
 
 
 def pet_watchdog():
@@ -58,6 +58,13 @@ def pet_watchdog():
     若主循环（含 _dispatch_mode）卡住超过 3 秒，PIT3 ISR 触发 hard reset。"""
     global _WWDG_CNT
     _WWDG_CNT = 0
+
+
+def start_watchdog():
+    """显式启用独立硬件看门狗，供 main.py 在初始化完成后调用"""
+    global _WWDG_CNT
+    _WWDG_CNT = 0
+    _WWDG_PIT.start(SCAN_PERIOD_MS)
 
 KEY_NAMES = ["KEY1", "KEY2", "KEY3", "KEY4"]
 

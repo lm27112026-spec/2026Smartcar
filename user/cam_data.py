@@ -1,87 +1,32 @@
-"""
-cam_data.py - 摄像头数据接收与解析模块（适配实际协议）
-【协议】AA [X_H X_L] [Y_H Y_L] [LABEL_H LABEL_L] [STATUS_H STATUS_L] [LINE_FLAG_H LINE_FLAG_L] BB
-        X = 横向偏移 (原始值单位: mm, ÷10后仍为mm)
-        Y = 纵向距离 (原始值单位: cm, ÷10后为cm)
-        LABEL = 目标标识 (int16)
-        STATUS = 检测状态 (int16, 0=丢失)
-        LINE_FLAG = 黄线标志 (int16)
-        int16 大端序，÷10 精度
-【单位说明】
-        X 返回值单位是 mm，用 x_to_cm(x) 转为 cm
-        Y 返回值单位是 cm，用 y_to_distance(y) 转为实际距离
-【Y坐标说明】
-        Y=0 对应实际距离 29cm
-        Y>0 比 29cm 更近, Y<0 比 29cm 更远
-【使用】
-    from cam_data import CamDataReceiver, x_to_cm, y_to_distance
-    recv = CamDataReceiver(uart_id=7)
-    while True:
-        data = recv.read()
-        if data is not None:
-            x_cm = x_to_cm(data['x'])      # 横向偏移 (cm)
-            dist = y_to_distance(data['y']) # 实际距离 (cm)
-            print(f"X:{x_cm:.1f}cm 距离:{dist:.1f}cm")
-"""
-
+# cam_data.py - 摄像头数据接收与解析模块（适配实际协议）
 from machine import UART
 import time
 
-# 协议常量
 FRAME_HEAD = 0xAA
 FRAME_TAIL = 0xBB
 FRAME_LEN = 12
 SCALE = 10.0
-FRAME_HEAD_BYTES = bytes([FRAME_HEAD])      # 预分配，避免每次 find() 创建临时对象
-BUF_MAX = 256                                # 缓冲区上限，超出则视为噪声清空
-
-# Y 坐标参考点：Y=0 时对应的实际距离
-Y_REF_DISTANCE = 29.0  # cm
-
+FRAME_HEAD_BYTES = bytes([FRAME_HEAD])
+BUF_MAX = 256
+Y_REF_DISTANCE = 29.0
 
 def _to_signed16(v):
-    """无符号转有符号 int16"""
     return v if v < 32768 else v - 65536
 
-
 def y_to_distance(y):
-    """返回相机 Y 原始值 (cm)"""
     return y
 
 def x_to_cm(x):
-    """返回相机 X 原始值 (已由 _parse_frame ÷10, 单位 cm)"""
     return x
 
-
 class CamDataReceiver:
-    """
-    摄像头数据接收器
-    
-    用法:
-        recv = CamDataReceiver(uart_id=7)
-        while True:
-            data = recv.read()
-            if data is not None:
-                if data['is_target']:
-                    print(f"X:{data['x']:.1f} Y:{data['y']:.1f} flag:{data['flag']}")
-    """
-    
     def __init__(self, uart_id=7, baudrate=115200):
-        """
-        初始化接收器
-        
-        参数:
-            uart_id: UART 编号
-            baudrate: 波特率
-        """
         self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1)
         self._buf = bytearray()
         self._frame_count = 0
         self._error_count = 0
         self._target_count = 0
         self._lost_count = 0
-
-        # ── 🟢 缓存字典：预分配固定 Dict，_parse_frame 原地更新，100Hz 零堆分配 ──
         self._cached_data = {
             'x': 0.0, 'y': 0.0,
             'label': 0, 'id': 0,
@@ -89,136 +34,68 @@ class CamDataReceiver:
             'b6': 0, 'b7': 0,
             'line_flag': 0, 'is_target': False
         }
-    
+
     @property
-    def frame_count(self):
-        """总帧数"""
-        return self._frame_count
-    
+    def frame_count(self): return self._frame_count
+
     @property
-    def error_count(self):
-        """错误帧数"""
-        return self._error_count
-    
+    def error_count(self): return self._error_count
+
     @property
-    def target_count(self):
-        """识别成功帧数"""
-        return self._target_count
-    
+    def target_count(self): return self._target_count
+
     @property
-    def lost_count(self):
-        """丢失帧数"""
-        return self._lost_count
-    
+    def lost_count(self): return self._lost_count
+
     def reset_stats(self):
-        """重置统计计数"""
         self._frame_count = 0
         self._error_count = 0
         self._target_count = 0
         self._lost_count = 0
-    
-    def read(self):
-        """
-        非阻塞读取一帧数据（已使用 MicroPython 原地切除优化，零堆内存分配）
-        
-        返回:
-            dict - 成功时返回数据字典
-            None - 无数据或数据无效
-        """
-        # 检查是否有足够数据
-        if self._uart.any() < 1:
-            return None
-        
-        # 读取可用数据
-        chunk = self._uart.read()
-        if chunk:
-            self._buf.extend(chunk)
 
-        # 缓冲区上限保护：超过 BUF_MAX 视为噪声，清空避免内存耗尽
+    def read(self):
+        if self._uart.any() < 1: return None
+        chunk = self._uart.read()
+        if chunk: self._buf.extend(chunk)
         if len(self._buf) > BUF_MAX:
             self._buf = bytearray()
             return None
-
-        # 查找并解析帧
         while True:
             idx = self._buf.find(FRAME_HEAD_BYTES)
             if idx == -1:
-                # 没有找到帧头，清空缓冲区
                 self._buf = bytearray()
                 return None
-            
-            # ── 🟢 优化点 1：使用切片赋值为 b'' 原地切除前缀（兼容所有 MicroPython 版本）──
             if idx > 0:
                 self._buf[:idx] = b''
-                idx = 0  # 切除后，帧头必然处于缓冲区第 0 字节
-            
-            # 检查是否有完整帧
-            if len(self._buf) < FRAME_LEN:
-                # 数据不完整，继续等待，无需做任何内存分配
-                return None
-            
-            # 检查帧尾
+                idx = 0
+            if len(self._buf) < FRAME_LEN: return None
             if self._buf[FRAME_LEN - 1] != FRAME_TAIL:
-                # 帧尾无效，原地切除当前错误帧头（1字节），继续向下检索
                 self._buf[:1] = b''
                 self._error_count += 1
                 continue
-            
-            # ── 🟢 优化点 2：提取固定长度帧，并原地移除该帧，完全避免 slicing 堆开销 ──
             frame = self._buf[:FRAME_LEN]
             self._buf[:FRAME_LEN] = b''
-            
-            # 解析数据
             return self._parse_frame(frame)
 
     def _parse_frame(self, frame):
-        """
-        解析一帧数据
-        
-        参数:
-            frame: 12 字节的帧数据
-            
-        返回:
-            dict 或 None
-        """
         self._frame_count += 1
-        
-        # 解析 X, Y (int16 大端序)
         raw_x = (frame[1] << 8) | frame[2]
         raw_y = (frame[3] << 8) | frame[4]
-        
         x = _to_signed16(raw_x) / SCALE
         y = _to_signed16(raw_y) / SCALE
-        
-        # 解析 LABEL (bytes 5-6, int16 大端序)
         raw_label = (frame[5] << 8) | frame[6]
         label_val = _to_signed16(raw_label)
-        
-        # 解析 STATUS (bytes 7-8, int16 大端序)
         raw_status = (frame[7] << 8) | frame[8]
         status_val = _to_signed16(raw_status)
-        
-        # 解析 LINE_FLAG (bytes 9-10, int16 大端序)
         raw_line_flag = (frame[9] << 8) | frame[10]
         line_flag_val = _to_signed16(raw_line_flag)
-        
-        # 衍生字段（保持兼容）
-        b6 = frame[5]        # label 高字节
-        b7 = frame[6]        # label 低字节
-        id = label_val       # label 有符号整数值
-        flag = frame[7]      # status 高字节
-        
-        # 判断是否检测到目标
-        # status != 0 且 X,Y 不同时为 0 才算有效目标
+        b6 = frame[5]
+        b7 = frame[6]
+        id = label_val
+        flag = frame[7]
         is_target = (status_val != 0) and not (x == 0 and y == 0)
-        
-        # 统计
-        if is_target:
-            self._target_count += 1
-        else:
-            self._lost_count += 1
-        
-        # 🟢 缓存字典原地更新 — 零堆分配，100Hz 无 GC 压力
+        if is_target: self._target_count += 1
+        else: self._lost_count += 1
         self._cached_data['x'] = x
         self._cached_data['y'] = y
         self._cached_data['label'] = label_val
@@ -230,31 +107,18 @@ class CamDataReceiver:
         self._cached_data['line_flag'] = line_flag_val
         self._cached_data['is_target'] = is_target
         return self._cached_data
-    
+
     def read_block(self, timeout_ms=100):
-        """
-        阻塞读取，直到收到有效数据或超时
-        
-        参数:
-            timeout_ms: 超时时间(毫秒)
-            
-        返回:
-            dict 或 None (超时)
-        """
         deadline = time.ticks_ms() + timeout_ms
         while time.ticks_diff(deadline, time.ticks_ms()) > 0:
             data = self.read()
-            if data is not None:
-                return data
+            if data is not None: return data
             time.sleep_ms(1)
         return None
-    
+
     def flush(self):
-        """清空接收缓冲区"""
-        while self._uart.any():
-            self._uart.read()
+        while self._uart.any(): self._uart.read()
         self._buf = bytearray()
 
     def deinit(self):
-        """纯引用释放 — 仅置空 UART 引用，不触发物理 deinit"""
         self._uart = None
