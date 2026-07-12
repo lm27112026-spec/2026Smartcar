@@ -18,14 +18,14 @@ from motor import (stop_all, omni_drive_closed_loop,
 
 # ── 跟踪目标 ──
 DIST  = 4            # 期望距离 (cm) — 纵向目标
-E_X   = 5         # 期望横向偏移 (cm) — 正=偏左
+E_X   = 1         # 期望横向偏移 (cm) — 正=偏左
 
 # ── 外环 PID 增益 ──
-PX  = 0.025           # 横向 P (x_err → vy)
+PX  = 0.03           # 横向 P (x_err → vy)
 IX  = 0.0           # 横向 I
 DX  = 0.002           # 横向 D
 
-PY  = 0.025           # 纵向 P (y_err → vx)
+PY  = 0.03           # 纵向 P (y_err → vx)
 IY  = 0.00              # 纵向 I
 DY  = 0.001           # 纵向 D
 
@@ -34,8 +34,8 @@ DEAD_X   = 0.3       # 横向死区 (cm) — |x_err|<DEAD_X → 输出 0
 DEAD_DIST = 0.5      # 纵向死区 (cm) — |y_err|<DEAD_DIST → 输出 0
 
 # ── 输出限幅 ──
-MAX_VX   = 1.2       # 前后最大速度 (m/s)
-MAX_VY   = 1.2       # 横向最大速度 (m/s)
+MAX_VX   = 1.5       # 前后最大速度 (m/s)
+MAX_VY   = 1.5       # 横向最大速度 (m/s)
 MAX_WZ   = 1         # 旋转最大速度 (归一化)
 
 # ── 积分限幅 ──
@@ -43,7 +43,7 @@ IX_OUT = 0.20        # X通道积分输出上限 (m/s)
 IY_OUT = 0.20        # Y通道积分输出上限 (m/s)
 
 # ── 动态速度预算 (3轴: vx+vy+wz) ──
-SPEED_BUDGET   = 0.90  # 总速度预算 (归一化)
+SPEED_BUDGET   = 1.0  # 总速度预算 (归一化)
 VY_BUDGET_MAX  = 0.70  # 横向占比上限 — x_err大→vy优先
 VY_BUDGET_MIN  = 0.30  # 横向占比下限 — y_err大→vx优先
 
@@ -307,3 +307,5 @@ def cam_approach(cam, lock_heading_fn, calc_wz_fn,
 
     if led_fn: led_fn(False)
     return (True, 'arrived')
+
+

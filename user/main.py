@@ -67,17 +67,17 @@ ORIGIN_CTRL_DT      = 0.01    # 控制周期 (s)
 BACKUP_PATH_SPEED   = 0.50    # 倒车回到路径速度 (m/s)
 BACKUP_PATH_TIMEOUT = 15.0    # 倒车回到路径超时 (s)
 
-# ── move_toward_fixed_point: 前进 50cm → 右平移 110cm ──
-MFP_FORWARD_DIST_CM  = 50.0    # 前进距离 (cm)
-MFP_RIGHT_DIST_CM    = 110.0   # 右平移距离 (cm)
+# ── move_toward_fixed_point: 前进 50cm(补偿后) → 右平移 110cm(补偿后) ──
+MFP_FORWARD_DIST_CM  = 50.0    # 目标50cm 
+MFP_RIGHT_DIST_CM    = 90.0   # 目标110cm - 20cm惯性 = 90.0cm
 MFP_SPEED            = 0.50    # 行进速度 (m/s)
 MFP_TIMEOUT_S        = 15.0    # 超时 (s)
 MFP_CTRL_DT          = 0.02    # 控制周期 (s)
 
-# ── _action_rightward_search: 右移 1.2m 搜索 ──
-RIGHTWARD_SEARCH_DIST_CM = 120.0   # 累计右移总距离 (cm)
+# ── _action_rightward_search: 右移 1.0m 搜索(补偿后) ──
+RIGHTWARD_SEARCH_DIST_CM = 90.0   # 目标100cm - 10cm侧向惯性 = 90.0cm
 RIGHTWARD_SPEED          = 0.40    # 右移速度 (m/s)
-RIGHTWARD_TIMEOUT_S      = 30.0    # 单次右移超时 (s)
+RIGHTWARD_TIMEOUT_S      = 20.0    # 单次右移超时 (s)
 RIGHTWARD_CTRL_DT        = 0.02    # 控制周期 (s)
 
 # ── SW2 ──
@@ -92,14 +92,15 @@ _approach_forward_dist = 0.0   # 取物流程净前进距离 (m)
 _rightward_cumulative  = 0.0   # 累计右移距离 (m)，跨多次调用持久化
 
 # ── 本地一阶低通滤波器（单次读取编码器 + 滤波，杜绝双读隐患）──
-_SPD_FILTER_ALPHA = 0.4
+_SPD_FILTER_ALPHA = 0.75
 _local_prev_speeds = [0.0, 0.0, 0.0, 0.0]
 _local_speeds_initialized = False
 
 
 def _get_local_filtered_speeds(raw_counts, dt):
     """基于外部传入的 counts 数组计算一阶低通滤波速度 [rf, lf, lb, rb] (m/s)。
-    不调用 get_encoder_counts()，杜绝二次读取导致增量清零。"""
+    不调用 get_encoder_counts()，杜绝二次读取导致增量清零。
+    🟢 内存零分配：原地修改 _local_prev_speeds，不创建新 list"""
     global _local_prev_speeds, _local_speeds_initialized
 
     if raw_counts is None or len(raw_counts) < 4:
@@ -109,18 +110,17 @@ def _get_local_filtered_speeds(raw_counts, dt):
     if dt <= 0.0001:
         dt = FWD_CTRL_DT  # 容错回退到默认控制周期 0.02s
 
-    raw_speeds = [raw_counts[i] / ENC_SCALE[i] / dt if ENC_SCALE[i] != 0 else 0
-                  for i in range(4)]
-
     if not _local_speeds_initialized:
-        _local_prev_speeds = raw_speeds[:]
+        for i in range(4):
+            _local_prev_speeds[i] = (raw_counts[i] / ENC_SCALE[i] / dt) if ENC_SCALE[i] != 0 else 0
         _local_speeds_initialized = True
         return _local_prev_speeds
 
-    _local_prev_speeds = [
-        _SPD_FILTER_ALPHA * p + (1 - _SPD_FILTER_ALPHA) * r
-        for p, r in zip(_local_prev_speeds, raw_speeds)
-    ]
+    # 原地逐元素更新：零堆分配
+    for i in range(4):
+        raw_spd = (raw_counts[i] / ENC_SCALE[i] / dt) if ENC_SCALE[i] != 0 else 0
+        _local_prev_speeds[i] = _SPD_FILTER_ALPHA * _local_prev_speeds[i] + (1 - _SPD_FILTER_ALPHA) * raw_spd
+
     return _local_prev_speeds
 
 
@@ -400,12 +400,6 @@ def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FW
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = FWD_CTRL_DT
-        if actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-        last_loop_ms = now_ms
 
         if _abort_check():
             led.value(0)
@@ -421,6 +415,14 @@ def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FW
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
 
         # 对单次增量脉冲取绝对值累加，彻底规避左右轮极性抵消的致命 Bug
         for i in range(4):
@@ -476,12 +478,6 @@ def _execute_backup(target_heading):
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = FWD_CTRL_DT
-        if actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-        last_loop_ms = now_ms
 
         if _abort_check():
             return
@@ -495,6 +491,14 @@ def _execute_backup(target_heading):
         if bcounts is None or len(bcounts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
 
         # 倒退时同样采用绝对值累加，防止倒退距离计算抵消
         for i in range(4):
@@ -561,12 +565,6 @@ def _action_rightward_search():
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = RIGHTWARD_CTRL_DT
-        if actual_dt > 3 * RIGHTWARD_CTRL_DT:
-            actual_dt = RIGHTWARD_CTRL_DT
-        last_loop_ms = now_ms
 
         # A. SW2 中断检查
         if _abort_check():
@@ -588,6 +586,14 @@ def _action_rightward_search():
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = RIGHTWARD_CTRL_DT
+        if actual_dt > 3 * RIGHTWARD_CTRL_DT:
+            actual_dt = RIGHTWARD_CTRL_DT
+        last_loop_ms = now_ms
 
         # D. 编码器绝对值累加（本会话平均距离）
         for i in range(4):
@@ -673,12 +679,6 @@ def _reverse_to_rightward_path():
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = FWD_CTRL_DT
-        if actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-        last_loop_ms = now_ms
 
         if _abort_check():
             stop_all()
@@ -696,6 +696,14 @@ def _reverse_to_rightward_path():
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
 
         # 绝对值累加，规避镜像接线极性抵消
         for i in range(4):
@@ -739,90 +747,160 @@ def _reverse_to_rightward_path():
 
 def see_and_push():
     """
-    完全复用 test_follow.py 的高平滑度控制链（动态实际 dt + 一阶低通滤波轮速 speeds），
-    同时保留 main.py 必需的自动到达判定、蓝牙从车通信与状态机跳转。
+    完全复用 test_vision_track.py 的核心跟随控制机理（CamDataReceiver + FollowController），
+    结合本地单次读取一阶低通滤波、动态时间步长与 8 帧对齐精准停靠判定。
     """
-    print("\n  [APPROACH] === 靠近目标 & 蓝牙信号 ===")
+    print("\n  [APPROACH] === 视觉对齐靠近 ➔ 蓝牙同步流程 ===")
 
-    cam = _ensure_cam()
-    
-    # ── 🟢 引入动态时间状态，用于消除由于相机串口数据变延迟引起的轮速闭环剧烈抖动 ──
-    drive_state = {"last_ms": None}
+    # ── 🟢 导入 test_vision_track 中验证通过的数据处理与控制器模块 ──
+    from cam_data import CamDataReceiver, x_to_cm, y_to_distance
+    from cam_follow import FollowController
 
-    # ── 回调函数：完全复用 test_follow.py 的高品质控制 ──
-    def _lock_fn():
-        return _lock_yaw()
+    # ── 初始化串口数据接收器与对齐状态控制器 ──
+    recv = CamDataReceiver(uart_id=7)
+    fc = FollowController()
 
-    def _wz_fn(target):
-        # 保持 100Hz (10ms) 的高响应航向更新（deadband 由 IMU_hold 全局管理）
-        return _heading_correction(target, dt=0.01)
+    # ── 状态及历史数据初始化 ──
+    target_heading = _lock_yaw()
+    last_x_cm = 0.0
+    last_dist_cm = 0.0
+    last_has_tgt = False
+    prev_vy = 0.0
 
-    def _abort_fn():
-        pet_watchdog()
-        if check_sw2():
-            print("  [SW2] Abort requested")
-            return True
-        return False
+    align_consecutive_count = 0  # 连续稳定对齐判定计数
+    arrived_success = False      # 到达停靠点标志位
 
-    def _drive_fn(vx, vy, wz, dt):
-        # ── 🟢 完全复用 test_follow.py 的动态时间步理解算 ──
-        now = time.ticks_ms()
-        last_ms = drive_state["last_ms"]
-        if last_ms is None:
-            actual_dt = dt
-        else:
-            actual_dt = time.ticks_diff(now, last_ms) / 1000.0
-            if actual_dt <= 0.001:  # 防止极限除零
-                actual_dt = dt
-            if actual_dt > 3 * dt:  # 🟢 新增：GC尖峰钳位
-                actual_dt = dt
-        drive_state["last_ms"] = now
+    LOOP_MS = 10                 # 100Hz 严苛控制节拍
+    t_prev = time.ticks_ms()
+    loop_cnt = 0
 
-        rc = get_encoder_counts()
-        if rc is not None and len(rc) >= 4:
-            # 🟢 实时累加平均前进位移到 _approach_forward_dist
-            global _approach_forward_dist
-            wheel_sum = 0.0
-            valid = 0
-            for i in range(4):
-                if ENC_SCALE[i] != 0:
-                    wheel_sum += abs(rc[i]) / abs(ENC_SCALE[i])
-                    valid += 1
-            if valid > 0:
-                _approach_forward_dist += (wheel_sum / valid)
+    # 开启指示灯
+    led.value(1)
 
-            # ── 🟢 核心：使用单次读取的 rc 计算本地一阶低通滤波 speeds ──
-            speeds = _get_local_filtered_speeds(rc, actual_dt)
-            omni_drive_closed_loop(vx, vy, wz, speeds, actual_dt)
+    try:
+        while True:
+            t_now = time.ticks_ms()
+            dt_act = time.ticks_diff(t_now, t_prev) * 0.001
+            t_prev = t_now
+            
+            # 防御性时间异常钳位
+            if dt_act <= 0 or dt_act > 0.1:
+                dt_act = 0.01
 
-    def _stop_fn():
+            # ── 1. 获取传感器原始数据 ──
+            cam_data = recv.read()
+            
+            # ── 2. 计算 IMU 航向补偿 wz ──
+            wz = _heading_correction(target_heading, dt=dt_act)
+
+            # ── 3. 视觉跟随状态解算 ──
+            has_tgt = False
+            x_cm = 0.0
+            dist_cm = 0.0
+
+            if cam_data is not None:
+                has_tgt = cam_data['is_target']
+                if has_tgt:
+                    x_cm = x_to_cm(cam_data['x'])
+                    dist_cm = y_to_distance(cam_data['y'])
+                    # 缓存有效坐标 — 短暂丢失时避免跳变到(0,0)产生剧烈摆动
+                    last_x_cm = x_cm
+                    last_dist_cm = dist_cm
+                    last_has_tgt = True
+                elif last_has_tgt:
+                    # 摄像头帧存在但目标短暂丢失 → 使用上一帧有效值平滑过渡
+                    x_cm = last_x_cm
+                    dist_cm = last_dist_cm
+            else:
+                if last_has_tgt:
+                    # UART 通信瞬时卡顿无数据 → 使用上一帧有效值过渡
+                    x_cm = last_x_cm
+                    dist_cm = last_dist_cm
+
+            # ── 4. 输入 FollowController 进行 3 轴闭环速度及对齐状态解算 ──
+            vx, vy, wz_out, is_aligned, dt_step = fc.step(
+                x_cm, dist_cm, has_tgt, wz_in=wz, now_ms=t_now
+            )
+
+            # ── 5. 驱动增益控制增强：速度倍增 + 一阶阻尼 + 临停死区 ──
+            
+            # 前进速度放大 1.5 倍，物理上限限幅在 0.8m/s
+            boost_vx = vx * 1.5
+            boost_vx = max(0.0, min(boost_vx, 0.80))
+
+            # 横向平移一阶阻尼滤波（60% 历史速度 + 40% 当前指令），阻尼横向共振摆动
+            smooth_vy = 0.6 * prev_vy + 0.4 * vy
+            prev_vy = smooth_vy
+
+            # 临近精细对齐判定（改用 vx 判断接近度，避免远距离因偏差收敛提前降速）
+            if boost_vx < 0.12:
+                smooth_vy = smooth_vy * 0.5
+                if abs(smooth_vy) < 0.03:
+                    smooth_vy = 0.0
+
+            # ── 6. 读取编码器并输出执行（严格单次读取，规避双读 bug） ──
+            rc = get_encoder_counts()
+            if rc is not None and len(rc) >= 4:
+                # 实时累加平均位移到全局前进位移变量（倒车回线重要参数）
+                global _approach_forward_dist
+                wheel_sum = 0.0
+                valid = 0
+                for i in range(4):
+                    if ENC_SCALE[i] != 0:
+                        wheel_sum += abs(rc[i]) / abs(ENC_SCALE[i])
+                        valid += 1
+                if valid > 0:
+                    _approach_forward_dist += (wheel_sum / valid)
+
+                # 底层闭环轮速驱动
+                speeds = _get_local_filtered_speeds(rc, dt_step)
+                omni_drive_closed_loop(boost_vx, smooth_vy, wz_out, speeds, dt_step)
+            else:
+                # 编码器空读时仅做原地姿态维持
+                stop_all()
+
+            # ── 7. 精准到达对齐判定（引入 8 帧防抖动去噪滤波） ──
+            if is_aligned:
+                align_consecutive_count += 1
+            else:
+                align_consecutive_count = 0
+
+            if align_consecutive_count >= 8:
+                stop_all()
+                print("\n  [APPROACH] 目标精准对齐停靠完成 (连续 8 帧对齐确认)！")
+                arrived_success = True
+                break
+
+            # ── 8. 中断退出检测与 100Hz 严格节拍维持 ──
+            if check_sw2():
+                print("\n  [APPROACH] SW2 手动中断退出。")
+                stop_all()
+                break
+
+            elap = time.ticks_diff(time.ticks_ms(), t_now)
+            if elap < LOOP_MS:
+                time.sleep_ms(LOOP_MS - elap)
+
+            loop_cnt += 1
+            if loop_cnt % 50 == 0:
+                gc.collect()
+
+    except Exception as e:
+        print("\n  [APPROACH] 视觉对齐靠近执行异常:", e)
         stop_all()
+    finally:
+        led.value(0)
 
-    def _led_fn(val):
-        led.value(val)
-
-    # 在靠近前重置一下时间状态
-    drive_state["last_ms"] = None
-
-    # ── 1. 调用底层的 cam_approach 靠近目标直到到达判定 ──
-    arrived, reason = cam_approach(
-        cam, _lock_fn, _wz_fn, _abort_fn,
-        _drive_fn, _stop_fn, _led_fn
-    )
-
-    if not arrived:
+    # ── 如果对齐跟随过程未最终到达，不执行后续协同，直接退回 ──
+    if not arrived_success:
         return False
 
-    # ── 2. 释放 LED ──
-    led.value(0)
-
-    # ── 3. 蓝牙发送与等待确认闭环（main.py 必需的竞赛任务） ──
+    # ── 9. 对齐停靠成功，启动蓝牙协同发送与重试机制（生产 main 逻辑） ──
     if check_sw2():
         print("  [APPROACH] 检测到 SW2 手动中断，强制跳过蓝牙等待")
         return True
 
     print("  [APPROACH] 向从车发送数字 0 (turn_right)...")
-    target_heading = _lock_yaw()
     retry_count = 0
     try:
         while True:
@@ -833,10 +911,10 @@ def see_and_push():
             bt_wait_start = time.ticks_ms()
             while True:
                 pet_watchdog()
-                _maintain_yaw(target_heading)  # 等待期间持续修正航向
+                _maintain_yaw(target_heading)  # 等待期间持续修正姿态
                 if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
                     print("  [APPROACH] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
-                    break  # 退出内层等待循环，重新发送
+                    break  # 退出内循环，重新发送
                 if check_sw2():
                     print("  [APPROACH] SW2 中断，跳过蓝牙等待")
                     return True
@@ -846,9 +924,8 @@ def see_and_push():
                     return True
                 time.sleep_ms(10)
     except Exception as e:
-        print("  [APPROACH] 蓝牙发送异常:", e)
+        print("  [APPROACH] 蓝牙通信发生异常:", e)
         return False
-
 
 # ═══════════════════════════════════════════════════════════════
 #  核心修复: 全速前进至 UWB X 距离 < -130cm（支持移动中重连，依靠视觉兜底不停车）
@@ -890,12 +967,6 @@ def _action_forward_until_uwb_x():
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = FWD_CTRL_DT
-        if actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-        last_loop_ms = now_ms
         if _abort_check():
             led.value(0)
             return False
@@ -910,6 +981,14 @@ def _action_forward_until_uwb_x():
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = FWD_CTRL_DT
+        if actual_dt > 3 * FWD_CTRL_DT:
+            actual_dt = FWD_CTRL_DT
+        last_loop_ms = now_ms
 
         # 🟢 实时累加平均前进位移到 _approach_forward_dist
         global _approach_forward_dist
@@ -1121,7 +1200,6 @@ def _action_uwb_translate():
             actual_dt = UWB_CTRL_DT
         if actual_dt > 3 * UWB_CTRL_DT:
             actual_dt = UWB_CTRL_DT
-        last_loop_ms = now_ms
         if _abort_check():
             led.value(0)
             return False
@@ -1210,6 +1288,7 @@ def _action_uwb_translate():
                 continue
             speeds = _get_local_filtered_speeds(rc, actual_dt)
             omni_drive_closed_loop(fwd_speed, 0, wz, speeds, actual_dt)
+            last_loop_ms = now_ms  # 🟢 时序对齐：编码器读取成功后才更新时间戳
         except Exception as e:
             print("  [UWB] 驱动错误:", e)
 
@@ -1248,12 +1327,6 @@ def move_toward_fixed_point():
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = MFP_CTRL_DT
-        if actual_dt > 3 * MFP_CTRL_DT:
-            actual_dt = MFP_CTRL_DT
-        last_loop_ms = now_ms
 
         if _abort_check():
             stop_all()
@@ -1273,6 +1346,14 @@ def move_toward_fixed_point():
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = MFP_CTRL_DT
+        if actual_dt > 3 * MFP_CTRL_DT:
+            actual_dt = MFP_CTRL_DT
+        last_loop_ms = now_ms
 
         for i in range(4):
             if ENC_SCALE[i] != 0:
@@ -1318,12 +1399,6 @@ def move_toward_fixed_point():
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = MFP_CTRL_DT
-        if actual_dt > 3 * MFP_CTRL_DT:
-            actual_dt = MFP_CTRL_DT
-        last_loop_ms = now_ms
 
         if _abort_check():
             stop_all()
@@ -1343,6 +1418,14 @@ def move_toward_fixed_point():
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
+        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = MFP_CTRL_DT
+        if actual_dt > 3 * MFP_CTRL_DT:
+            actual_dt = MFP_CTRL_DT
+        last_loop_ms = now_ms
 
         for i in range(4):
             if ENC_SCALE[i] != 0:
@@ -1462,122 +1545,191 @@ def main():
     # ── 🔒 提前锁定航向 ──
     _lock_yaw()
 
-    # ── UWB 初始化 & 记录起点坐标 ──
-    global origin
-    uwb = _ensure_uwb()
-    if uwb is not None and uwb.get_frame_count() > 0:
-        origin = uwb.get_position()  
-        print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
-            origin[0], origin[1]))
-    else:
-        print("  [ORIGIN] UWB 未就绪，使用默认坐标")
-        origin = (130.0, 262.0)
+#     # ── UWB 初始化 & 记录起点坐标 ──
+#     global origin
+#     uwb = _ensure_uwb()
+#     if uwb is not None and uwb.get_frame_count() > 0:
+#         origin = uwb.get_position()  
+#         print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
+#             origin[0], origin[1]))
+#     else:
+#         print("  [ORIGIN] UWB 未就绪，使用默认坐标")
+#         origin = (130.0, 262.0)
 
-    print("  [MAIN] 航向已锁定，执行初始路径移动...")
-    move_toward_fixed_point()
+    # ──── 注释掉完整流程，启用测试模式 ────
+    # print("  [MAIN] 航向已锁定，执行初始路径移动...")
+    # move_toward_fixed_point()
+    #
+    # # ═══════════════════════════════════════════════════════
+    # #  主循环：右移搜索（累计1.2m）+ 取物流程
+    # # ═══════════════════════════════════════════════════════
 
-    # ═══════════════════════════════════════════════════════
-    #  主循环：右移搜索（累计1.2m）+ 取物流程
-    # ═══════════════════════════════════════════════════════
+    # ──── 测试模式：C8/C9 按键调度 ────
+    print("  [MAIN] 航向已锁定（测试模式）")
+    print("  [MAIN] C8=move_toward_fixed_point  C9=rightward_search  SW2=退出")
+    print("")
+
     while True:
-        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-        _encoder_reset()
+        capture()
+        pet_watchdog()
 
-        # ① 向右平移搜索（累计1.2m，逐帧摄像头检测物品）
-        item_found = _action_rightward_search()
+        if key_triggered(1):  # KEY1 = C8
+            print("\n  [MAIN] C8 触发: move_toward_fixed_point()")
+            try:
+                move_toward_fixed_point()
+            except Exception as e:
+                print("  [MAIN] move_toward_fixed_point 异常:", e)
+            print("  [MAIN] 完成，等待下一次按键...\n")
+            _pause_with_yaw_hold(_TARGET_HEADING, 300)
+            _encoder_reset()
+            continue
 
-        if not item_found:
-            # 1.2m 右移完成，未发现物品 → 返航停机
-            print("\n  [MAIN] 1.2m 右移搜索完成，未检测到物品")
+        if key_triggered(2):  # KEY2 = C9
+            print("\n  [MAIN] C9 触发: 右移搜索 → 发现目标后靠近")
+            try:
+                # 🟢 暂停后台定时器，防止与主循环抢编码器数据
+                pause_encoder_ticker()
+                _encoder_reset()
+
+                found = _action_rightward_search()
+                if found:
+                    print("  [MAIN] 检测到目标，开始视觉靠近...")
+                    global _approach_forward_dist
+                    _approach_forward_dist = 0.0
+                    _encoder_reset()
+
+                    arrived = see_and_push()
+                    print("  [MAIN] 视觉靠近结果: {}".format("到达" if arrived else "中断"))
+                else:
+                    print("  [MAIN] 未发现目标")
+
+                resume_encoder_ticker()
+            except Exception as e:
+                print("  [MAIN] C9 流程异常:", e)
+            print("  [MAIN] 完成，等待下一次按键...\n")
+            _pause_with_yaw_hold(_TARGET_HEADING, 300)
+            _encoder_reset()
+            continue
+
+        if check_sw2():
+            print("  [MAIN] SW2 退出测试模式")
             break
 
-        # ── 物品被发现 → 执行取物流程 ②~⑥ ──
-        global _approach_forward_dist
-        _approach_forward_dist = 0.0  # 重置净前进距离追踪
+        time.sleep_ms(10)
 
-        # 清零此前横移搜索产生的编码器数据
-        _encoder_reset()
+    stop_all()
+    _encoder_reset()
+    try:
+        pause_encoder_ticker()
+        stop_imu_ticker()
+    except Exception:
+        pass
+    
+    print("\n[INFO] 程序运行结束。")
+    return
 
-        # ② 离开平移路径，向前视觉靠近（移动期间已通过 _drive_fn 实时累加前进距离）
-        if not see_and_push():
-            print("  [MAIN] 视觉靠近中断，沿原路倒退回到搜索路径...")
-            _reverse_to_rightward_path()
-            _pause_with_yaw_hold(_TARGET_HEADING, 300)
-            _encoder_reset()
-            continue
-
-        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-        _encoder_reset()
-
-        # ③ 全速推送过 UWB 边界（移动期间已在内部实时累加前进距离）
-        if not _action_forward_until_uwb_x():
-            print("  [MAIN] UWB 推送中断，沿原路倒退回到搜索路径...")
-            _reverse_to_rightward_path()
-            _pause_with_yaw_hold(_TARGET_HEADING, 300)
-            _encoder_reset()
-            continue
-
-        # 执行 20cm 倒退（避开障碍物/边界线）
-        _execute_backup(_TARGET_HEADING)
-
-        # 手动扣除 20cm 倒退距离，得到净前进距离
-        _approach_forward_dist -= (UWB_BACKUP_DIST_CM / 100.0)
-        if _approach_forward_dist < 0:
-            _approach_forward_dist = 0.0
-
-        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-        _encoder_reset()
-
-        # ④ 蓝牙通知从车（永不因蓝牙超时触发返航）
-        if check_sw2():
-            print("  [MAIN] SW2 手动旁路，跳过蓝牙")
-        else:
-            target_heading = _lock_yaw()
-            retry_count = 0
-            try:
-                while True:
-                    bt.turn_left()
-                    retry_count += 1
-                    suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
-                    print("  [MAIN] turn_left 已发出{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
-                    bt_wait_start = time.ticks_ms()
-                    received_ok = False
-                    while True:
-                        pet_watchdog()
-                        _maintain_yaw(target_heading)
-                        if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
-                            print("  [MAIN] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
-                            break  # 退出内层等待循环，重新发送
-                        if check_sw2():
-                            print("  [MAIN] SW2 中断等待")
-                            break
-                        resp = bt.read_response()
-                        if resp == "ok":
-                            print("  [MAIN] 从车确认完毕")
-                            received_ok = True
-                            break
-                        time.sleep_ms(10)
-                    if received_ok or check_sw2():
-                        break
-            except Exception as e:
-                print("  [MAIN] 蓝牙通信异常:", e)
-                # 蓝牙硬件异常也直接继续，不触发返航
-
-        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-        _encoder_reset()
-
-        # ⑤ 向后倒车，回到右移路径线
-        _reverse_to_rightward_path()
-
-        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-        _encoder_reset()
-
-        # ⑥ 循环回到 ①，从断点处继续右移搜索
-        print("  [MAIN] 已回到右移路径，继续搜索...")
-
-    # ⑦ 返航停机
-    print("\n  [MAIN] 触发自动返航...")
-    _safe_return_and_exit()
+# ═══════════════════════════════════════════════════════════════
+#  [原版完整流程] 取消上方测试代码注释，恢复下方代码即可
+# ═══════════════════════════════════════════════════════════════
+#    while True:
+#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#        _encoder_reset()
+#
+#        # ① 向右平移搜索（累计1.2m，逐帧摄像头检测物品）
+#        item_found = _action_rightward_search()
+#
+#        if not item_found:
+#            # 1.2m 右移完成，未发现物品 → 返航停机
+#            print("\n  [MAIN] 1.2m 右移搜索完成，未检测到物品")
+#            break
+#
+#        # ── 物品被发现 → 执行取物流程 ②~⑥ ──
+#        global _approach_forward_dist
+#        _approach_forward_dist = 0.0  # 重置净前进距离追踪
+#
+#        # 清零此前横移搜索产生的编码器数据
+#        _encoder_reset()
+#
+#        # ② 离开平移路径，向前视觉靠近（移动期间已通过 _drive_fn 实时累加前进距离）
+#        if not see_and_push():
+#            print("  [MAIN] 视觉靠近中断，沿原路倒退回到搜索路径...")
+#            _reverse_to_rightward_path()
+#            _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#            _encoder_reset()
+#            continue
+#
+#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#        _encoder_reset()
+#
+#        # ③ 全速推送过 UWB 边界（移动期间已在内部实时累加前进距离）
+#        if not _action_forward_until_uwb_x():
+#            print("  [MAIN] UWB 推送中断，沿原路倒退回到搜索路径...")
+#            _reverse_to_rightward_path()
+#            _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#            _encoder_reset()
+#            continue
+#
+#        # 执行 20cm 倒退（避开障碍物/边界线）
+#        _execute_backup(_TARGET_HEADING)
+#
+#        # 手动扣除 20cm 倒退距离，得到净前进距离
+#        _approach_forward_dist -= (UWB_BACKUP_DIST_CM / 100.0)
+#        if _approach_forward_dist < 0:
+#            _approach_forward_dist = 0.0
+#
+#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#        _encoder_reset()
+#
+#        # ④ 蓝牙通知从车（永不因蓝牙超时触发返航）
+#        if check_sw2():
+#            print("  [MAIN] SW2 手动旁路，跳过蓝牙")
+#        else:
+#            target_heading = _lock_yaw()
+#            retry_count = 0
+#            try:
+#                while True:
+#                    bt.turn_left()
+#                    retry_count += 1
+#                    suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
+#                    print("  [MAIN] turn_left 已发出{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
+#                    bt_wait_start = time.ticks_ms()
+#                    received_ok = False
+#                    while True:
+#                        pet_watchdog()
+#                        _maintain_yaw(target_heading)
+#                        if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
+#                            print("  [MAIN] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
+#                            break  # 退出内层等待循环，重新发送
+#                        if check_sw2():
+#                            print("  [MAIN] SW2 中断等待")
+#                            break
+#                        resp = bt.read_response()
+#                        if resp == "ok":
+#                            print("  [MAIN] 从车确认完毕")
+#                            received_ok = True
+#                            break
+#                        time.sleep_ms(10)
+#                    if received_ok or check_sw2():
+#                        break
+#            except Exception as e:
+#                print("  [MAIN] 蓝牙通信异常:", e)
+#                # 蓝牙硬件异常也直接继续，不触发返航
+#
+#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#        _encoder_reset()
+#
+#        # ⑤ 向后倒车，回到右移路径线
+#        _reverse_to_rightward_path()
+#
+#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+#        _encoder_reset()
+#
+#        # ⑥ 循环回到 ①，从断点处继续右移搜索
+#        print("  [MAIN] 已回到右移路径，继续搜索...")
+#
+#    # ⑦ 返航停机
+#    print("\n  [MAIN] 触发自动返航...")
+#    _safe_return_and_exit()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1617,3 +1769,4 @@ def _safe_return_and_exit():
 # ═══════════════════════════════════════════════════════════════
 
 main()
+

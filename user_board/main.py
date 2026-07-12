@@ -1,170 +1,164 @@
 """
-test_uwb_nav.py — UWB 导航调试：发车区 → 物资区 （VOFA+ 可视化）
+test_vision_track.py — 视觉跟随功能测试（观察底盘速度输出）
+
+【测试目的】
+  1. 验证 FollowController 的输入死区 + 3轴速度预算跟随效果。
+  2. 观察对齐阈值 (ALIGN_EX, ALIGN_DIST) 的判定触发时机。
+  3. 验证 HeadingHold 在跟随过程中抑制底盘自旋的稳定性。
 """
-import gc
-import time
-import struct
-import sys
+
+import gc, time
 from machine import Pin
-gc.collect()
 
-from uwb_control import UWBPosition, goto_location
-from IMU_hold import HeadingHold
-from uwb_follow import GOTO_SUPPLIES_X, GOTO_SUPPLIES_Y, GOTO_CTRL_DT
-from motor import (stop_all, omni_drive_closed_loop,
-                   get_encoder_counts,
-                   reset_encoder_filter, reset_wheel_pi, ENC_SCALE)
 from imu import IMU
-from key import pet_watchdog
-gc.collect()
+from cam_data import CamDataReceiver, x_to_cm, y_to_distance
+from cam_follow import FollowController, DIST, ALIGN_EX, ALIGN_DIST
+from IMU_hold import HeadingHold
+from motor import (stop_all, omni_drive_closed_loop,
+                   get_encoder_speeds_filtered, get_encoder_counts,
+                   reset_encoder_filter, reset_wheel_pi)
 
-TARGET_X, TARGET_Y = GOTO_SUPPLIES_X, GOTO_SUPPLIES_Y
-LED_PIN         = 'C4'
-SW2_PIN         = 'D9'
-SW2_DEBOUNCE_MS = 50
-UWB_UART        = 0
-UWB_BAUDRATE    = 115200
-UWB_ANCHOR      = "8834"
-
-# ═══════════════════════════════════════════════════════════════
-#  VOFA+ Firewater 协议
-# ═══════════════════════════════════════════════════════════════
-ENABLE_VOFA       = True
-VOFA_SEND_MS      = 100      # VOFA 发送间隔 (ms)
-_FW_TAIL          = bytearray([0x00, 0x00, 0x80, 0x7F])  # float infinity
-
-_last_vofa_ms = 0  # 全局节流时间戳
-
-def send_vofa(tx, ty, cx, cy):
-    """发送 4 通道 float 到 VOFA+: CH0=target_x, CH1=target_y, CH2=curr_x, CH3=curr_y"""
-    data = struct.pack("<ffff", tx, ty, cx, cy)
-    sys.stdout.buffer.write(data + _FW_TAIL)
-
-
-_sw2_last         = 1
-_sw2_changed      = False
-_sw2_stable_start = 0
-
-
-def _check_sw2(sw2_pin):
-    global _sw2_last, _sw2_changed, _sw2_stable_start
-    val = sw2_pin.value()
-    if val != _sw2_last:
-        _sw2_last = val
-        _sw2_changed = True
-        _sw2_stable_start = time.ticks_ms()
-    if _sw2_changed and time.ticks_diff(time.ticks_ms(), _sw2_stable_start) >= SW2_DEBOUNCE_MS:
-        _sw2_changed = False
-        return True
-    return False
-
+# ── 调试配置 ──
+LOOP_MS  = 10               # 控制周期 100Hz
+DT       = 0.01
+PRINT_MS = 200              # 终端打印间隔 (ms)
+SW2_PIN  = 'D9'
 
 def main():
     gc.collect()
 
-    led = Pin(LED_PIN, Pin.OUT, value=False)
     sw2 = Pin(SW2_PIN, Pin.IN, pull=Pin.PULL_UP_47K)
+    sw2_start_state = sw2.value()
 
-    global _sw2_last, _sw2_changed, _sw2_stable_start
-    _sw2_last = sw2.value()
-    _sw2_changed = False
-    _sw2_stable_start = 0
-
-    # print("  UWB nav: ({:.1f}, {:.1f})".format(TARGET_X, TARGET_Y))
-
-    # ── IMU ──
-    imu = IMU(calibrate_on_init=True, calib_samples=500, period_ms=10)
+    # ── IMU 与航向保持初始化 ──
+    print("[INIT] 校准 IMU 陀螺仪...")
+    imu = IMU(calibrate_on_init=True, calib_samples=300)
     imu.start()
     time.sleep_ms(200)
     imu.set_zero_reference()
-    hold = HeadingHold(imu, target_yaw_deg=0.0)
+    
+    hold = HeadingHold(imu)
+    hold.set_target(0)
+    print("[INIT] 航向保持就绪，锁定当前朝向(0°)")
 
-    # ── 编码器复位 ──
-    reset_encoder_filter()
-    reset_wheel_pi()
-    hold.reset()
+    # ── 视觉与电机初始化 ──
+    recv = CamDataReceiver(uart_id=7)
+    fc = FollowController()
+    print("[INIT] FollowController + 摄像头串口就绪")
+
+    stop_all()
     for _ in range(5):
         _ = get_encoder_counts()
         time.sleep_ms(10)
+    reset_encoder_filter()
+    reset_wheel_pi()
+    
+    print("=" * 50)
+    print(" 开始跟随测试 | 目标对齐距离: {:.0f}cm | 按 SW2 退出".format(DIST))
+    print("=" * 50)
 
-    # ── UWB ──
-    uwb = UWBPosition(uart_id=UWB_UART, baudrate=UWB_BAUDRATE, target_anchor=UWB_ANCHOR)
-    wait_start = time.ticks_ms()
-    while uwb.get_frame_count() == 0:
-        uwb.step()
-        pet_watchdog()
-        if _check_sw2(sw2) or time.ticks_diff(time.ticks_ms(), wait_start) > 5000:
-            uwb.stop(); stop_all(); led.value(0); return
-        time.sleep_ms(10)
-    # print("  [UWB] ready f={}".format(uwb.get_frame_count()))
+    t_prev = time.ticks_ms()
+    t_print = time.ticks_ms()
+    loop_cnt = 0
 
-    # ── 回调 ──
-    def lock_heading():  return hold.target
-    def calc_wz(t):
-        if t is not None and t != hold.target: hold.set_target(t)
-        wz, _, _ = hold.compute(GOTO_CTRL_DT); return wz
-    def get_yaw():       return imu.get_angles()[2]
-    def should_abort():
-        pet_watchdog(); return _check_sw2(sw2)
-    def drive_fn(vx, vy, wz, dt):
-        try:
-            rc = get_encoder_counts()
-            if rc and len(rc) >= 4:
-                rs = [rc[i] / ENC_SCALE[i] / dt if ENC_SCALE[i] != 0 else 0 for i in range(4)]
-                omni_drive_closed_loop(vx, vy, wz, rs, dt)
-        except Exception: pass
-    def stop_fn():  stop_all()
-    def led_fn(on): led.value(1 if on else 0)
+    # 目标短暂丢失时保留上一帧有效坐标，防止跳变到(0,0)误驱动
+    last_x_cm = 0.0
+    last_dist_cm = 0.0
+    last_has_tgt = False
 
-    # ── 编码器融合回调 ──
-    def enc_fn(): return get_encoder_counts()
-    def drive_with_spd(vx, vy, wz, dt, spd):
-        omni_drive_closed_loop(vx, vy, wz, spd, dt)
-
-    # ── VOFA on_progress 回调 ──
-    global _last_vofa_ms
-    _last_vofa_ms = time.ticks_ms()
-
-    def on_progress(dist_cm, curr_x, curr_y):
-        global _last_vofa_ms
-        if not ENABLE_VOFA:
-            return
-        now = time.ticks_ms()
-        if time.ticks_diff(now, _last_vofa_ms) >= VOFA_SEND_MS:
-            _last_vofa_ms = now
-            send_vofa(TARGET_X, TARGET_Y, curr_x, curr_y)
-
-    # ── 导航 ──
-    # print("  [GO]")
     try:
-        arrived, reason = goto_location(
-            uwb, TARGET_X, TARGET_Y,
-            lock_heading, calc_wz, get_yaw,
-            should_abort, drive_fn, stop_fn,
-            enc_fn, ENC_SCALE, drive_with_spd,
-            led_fn=led_fn, label="UWB",
-            on_progress=on_progress, verbose=False
-        )
-        raw = uwb.get_latest_raw()
-        filt = uwb.get_position()
-        print("  [OK] {} raw({:.1f},{:.1f}) filt({:.1f},{:.1f}) f={}".format(
-            reason, raw[0], raw[1], filt[0], filt[1], uwb.get_frame_count()))
-    except KeyboardInterrupt:
-        print("\n  [STOP]")
-    except Exception as e:
-        print("\n  [ERR] {}".format(e))
-        import sys; sys.print_exception(e)
-    finally:
-        imu.stop()
-        uwb.stop(); stop_all(); led.value(0)
-        print("  [DONE] 按 SW2 或复位退出。")
-        try:
-            while not _check_sw2(sw2):
-                pet_watchdog()
-                time.sleep_ms(100)
-        except KeyboardInterrupt:
-            pass
+        while True:
+            t_now = time.ticks_ms()
+            dt_act = time.ticks_diff(t_now, t_prev) * 0.001
+            t_prev = t_now
+            if dt_act <= 0 or dt_act > 0.1:
+                dt_act = DT
 
+            # ── 获取传感数据 ──
+            cam_data = recv.read()
+            imu.update()
+            
+            # 计算航向补偿 WZ (独立闭环)
+            wz, _, _ = hold.compute(dt_act)
+
+            # ── 视觉跟随解算 ──
+            has_tgt = False
+            x_cm = 0.0
+            dist_cm = 0.0
+            obj_id = 0
+            line_flag = 0
+
+            if cam_data is not None:
+                has_tgt = cam_data['is_target']
+                obj_id = cam_data['id']
+                line_flag = cam_data['line_flag']
+                if has_tgt:
+                    x_cm = x_to_cm(cam_data['x'])
+                    dist_cm = y_to_distance(cam_data['y'])
+                    # 缓存有效坐标 — 短暂丢失时避免跳变到(0,0)
+                    last_x_cm = x_cm
+                    last_dist_cm = dist_cm
+                    last_has_tgt = True
+                elif last_has_tgt:
+                    # 摄像头帧存在但目标丢失 → 用上一帧有效值过渡
+                    x_cm = last_x_cm
+                    dist_cm = last_dist_cm
+            else:
+                if last_has_tgt:
+                    # 无 UART 数据 → 用上一帧有效值过渡
+                    x_cm = last_x_cm
+                    dist_cm = last_dist_cm
+
+            # 将目标状态输入跟随控制器 (对齐 LED: dt 由控制器内算，统一返回)
+            vx, vy, wz_out, is_aligned, dt_step = fc.step(x_cm, dist_cm, has_tgt, wz_in=wz, now_ms=t_now)
+
+            # ── 速度合成与底层闭环 ──
+
+            # 黄线越界 → 立即停车 (测试跟随时注释)
+            # if line_flag:
+            #     print("\n[LINE] 黄线越界 → 停车!")
+            #     stop_all()
+            #     break
+
+            if abs(vx) > 0.001 or abs(vy) > 0.001:
+                # FollowController 处于 FOLLOW 态 → 驱动 vx, vy, wz_out
+                speeds = get_encoder_speeds_filtered(dt_step)
+                omni_drive_closed_loop(vx, vy, wz_out, speeds, dt_step)
+            else:
+                # S_LOST 或 S_STOP → 仅维持航向
+                if abs(wz) > 0.001:
+                    speeds = get_encoder_speeds_filtered(dt_step)
+                    omni_drive_closed_loop(0, 0, wz, speeds, dt_step)
+                else:
+                    stop_all()
+
+            # ── 状态打印 (供参数调优使用) ──
+            if time.ticks_diff(t_now, t_print) >= PRINT_MS:
+                state_str = "T" if has_tgt else "-"
+                al = "✓" if is_aligned else " "
+                print("[{:04d} {} {}] X:{:+5.1f} D:{:5.1f} | vx:{:+.2f} vy:{:+.2f} wz:{:+.2f}".format(
+                    loop_cnt, state_str, al, x_cm, dist_cm, vx, vy, wz_out), end='\r')
+                t_print = t_now
+
+            # ── 退出检测与节拍维持 ──
+            if sw2.value() != sw2_start_state:
+                print("\n[EXIT] SW2 触发退出。")
+                break
+
+            elap = time.ticks_diff(time.ticks_ms(), t_now)
+            if elap < LOOP_MS:
+                time.sleep_ms(LOOP_MS - elap)
+
+            loop_cnt += 1
+            if loop_cnt % 50 == 0:
+                gc.collect()
+
+    except KeyboardInterrupt:
+        print("\n[EXIT] 键盘中断。")
+    finally:
+        stop_all()
+        imu.stop()
+        print("测试结束，电机已锁定。")
 
 if __name__ == '__main__':
     main()
