@@ -20,7 +20,7 @@ from uwb_position import UWBPosition
 from IMU_hold import HeadingHold
 
 gc.collect()  # 导入相机模块前再次回收
-from cam_control import CameraController, cam_approach
+from cam_control import CameraController
 from uwb_control import goto_location
 
 # ═══════════════════════════════════════════════════════════════
@@ -411,17 +411,22 @@ def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FW
             led.value(0)
             return False
 
+        # ── 🟢 核心修改：先获取并校验编码器 counts，保证硬件计数周期不被 continue 割裂 ──
         counts = get_encoder_counts()
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
 
-        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        # ── 🟢 校验通过后，再刷新时间基准，计算真实的 actual_dt，防止突变 ──
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001:
             actual_dt = FWD_CTRL_DT
         if actual_dt > 3 * FWD_CTRL_DT:
             actual_dt = FWD_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         # 对单次增量脉冲取绝对值累加，彻底规避左右轮极性抵消的致命 Bug
@@ -492,12 +497,16 @@ def _execute_backup(target_heading):
             time.sleep_ms(5)
             continue
 
-        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        # ── 🟢 核心修改二：校验通过后，在时序计算前统一使用新时间戳，并加入零分配防暴冲 ──
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001:
             actual_dt = FWD_CTRL_DT
         if actual_dt > 3 * FWD_CTRL_DT:
             actual_dt = FWD_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         # 倒退时同样采用绝对值累加，防止倒退距离计算抵消
@@ -593,6 +602,10 @@ def _action_rightward_search():
             actual_dt = RIGHTWARD_CTRL_DT
         if actual_dt > 3 * RIGHTWARD_CTRL_DT:
             actual_dt = RIGHTWARD_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         # D. 编码器绝对值累加（本会话平均距离）
@@ -697,12 +710,16 @@ def _reverse_to_rightward_path():
             time.sleep_ms(5)
             continue
 
-        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        # ── 🟢 核心修改二：校验通过后，在时序计算前统一使用新时间戳，并加入零分配防暴冲 ──
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001:
             actual_dt = FWD_CTRL_DT
         if actual_dt > 3 * FWD_CTRL_DT:
             actual_dt = FWD_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         # 绝对值累加，规避镜像接线极性抵消
@@ -752,12 +769,13 @@ def see_and_push():
     """
     print("\n  [APPROACH] === 视觉对齐靠近 ➔ 蓝牙同步流程 ===")
 
-    # ── 🟢 导入 test_vision_track 中验证通过的数据处理与控制器模块 ──
-    from cam_data import CamDataReceiver, x_to_cm, y_to_distance
+    # ── 🟢 获取全局共享的 Camera 实例 ──
+    cam = _ensure_cam()
+    from cam_data import x_to_cm, y_to_distance
     from cam_follow import FollowController
 
-    # ── 初始化串口数据接收器与对齐状态控制器 ──
-    recv = CamDataReceiver(uart_id=7)
+    # ── 🟢 核心修改一：采用无侵入的方案 A，直接读取私有属性 _recv ──
+    recv = cam._recv
     fc = FollowController()
 
     # ── 状态及历史数据初始化 ──
@@ -982,12 +1000,16 @@ def _action_forward_until_uwb_x():
             time.sleep_ms(5)
             continue
 
-        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        # ── 🟢 核心修改二：校验通过后，在时序计算前统一使用新时间戳，并加入零分配防暴冲 ──
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001:
             actual_dt = FWD_CTRL_DT
         if actual_dt > 3 * FWD_CTRL_DT:
             actual_dt = FWD_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         # 🟢 实时累加平均前进位移到 _approach_forward_dist
@@ -1195,11 +1217,6 @@ def _action_uwb_translate():
 
     while True:
         now_ms = time.ticks_ms()
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001:
-            actual_dt = UWB_CTRL_DT
-        if actual_dt > 3 * UWB_CTRL_DT:
-            actual_dt = UWB_CTRL_DT
         if _abort_check():
             led.value(0)
             return False
@@ -1279,16 +1296,29 @@ def _action_uwb_translate():
         if loop_cnt % 50 == 0:
             gc.collect()
 
+        # ── 🟢 先校验编码器 ──
+        rc = get_encoder_counts()
+        if rc is None or len(rc) < 4:
+            time.sleep_ms(5)
+            continue
+
+        # ── 🟢 校验通过后再算 dt 并刷新 ──
+        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+        if actual_dt <= 0.001:
+            actual_dt = UWB_CTRL_DT
+        if actual_dt > 3 * UWB_CTRL_DT:
+            actual_dt = UWB_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
+        last_loop_ms = now_ms
+
         wz = _heading_correction(target_heading, dt=actual_dt)
 
         try:
-            rc = get_encoder_counts()
-            if rc is None or len(rc) < 4:
-                time.sleep_ms(5)
-                continue
             speeds = _get_local_filtered_speeds(rc, actual_dt)
             omni_drive_closed_loop(fwd_speed, 0, wz, speeds, actual_dt)
-            last_loop_ms = now_ms  # 🟢 时序对齐：编码器读取成功后才更新时间戳
         except Exception as e:
             print("  [UWB] 驱动错误:", e)
 
@@ -1347,12 +1377,16 @@ def move_toward_fixed_point():
             time.sleep_ms(5)
             continue
 
-        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        # ── 🟢 核心修改二：校验通过后，在时序计算前统一使用新时间戳，并加入零分配防暴冲 ──
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001:
             actual_dt = MFP_CTRL_DT
         if actual_dt > 3 * MFP_CTRL_DT:
             actual_dt = MFP_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         for i in range(4):
@@ -1419,12 +1453,16 @@ def move_toward_fixed_point():
             time.sleep_ms(5)
             continue
 
-        # 🟢 时序对齐：编码器读取成功后才计算 actual_dt 并更新时间戳
+        # ── 🟢 核心修改二：校验通过后，在时序计算前统一使用新时间戳，并加入零分配防暴冲 ──
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001:
             actual_dt = MFP_CTRL_DT
         if actual_dt > 3 * MFP_CTRL_DT:
             actual_dt = MFP_CTRL_DT
+            global _local_speeds_initialized
+            for i in range(4):
+                _local_prev_speeds[i] = 0.0
+            _local_speeds_initialized = False
         last_loop_ms = now_ms
 
         for i in range(4):
@@ -1587,6 +1625,10 @@ def main():
         if key_triggered(2):  # KEY2 = C9
             print("\n  [MAIN] C9 触发: 右移搜索 → 发现目标后靠近")
             try:
+                # ── 🟢 补全调试细节：每次测试搜寻时，均重置累计进度，保证多次按键调试皆能跑满 ──
+                global _rightward_cumulative
+                _rightward_cumulative = 0.0
+
                 # 🟢 暂停后台定时器，防止与主循环抢编码器数据
                 pause_encoder_ticker()
                 _encoder_reset()
