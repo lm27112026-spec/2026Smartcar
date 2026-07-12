@@ -791,7 +791,7 @@ def see_and_push():
     # ── 🟢 获取全局共享的 Camera 实例 ──
     cam = _ensure_cam()
     from cam_data import x_to_cm, y_to_distance
-    from cam_follow import FollowController
+    from cam_control import FollowController
 
     # ── 🟢 核心修改一：采用无侵入的方案 A，直接读取私有属性 _recv ──
     recv = cam._recv
