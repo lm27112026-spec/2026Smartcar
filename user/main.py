@@ -1602,24 +1602,24 @@ def main():
     # ── 🔒 提前锁定航向 ──
     _lock_yaw()
 
-#     # ── UWB 初始化 & 记录起点坐标 ──
-#     global origin
-#     uwb = _ensure_uwb()
-#     if uwb is not None and uwb.get_frame_count() > 0:
-#         origin = uwb.get_position()  
-#         print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
-#             origin[0], origin[1]))
-#     else:
-#         print("  [ORIGIN] UWB 未就绪，使用默认坐标")
-#         origin = (130.0, 262.0)
+    # ── UWB 初始化 & 记录起点坐标 ──
+    global origin
+    uwb = _ensure_uwb()
+    if uwb is not None and uwb.get_frame_count() > 0:
+        origin = uwb.get_position()  
+        print("  [ORIGIN] 起点坐标已记录: ({:.1f}, {:.1f})".format(
+            origin[0], origin[1]))
+    else:
+        print("  [ORIGIN] UWB 未就绪，使用默认坐标")
+        origin = (130.0, 262.0)
 
     # ──── 注释掉完整流程，启用测试模式 ────
-    # print("  [MAIN] 航向已锁定，执行初始路径移动...")
-    # move_toward_fixed_point()
-    #
-    # # ═══════════════════════════════════════════════════════
-    # #  主循环：右移搜索（累计1.2m）+ 取物流程
-    # # ═══════════════════════════════════════════════════════
+    print("  [MAIN] 航向已锁定，执行初始路径移动...")
+    move_toward_fixed_point()
+    
+    # ═══════════════════════════════════════════════════════
+    #  主循环：右移搜索（累计1.2m）+ 取物流程
+    # ═══════════════════════════════════════════════════════
 
     # ──── 测试模式：C8/C9 按键调度 ────
     print("  [MAIN] 航向已锁定（测试模式）")
@@ -1695,105 +1695,103 @@ def main():
 # ═══════════════════════════════════════════════════════════════
 #  [原版完整流程] 取消上方测试代码注释，恢复下方代码即可
 # ═══════════════════════════════════════════════════════════════
-#    while True:
-#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#        _encoder_reset()
-#
-#        # ① 向右平移搜索（累计1.2m，逐帧摄像头检测物品）
-#        item_found = _action_rightward_search()
-#
-#        if not item_found:
-#            # 1.2m 右移完成，未发现物品 → 返航停机
-#            print("\n  [MAIN] 1.2m 右移搜索完成，未检测到物品")
-#            break
-#
-#        # ── 物品被发现 → 执行取物流程 ②~⑥ ──
-#        global _approach_forward_dist
-#        _approach_forward_dist = 0.0  # 重置净前进距离追踪
-#
-#        # 清零此前横移搜索产生的编码器数据
-#        _encoder_reset()
-#
-#        # ② 离开平移路径，向前视觉靠近（移动期间已通过 _drive_fn 实时累加前进距离）
-#        if not see_and_push():
-#            print("  [MAIN] 视觉靠近中断，沿原路倒退回到搜索路径...")
-#            _reverse_to_rightward_path()
-#            _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#            _encoder_reset()
-#            continue
-#
-#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#        _encoder_reset()
-#
-#        # ③ 全速推送过 UWB 边界（移动期间已在内部实时累加前进距离）
-#        if not _action_forward_until_uwb_x():
-#            print("  [MAIN] UWB 推送中断，沿原路倒退回到搜索路径...")
-#            _reverse_to_rightward_path()
-#            _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#            _encoder_reset()
-#            continue
-#
-#        # 执行 20cm 倒退（避开障碍物/边界线）
-#        _execute_backup(_TARGET_HEADING)
-#
-#        # 手动扣除 20cm 倒退距离，得到净前进距离
-#        _approach_forward_dist -= (UWB_BACKUP_DIST_CM / 100.0)
-#        if _approach_forward_dist < 0:
-#            _approach_forward_dist = 0.0
-#
-#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#        _encoder_reset()
-#
-#        # ④ 蓝牙通知从车（永不因蓝牙超时触发返航）
-#        if check_sw2():
-#            print("  [MAIN] SW2 手动旁路，跳过蓝牙")
-#        else:
-#            target_heading = _lock_yaw()
-#            retry_count = 0
-#            try:
-#                while True:
-#                    bt.turn_left()
-#                    retry_count += 1
-#                    suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
-#                    print("  [MAIN] turn_left 已发出{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
-#                    bt_wait_start = time.ticks_ms()
-#                    received_ok = False
-#                    while True:
-#                        pet_watchdog()
-#                        _maintain_yaw(target_heading)
-#                        if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
-#                            print("  [MAIN] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
-#                            break  # 退出内层等待循环，重新发送
-#                        if check_sw2():
-#                            print("  [MAIN] SW2 中断等待")
-#                            break
-#                        resp = bt.read_response()
-#                        if resp == "ok":
-#                            print("  [MAIN] 从车确认完毕")
-#                            received_ok = True
-#                            break
-#                        time.sleep_ms(10)
-#                    if received_ok or check_sw2():
-#                        break
-#            except Exception as e:
-#                print("  [MAIN] 蓝牙通信异常:", e)
-#                # 蓝牙硬件异常也直接继续，不触发返航
-#
-#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#        _encoder_reset()
-#
-#        # ⑤ 向后倒车，回到右移路径线
-#        _reverse_to_rightward_path()
-#
-#        _pause_with_yaw_hold(_TARGET_HEADING, 300)
-#        _encoder_reset()
-#
-#        # ⑥ 循环回到 ①，从断点处继续右移搜索
-#        print("  [MAIN] 已回到右移路径，继续搜索...")
-#
-#    # ⑦ 返航停机
-#    print("\n  [MAIN] 触发自动返航...")
-#    _safe_return_and_exit()
+while True:
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
+    _encoder_reset()
+
+    # ① 向右平移搜索（累计1.2m，逐帧摄像头检测物品）
+    item_found = _action_rightward_search()
+
+    if not item_found:
+        # 1.2m 右移完成，未发现物品 → 返航停机
+        print("\n  [MAIN] 1.2m 右移搜索完成，未检测到物品")
+        break
+
+    # ── 物品被发现 → 执行取物流程 ②~⑥ ──
+    _approach_forward_dist = 0.0  # 重置净前进距离追踪
+
+    # 清零此前横移搜索产生的编码器数据
+    _encoder_reset()
+
+    # ② 离开平移路径，向前视觉靠近（移动期间已通过 _drive_fn 实时累加前进距离）
+    if not see_and_push():
+        print("  [MAIN] 视觉靠近中断，沿原路倒退回到搜索路径...")
+        _reverse_to_rightward_path()
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+        _encoder_reset()
+        continue
+
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
+    _encoder_reset()
+
+    # ③ 全速推送过 UWB 边界（移动期间已在内部实时累加前进距离）
+    if not _action_forward_until_uwb_x():
+        print("  [MAIN] UWB 推送中断，沿原路倒退回到搜索路径...")
+        _reverse_to_rightward_path()
+        _pause_with_yaw_hold(_TARGET_HEADING, 300)
+        _encoder_reset()
+        continue
+
+    # 执行 20cm 倒退（避开障碍物/边界线）
+    _execute_backup(_TARGET_HEADING)
+
+    # 手动扣除 20cm 倒退距离，得到净前进距离
+    _approach_forward_dist -= (UWB_BACKUP_DIST_CM / 100.0)
+    if _approach_forward_dist < 0:
+        _approach_forward_dist = 0.0
+
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
+    _encoder_reset()
+    # ④ 蓝牙通知从车（永不因蓝牙超时触发返航）
+    if check_sw2():
+        print("  [MAIN] SW2 手动旁路，跳过蓝牙")
+    else:
+        target_heading = _lock_yaw()
+        retry_count = 0
+        try:
+            while True:
+                bt.turn_left()
+                retry_count += 1
+                suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
+                print("  [MAIN] turn_left 已发出{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
+                bt_wait_start = time.ticks_ms()
+                received_ok = False
+                while True:
+                    pet_watchdog()
+                    _maintain_yaw(target_heading)
+                    if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
+                        print("  [MAIN] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
+                        break  # 退出内层等待循环，重新发送
+                    if check_sw2():
+                        print("  [MAIN] SW2 中断等待")
+                        break
+                    resp = bt.read_response()
+                    if resp == "ok":
+                        print("  [MAIN] 从车确认完毕")
+                        received_ok = True
+                        break
+                    time.sleep_ms(10)
+                if received_ok or check_sw2():
+                    break
+        except Exception as e:
+            print("  [MAIN] 蓝牙通信异常:", e)
+            # 蓝牙硬件异常也直接继续，不触发返航
+
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
+    _encoder_reset()
+
+    # ⑤ 向后倒车，回到右移路径线
+    _reverse_to_rightward_path()
+
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
+    _encoder_reset()
+
+    # ⑥ 循环回到 ①，从断点处继续右移搜索
+    print("  [MAIN] 已回到右移路径，继续搜索...")
+
+# ⑦ 返航停机
+print("\n  [MAIN] 触发自动返航...")
+_safe_return_and_exit()
 
 
 # ═══════════════════════════════════════════════════════════════
