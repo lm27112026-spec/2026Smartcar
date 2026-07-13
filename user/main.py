@@ -769,14 +769,14 @@ def see_and_push():
             rc = get_encoder_counts()
             if rc is not None and len(rc) >= 4:
                 global _approach_forward_dist
-                wheel_sum = 0.0
-                valid = 0
-                for i in range(4):
-                    if ENC_SCALE[i] != 0:
-                        wheel_sum += abs(rc[i]) / abs(ENC_SCALE[i])
-                        valid += 1
-                if valid > 0:
-                    _approach_forward_dist += (wheel_sum / valid)
+                # 麦轮正解：带符号位移均值 = 纯纵向净前进，平移/自转分量自动抵消归零
+                dist_rf = rc[0] / ENC_SCALE[0]
+                dist_lf = rc[1] / ENC_SCALE[1]
+                dist_lb = rc[2] / ENC_SCALE[2]
+                dist_rb = rc[3] / ENC_SCALE[3]
+                step_forward = (dist_rf + dist_lf + dist_lb + dist_rb) / 4.0
+                if step_forward > 0:
+                    _approach_forward_dist += step_forward
                 speeds = _get_local_filtered_speeds(rc, dt_step)
                 omni_drive_closed_loop(boost_vx, smooth_vy, wz_out, speeds, dt_step)
             else:
@@ -894,14 +894,14 @@ def _action_forward_until_uwb_x():
             _local_speeds_initialized = False
         last_loop_ms = now_ms
         global _approach_forward_dist
-        wheel_sum = 0.0
-        valid = 0
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                wheel_sum += abs(counts[i]) / abs(ENC_SCALE[i])
-                valid += 1
-        if valid > 0:
-            _approach_forward_dist += (wheel_sum / valid)
+        # 麦轮正解：带符号位移均值 = 纯纵向净前进，平移/自转分量自动抵消归零
+        dist_rf = counts[0] / ENC_SCALE[0]
+        dist_lf = counts[1] / ENC_SCALE[1]
+        dist_lb = counts[2] / ENC_SCALE[2]
+        dist_rb = counts[3] / ENC_SCALE[3]
+        step_forward = (dist_rf + dist_lf + dist_lb + dist_rb) / 4.0
+        if step_forward > 0:
+            _approach_forward_dist += step_forward
         now = time.ticks_ms()
         if uwb is not None and time.ticks_diff(now, last_uwb_ms) >= 50:
             uwb.step()
