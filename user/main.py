@@ -87,6 +87,7 @@ _cam_shared           = None    # 共享 CameraController 实例
 _TARGET_HEADING       = None    # 全程锁定的目标航向
 _approach_forward_dist = 0.0     # 取物流程净前进距离 (m)，由正解投影精确累加
 _search_progress_cm   = 0.0     # 一维轴向S形总里程进度（0 ~ 220cm）
+_just_pushed          = False    # 避盲区保护标志：刚完成推出后置 True，用于起步避开二次触发
 
 # ── 本地一阶低通滤波器（用于动力闭环速度输入）──
 _SPD_FILTER_ALPHA = 0.75
@@ -417,7 +418,7 @@ def _ensure_cam():
 #  二、统一动力闭环驱动器 (Unified Closed-Loop Driver)
 # ═══════════════════════════════════════════════════════════════
 
-def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadband=1.0, timeout_s=15.0, label="DRIVE"):
+def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadband=1.0, timeout_s=15.0, label="DRIVE", ignore_dist_m=0.0):
     """
     统一的参数化物理闭环驱动器。
     代替原本分散重复的直行、平移测距运动，内部融合了：
@@ -479,8 +480,8 @@ def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadba
             print("  [{}] 完成指定目标距离: {:.2f}m".format(label, dist_integrated))
             return False, dist_integrated
 
-        # 判断是否被视觉拦截
-        if check_target and cam is not None:
+        # 判断是否被视觉拦截（满足最小起步避盲区距离 ignore_dist_m 后才允许触发拦截）
+        if check_target and cam is not None and dist_integrated >= ignore_dist_m:
             ctrl = cam.step()
             if ctrl and ctrl.get('has_target', False):
                 stop_all()
@@ -517,14 +518,20 @@ def _action_s_pattern_search():
     一维总进度通过全局变量 _search_progress_cm (0 ~ 220cm) 统一管理。
     """
     global _search_progress_cm
+    # 清空 move_toward_fixed_point 阶段积压的摄像头 UART 脏帧，保证视觉时效
+    _ensure_cam().reset()
     target_heading = _lock_yaw()
     print("\n  [S_SEARCH] 开始/恢复 S 曲线搜索路径。当前全局总轴向进度: {:.1f}cm".format(_search_progress_cm))
+
+    # 确定起步避空行程（防原地二次误触发刚推完的物品，测试/循环模式通用）
+    ignore_d = 0.15 if _just_pushed else 0.0
+    _just_pushed = False  # 清除标志位
 
     # ── 阶段 0: 右平移搜索区 (0 - 90cm) ──
     if _search_progress_cm < 90.0:
         rem_dist_m = (90.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 0 (向右平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
-        found, moved_m = _drive_closed_loop(0, RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_0")
+        found, moved_m = _drive_closed_loop(0, RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_0", ignore_dist_m=ignore_d)
         _search_progress_cm += moved_m * 100.0
         if found:
             print("  [S_SEARCH] 阶段 0 捕获目标! 断点已锁定在: {:.1f}cm".format(_search_progress_cm))
@@ -547,7 +554,7 @@ def _action_s_pattern_search():
         rem_dist_m = (220.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 2 (向左平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
         # 向左平移使用负的 Y 速度分量
-        found, moved_m = _drive_closed_loop(0, -RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_2")
+        found, moved_m = _drive_closed_loop(0, -RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_2", ignore_dist_m=ignore_d)
         _search_progress_cm += moved_m * 100.0
         if found:
             print("  [S_SEARCH] 阶段 2 捕获目标! 断点已锁定在: {:.1f}cm".format(_search_progress_cm))
@@ -606,14 +613,16 @@ def see_and_push():
     global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [APPROACH] === 视觉对齐靠近 ➔ 蓝牙同步流程 ===")
     cam = _ensure_cam()
+    # 清空 S 扫描残留帧 + 复位视觉追踪状态，确保与 test 模式一致的干净启动
+    cam.reset()
     recv = cam._recv
-    fc = cam._ctrl           # 复用 CameraController 内部已有跟踪状态的 FollowController
+    fc = cam._ctrl
     from cam_data import x_to_cm, y_to_distance
 
     target_heading = _lock_yaw()
-    last_x_cm = float(cam._last_x_cm) if cam._last_has_tgt else 0.0
-    last_dist_cm = float(cam._last_dist_cm) if cam._last_has_tgt else 0.0
-    last_has_tgt = cam._last_has_tgt
+    last_x_cm = 0.0
+    last_dist_cm = 0.0
+    last_has_tgt = False
     prev_vy = 0.0
     align_consecutive_count = 0
     arrived_success = False
@@ -649,28 +658,38 @@ def see_and_push():
                 if last_has_tgt:
                     x_cm = last_x_cm
                     dist_cm = last_dist_cm
-            # 目标短暂丢失时用最后已知位置撑住，避免 FC 掉到 S_LOST 输出零速度
-            if last_has_tgt:
-                has_tgt = True
+
+            # 保持真实的 has_tgt 输入，让控制器内部的 500ms 容忍时钟正常工作
             vx, vy, wz_out, is_aligned, dt_step = fc.step(
                 x_cm, dist_cm, has_tgt, wz_in=wz, now_ms=t_now)
-            boost_vx = max(0.0, min(vx * 1.5, 0.80))
-            smooth_vy = 0.6 * prev_vy + 0.4 * vy
-            prev_vy = smooth_vy
-            if boost_vx < 0.12:
-                smooth_vy = smooth_vy * 0.5
-                if abs(smooth_vy) < 0.03:
-                    smooth_vy = 0.0
-            rc = get_encoder_counts()
-            if rc is not None and len(rc) >= 4:
-                # 绝对值累加里程：消除左右镜像编码器极性相消，正确反映物理位移
-                step_forward = sum(abs(rc[i] / ENC_SCALE[i]) for i in range(4)) / 4.0
-                if step_forward > 0:
-                    _approach_forward_dist += step_forward
-                speeds = _get_local_filtered_speeds(rc, dt_step)
-                omni_drive_closed_loop(boost_vx, smooth_vy, wz_out, speeds, dt_step)
+            
+            # ── 依据控制器输出状态分级驱动底盘（与测试文件逻辑对齐） ──
+            if abs(vx) > 0.001 or abs(vy) > 0.001:
+                # 【纵向纯净位移积分】：只在真正向前移动时累加；若过冲产生向后修正（vx < 0），则对应递减
+                step_forward = vx * dt_step
+                _approach_forward_dist += step_forward
+                if _approach_forward_dist < 0.0:
+                    _approach_forward_dist = 0.0
+
+                rc = get_encoder_counts()
+                if rc is not None and len(rc) >= 4:
+                    speeds = _get_local_filtered_speeds(rc, dt_step)
+                    # 直接采用控制器原生的 vx 和 vy 进行驱动，支持双向修正、自动减速与精准停靠
+                    omni_drive_closed_loop(vx, vy, wz_out, speeds, dt_step)
+                else:
+                    stop_all()
             else:
-                stop_all()
+                # 丢包或已对齐停靠：立即切断纵向与横向驱动，仅维持纯原地航向锁定
+                if abs(wz) > 0.001:
+                    rc = get_encoder_counts()
+                    if rc is not None and len(rc) >= 4:
+                        speeds = _get_local_filtered_speeds(rc, dt_step)
+                        omni_drive_closed_loop(0, 0, wz, speeds, dt_step)
+                    else:
+                        stop_all()
+                else:
+                    stop_all()
+
             if is_aligned:
                 align_consecutive_count += 1
             else:
@@ -737,7 +756,6 @@ def see_and_push():
         print("  [APPROACH] 蓝牙通信发生异常:", e)
         return False
 
-
 # ═══════════════════════════════════════════════════════════════
 #  全速前进至 UWB X 距离 < -130cm
 # ═══════════════════════════════════════════════════════════════
@@ -800,7 +818,7 @@ def _action_forward_until_uwb_x():
             _local_speeds_initialized = False
         last_loop_ms = now_ms
 
-        # 绝对值累加里程：消除左右镜像编码器极性相消，正确反映物理位移
+        # 绝对值累加里程：由于是 vy=0 的纯直行，绝对值累加能高精度准确反映直行里程。
         step_forward = sum(abs(counts[i] / ENC_SCALE[i]) for i in range(4)) / 4.0
         if step_forward > 0:
             _approach_forward_dist += step_forward
@@ -1118,9 +1136,10 @@ def main():
         if key_triggered(1):
             print("\n  [TEST_MODE] KEY1 (C8) 被按下。开始执行 S形搜索 ➔ 推出 ➔ 倒车复位闭环流程...")
             try:
-                global _search_progress_cm, _approach_forward_dist
+                global _search_progress_cm, _approach_forward_dist, _just_pushed
                 _search_progress_cm = 0.0
                 _approach_forward_dist = 0.0
+                _just_pushed = False
 
                 while True:
                     pause_encoder_ticker()
@@ -1162,6 +1181,9 @@ def main():
 
                     # 4. 高精度倒车退回到 S 轴向扫描线上
                     _reverse_to_rightward_path()
+                    
+                    # 激活起步避盲区保护
+                    _just_pushed = True
 
                     _pause_with_yaw_hold(_TARGET_HEADING, 300)
                     _encoder_reset()
@@ -1176,9 +1198,10 @@ def main():
         if key_triggered(2):
             print("\n  [TEST_MODE] KEY2 (C9) 触发: 原始带通信的 S 曲线测试")
             try:
-                global _search_progress_cm, _approach_forward_dist
+                global _search_progress_cm, _approach_forward_dist, _just_pushed
                 _search_progress_cm = 0.0
                 _approach_forward_dist = 0.0
+                _just_pushed = False
                 pause_encoder_ticker()
                 _encoder_reset()
                 found = _action_s_pattern_search()
@@ -1191,6 +1214,7 @@ def main():
                         _encoder_reset()
                         _action_forward_until_uwb_x()
                         _reverse_to_rightward_path()
+                        _just_pushed = True
                     print("  [TEST_MODE] 靠近并传输完成:", arrived)
                 else:
                     print("  [TEST_MODE] 未搜索到目标")
@@ -1307,6 +1331,9 @@ if RUN_MODE == "loop":
 
             # 第五阶段：按照整个过程的高精度累计前进偏移进行回退复位
             _reverse_to_rightward_path()
+            
+            # 激活起步避盲区保护
+            _just_pushed = True
 
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
