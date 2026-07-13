@@ -65,7 +65,7 @@ BACKUP_PATH_SPEED   = 0.50    # 倒车回到路径速度 (m/s)
 BACKUP_PATH_TIMEOUT = 15.0    # 倒车回到路径超时 (s)
 
 # ── move_toward_fixed_point: 前进 50cm(补偿后) → 右平移 110cm(补偿后) ──
-MFP_FORWARD_DIST_CM  = 50.0    # 目标50cm 
+MFP_FORWARD_DIST_CM  = 55.0    # 目标50cm 
 MFP_RIGHT_DIST_CM    = 90.0   # 目标110cm - 20cm惯性 = 90.0cm
 MFP_SPEED            = 0.50    # 行进速度 (m/s)
 MFP_TIMEOUT_S        = 15.0    # 超时 (s)
