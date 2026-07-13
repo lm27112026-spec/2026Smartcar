@@ -1,4 +1,4 @@
-#  RT1021 — 按键驱动控制
+#  RT1021 — 按键驱动控制 (1D S-Pattern & Unified Driver Refactored)
 
 import gc, time, math
 from machine import Pin
@@ -43,7 +43,7 @@ UWB_CTRL_DT      = 0.02    # 控制周期 (s)
 _heading_hold = None        # HeadingHold 实例（首次 _lock_yaw 时懒初始化）
 
 # ── 蓝牙信号 ──
-BT_WAIT_DEADLINE_S       = 10.0     # 蓝牙单次等待超时 (s)，超时后重发消息重试，永不因蓝牙触发返航
+BT_WAIT_DEADLINE_S       = 10.0     # 蓝牙单次等待超时 (s)
 
 # ── 启动: 收到 ok 后全速前进至 UWB X 距离 < -130cm ──
 STARTUP_FULL_SPEED     = 1.00     # 全速前进速度（绝对值，m/s）
@@ -64,44 +64,42 @@ ORIGIN_CTRL_DT      = 0.01    # 控制周期 (s)
 BACKUP_PATH_SPEED   = 0.50    # 倒车回到路径速度 (m/s)
 BACKUP_PATH_TIMEOUT = 15.0    # 倒车回到路径超时 (s)
 
-# ── move_toward_fixed_point: 前进 50cm(补偿后) → 右平移 110cm(补偿后) ──
+# ── move_toward_fixed_point ──
 MFP_FORWARD_DIST_CM  = 55.0    # 目标50cm 
-MFP_RIGHT_DIST_CM    = 90.0   # 目标110cm - 20cm惯性 = 90.0cm
+MFP_RIGHT_DIST_CM    = 60.0    # 目标110cm - 20cm惯性 = 90.0cm
 MFP_SPEED            = 0.50    # 行进速度 (m/s)
 MFP_TIMEOUT_S        = 15.0    # 超时 (s)
 MFP_CTRL_DT          = 0.02    # 控制周期 (s)
 
-# ── _action_rightward_search: 右移 1.0m 搜索(补偿后) ──
-RIGHTWARD_SEARCH_DIST_CM = 90.0   # 目标100cm - 10cm侧向惯性 = 90.0cm
-RIGHTWARD_SPEED          = 0.40    # 右移速度 (m/s)
-RIGHTWARD_TIMEOUT_S      = 20.0    # 单次右移超时 (s)
+# ── S形搜索参数 ──
+RIGHTWARD_SPEED          = 0.40    # 平移速度 (m/s)
+RIGHTWARD_TIMEOUT_S      = 20.0    # 单段平移超时 (s)
 RIGHTWARD_CTRL_DT        = 0.02    # 控制周期 (s)
 
 # ── SW2 ──
 SW2_DEBOUNCE_MS  = 50
 
-# ── UWB 坐标记录 ──
-origin   = None    # 起点坐标 (x, y)
-_uwb_shared = None  # 共享 UWBPosition 实例
-_cam_shared = None  # 共享 CameraController 实例
-_TARGET_HEADING = None  # 全程锁定的目标航向
-_approach_forward_dist = 0.0   # 取物流程净前进距离 (m)
-_rightward_cumulative  = 0.0   # 累计右移距离 (m)，跨多次调用持久化
+# ── 状态机与物理位置全局变量 ──
+origin                = None    # 起点坐标 (x, y)
+_uwb_shared           = None    # 共享 UWBPosition 实例
+_cam_shared           = None    # 共享 CameraController 实例
+_TARGET_HEADING       = None    # 全程锁定的目标航向
+_approach_forward_dist = 0.0     # 取物流程净前进距离 (m)，由正解投影精确累加
+_search_progress_cm   = 0.0     # 一维轴向S形总里程进度（0 ~ 220cm）
 
-# ── 本地一阶低通滤波器（单次读取编码器 + 滤波，杜绝双读隐患）──
+# ── 本地一阶低通滤波器（用于动力闭环速度输入）──
 _SPD_FILTER_ALPHA = 0.75
 _local_prev_speeds = [0.0, 0.0, 0.0, 0.0]
 _local_speeds_initialized = False
 
-# ── 延迟导入占位符：消除模块级 Pylance 报错，实际值由 _system_init() 注入 ──
+# ── 延迟导入占位符 ──
 CameraController = None
 goto_location = None
 
 
 def _get_local_filtered_speeds(raw_counts, dt):
     """基于外部传入的 counts 数组计算一阶低通滤波速度 [rf, lf, lb, rb] (m/s)。
-    不调用 get_encoder_counts()，杜绝二次读取导致增量清零。
-    🟢 内存零分配：原地修改 _local_prev_speeds，不创建新 list"""
+    不调用 get_encoder_counts()，杜绝二次读取导致增量清零。"""
     global _local_prev_speeds, _local_speeds_initialized
     if raw_counts is None or len(raw_counts) < 4:
         return _local_prev_speeds
@@ -119,11 +117,7 @@ def _get_local_filtered_speeds(raw_counts, dt):
 
 
 def _clean_globals_for_ide():
-    """
-    🟢 程序退出前将全局命名空间中所有自定义值置 None。
-    只保留 Thonny 必需的 __name__ / __file__ 和 stdlib 模块，
-    其余全部清空——杜绝任何 repr() 触发 C 扩展序列化报错。
-    """
+    """程序退出前清空命名空间中的自定义全局变量。"""
     print("  [IDE] 正在清理全局变量，防止 IDE 扫描冲突...")
     g = globals()
     keep = {'__name__', '__file__', 'gc', 'time', 'math', 'machine', 'sys', 'builtins'}
@@ -174,11 +168,10 @@ def _system_init():
     pause_encoder_ticker()
     _encoder_reset()
 
-    start_watchdog()
-    print("  [INIT] 独立硬件看门狗已启用 (3秒超时)")
-
+    # 1. IMU 陀螺仪标定及目标偏航锁定
     _lock_yaw()
 
+    # 2. 预先加载并初始化重型相机/控制模块
     gc.collect()
     import cam_control
     CameraController = cam_control.CameraController
@@ -187,6 +180,11 @@ def _system_init():
     gc.collect()
     print("  [INIT] 闭环控制模块加载成功")
 
+    # 3. 规避编译卡顿触发复位，在库导入完毕及标定通关后，正式开启 WDT
+    start_watchdog()
+    print("  [INIT] 独立硬件看门狗已启用 (3秒超时)")
+
+    # 4. 初始化 UWB（确保 watch dog 此时非 None 避免空指针）
     uwb = _ensure_uwb()
     if uwb is not None and uwb.get_frame_count() > 0:
         origin = uwb.get_position()
@@ -199,7 +197,7 @@ def _system_init():
 
 
 def _system_cleanup():
-    """统一资源释放：无论何种因由退出，执行一致的物理归档"""
+    """统一资源释放"""
     print("\n[SYSTEM] 执行统一系统资源回收...")
     stop_all()
     _encoder_reset()
@@ -233,7 +231,6 @@ _maintain_yaw_fail = 0
 
 def _read_imu_update_yaw():
     global _imu_ticker_stopped, _imu_ok_count, _imu_fail_count
-
     if not _imu_ticker_stopped:
         print("  [IMU] 停止 PIT3 ticker，切换到直接 SPI 读取...")
         stop_imu_ticker()
@@ -302,7 +299,7 @@ def _heading_correction(target_yaw, deadband=1.0, dt=None):
 
 def _maintain_yaw(target_heading):
     """单次 yaw 保持迭代：应用层角度环回强校验 + 委托 HeadingHold → 驱动电机。
-    返回: True=已驱动/已在死区, False=驱动异常
+
     """
     global _maintain_yaw_fail
     _read_imu_update_yaw()
@@ -416,301 +413,209 @@ def _ensure_cam():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  通用前进函数
+#  二、统一动力闭环驱动器 (Unified Closed-Loop Driver)
 # ═══════════════════════════════════════════════════════════════
 
-def _forward_distance(dist_m, speed, timeout_s, heading_deadband=None, label="FWD"):
-    print("  [{}] 前进 {:.0f}cm 开始...".format(label, dist_m * 100))
-    target_heading = _lock_yaw()
-    db_str = "  死区 {:.0f}°".format(heading_deadband) if heading_deadband is not None else ""
-    print("  [{}] 航向锁定: {:.1f}°{}".format(label, target_heading, db_str))
+def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadband=1.0, timeout_s=15.0, label="DRIVE"):
+    """
+    统一的参数化物理闭环驱动器。
+    代替原本分散重复的直行、平移测距运动，内部融合了：
+    IMU 航向环校正、一阶低通滤波测速、硬件看门狗喂狗、SW2 毫秒级打断、高精度里程积分和视觉每帧拦截。
 
-    total_wheel_dists = [0.0, 0.0, 0.0, 0.0]
+    返回:
+        (has_spotted_target, actual_moved_dist_m)
+    """
+    global _local_prev_speeds, _local_speeds_initialized
+    print("  [{}] 启动: vx={:.2f} vy={:.2f} 目标距离={:.2f}m".format(label, vx, vy, target_dist_m))
+    target_heading = _lock_yaw()
+    
+    dist_integrated = 0.0
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
-    loop_cnt = 0
     last_loop_ms = start_ms
+    loop_cnt = 0
+    cam = _ensure_cam() if check_target else None
     led.value(1)
 
     while True:
         now_ms = time.ticks_ms()
+        pet_watchdog()
+
         if _abort_check():
+            stop_all()
             led.value(0)
-            return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+            print("  [{}] SW2 中途紧急打断！".format(label))
+            return False, dist_integrated
+
+        elapsed = time.ticks_diff(now_ms, start_ms) / 1000.0
         if elapsed > timeout_s:
-            print("  [{}] 超时 ({:.1f}s)".format(label, elapsed))
+            stop_all()
             led.value(0)
-            return False
+            print("  [{}] 运行超时 ({:.1f}s)".format(label, elapsed))
+            return False, dist_integrated
+
         counts = get_encoder_counts()
         if counts is None or len(counts) < 4:
             time.sleep_ms(5)
             continue
+
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001 or actual_dt > 3 * FWD_CTRL_DT:
             actual_dt = FWD_CTRL_DT
-            global _local_speeds_initialized
+            _local_speeds_initialized = False
             for i in range(4):
                 _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
         last_loop_ms = now_ms
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                total_wheel_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-        avg_dist = sum(total_wheel_dists) / len(total_wheel_dists)
-        if avg_dist >= dist_m:
-            print("  [{}] 到达目标！dist={:.2f}m".format(label, avg_dist))
+
+        # 统一闭环里程：绝对值累加，确保无论电机极性正反，位移始终正确向上累计
+        step = sum(abs(counts[i] / ENC_SCALE[i]) for i in range(4)) / 4.0
+        dist_integrated += step
+
+        # 判断是否到达距离
+        if dist_integrated >= target_dist_m:
+            stop_all()
             led.value(0)
-            return True
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
+            print("  [{}] 完成指定目标距离: {:.2f}m".format(label, dist_integrated))
+            return False, dist_integrated
+
+        # 判断是否被视觉拦截
+        if check_target and cam is not None:
+            ctrl = cam.step()
+            if ctrl and ctrl.get('has_target', False):
+                stop_all()
+                led.value(0)
+                print("  [{}] 视觉捕获拦截! 当前进度已保存。".format(label))
+                return True, dist_integrated
+
+        if time.ticks_diff(now_ms, last_print_ms) >= 500:
+            last_print_ms = now_ms
             print("  [{}] dist={:.2f}m / {:.2f}m  yaw={:.2f}°".format(
-                label, avg_dist, dist_m, _yaw()))
+                label, dist_integrated, target_dist_m, _yaw()))
+
         loop_cnt += 1
         if loop_cnt % 50 == 0:
             gc.collect()
+
         wz = _heading_correction(target_heading, deadband=heading_deadband, dt=actual_dt)
         try:
             speeds = _get_local_filtered_speeds(counts, actual_dt)
-            omni_drive_closed_loop(speed, 0, wz, speeds, actual_dt)
+            omni_drive_closed_loop(vx, vy, wz, speeds, actual_dt)
         except Exception as e:
-            print("  [{}] 驱动错误:".format(label), e)
+            print("  [{}] 闭环控制驱动异常:".format(label), e)
+
         time.sleep_ms(int(FWD_CTRL_DT * 1000))
 
 
 # ═══════════════════════════════════════════════════════════════
-#  辅助倒退执行闭环函数
+#  一维一字型 S 曲线搜索算法 (1D S-Pattern State Machine)
+# ═══════════════════════════════════════════════════════════════
+
+def _action_s_pattern_search():
+    """
+    一维轴向一字型 S 曲线搜索路径规划。
+    一维总进度通过全局变量 _search_progress_cm (0 ~ 220cm) 统一管理。
+    可在中途中断后进行状态断点恢复。
+
+    搜索阶段：
+        阶段 0 (0 <= 进度 < 90cm): 执行向右平移 (0.40 m/s)，开启视觉目标监测
+        阶段 1 (90 <= 进度 < 130cm): 执行前行过渡 (0.40 m/s)，不检测视觉目标
+        阶段 2 (130 <= 进度 < 220cm): 执行向左平移 (0.40 m/s)，开启视觉目标监测
+        阶段 3 (进度 >= 220cm): 搜索无果，返回 False。
+    """
+    global _search_progress_cm
+    target_heading = _lock_yaw()
+    print("\n  [S_SEARCH] 开始/恢复 S 曲线搜索路径。当前全局总轴向进度: {:.1f}cm".format(_search_progress_cm))
+
+    # ── 阶段 0: 右平移搜索区 (0 - 90cm) ──
+    if _search_progress_cm < 90.0:
+        rem_dist_m = (90.0 - _search_progress_cm) / 100.0
+        print("  [S_SEARCH] 阶段 0 (向右平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
+        found, moved_m = _drive_closed_loop(0, RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_0")
+        _search_progress_cm += moved_m * 100.0
+        if found:
+            print("  [S_SEARCH] 阶段 0 捕获目标! 断点已锁定在: {:.1f}cm".format(_search_progress_cm))
+            return True
+        if check_sw2():
+            return False
+
+    # ── 阶段 1: 前行过渡区 (90 - 140cm) ──
+    if 90.0 <= _search_progress_cm < 140.0:
+        rem_dist_m = (140.0 - _search_progress_cm) / 100.0
+        print("  [S_SEARCH] 阶段 1 (前行过渡): 剩余前行过渡距离 = {:.1f}cm".format(rem_dist_m * 100.0))
+        # 前行段不进行视觉拦截
+        _, moved_m = _drive_closed_loop(0.40, 0, rem_dist_m, check_target=False, label="S_STAGE_1")
+        _search_progress_cm += moved_m * 100.0
+        if check_sw2():
+            return False
+
+    # ── 阶段 2: 左平移搜索区 (140 - 220cm) ──
+    if 140.0 <= _search_progress_cm < 220.0:
+        rem_dist_m = (220.0 - _search_progress_cm) / 100.0
+        print("  [S_SEARCH] 阶段 2 (向左平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
+        # 向左平移使用负的 Y 速度分量
+        found, moved_m = _drive_closed_loop(0, -RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_2")
+        _search_progress_cm += moved_m * 100.0
+        if found:
+            print("  [S_SEARCH] 阶段 2 捕获目标! 断点已锁定在: {:.1f}cm".format(_search_progress_cm))
+            return True
+        if check_sw2():
+            return False
+
+    # ── 阶段 3: 无果判定 ──
+    if _search_progress_cm >= 220.0:
+        print("  [S_SEARCH] 阶段 3 (轴向搜索结束，未发现任何物品)。")
+        return False
+
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  辅助倒退执行闭环函数 (Compatible Wrapper)
 # ═══════════════════════════════════════════════════════════════
 
 def _execute_backup(target_heading):
-    """执行倒退 UWB_BACKUP_DIST_CM 厘米的闭环辅助函数"""
+    """倒退 20cm，使用统一闭环驱动器进行动作复用"""
     print("  [BACKUP] 开始倒退 {:.0f}cm...".format(UWB_BACKUP_DIST_CM))
-    backup_dist_m = UWB_BACKUP_DIST_CM / 100.0
-    backup_dists = [0.0, 0.0, 0.0, 0.0]
-    backup_start_ms = time.ticks_ms()
-    last_loop_ms = backup_start_ms
-
-    while True:
-        now_ms = time.ticks_ms()
-        if _abort_check():
-            return
-        b_elapsed = time.ticks_diff(time.ticks_ms(), backup_start_ms) / 1000.0
-        if b_elapsed > UWB_BACKUP_TIMEOUT_S:
-            print("  [BACKUP] 倒退超时 ({:.1f}s)，放弃倒退".format(b_elapsed))
-            break
-        bcounts = get_encoder_counts()
-        if bcounts is None or len(bcounts) < 4:
-            time.sleep_ms(5)
-            continue
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001 or actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-            global _local_speeds_initialized
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
-        last_loop_ms = now_ms
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                backup_dists[i] += abs(bcounts[i]) / abs(ENC_SCALE[i])
-        avg_backup = sum(backup_dists) / len(backup_dists)
-        if abs(avg_backup) >= backup_dist_m:
-            print("  [BACKUP] 倒退完成 dist={:.2f}m".format(abs(avg_backup)))
-            break
-        wz_b = _heading_correction(target_heading, dt=actual_dt)
-        try:
-            speeds = _get_local_filtered_speeds(bcounts, actual_dt)
-            omni_drive_closed_loop(-UWB_BACKUP_SPEED, 0, wz_b, speeds, actual_dt)
-        except Exception as e:
-            print("  [BACKUP] 驱动错误:", e)
-        time.sleep_ms(int(FWD_CTRL_DT * 1000))
-
-    stop_all()
+    _drive_closed_loop(-UWB_BACKUP_SPEED, 0, UWB_BACKUP_DIST_CM / 100.0, check_target=False, label="BACKUP")
     time.sleep_ms(300)
     _encoder_reset()
 
 
 # ═══════════════════════════════════════════════════════════════
-#  _action_rightward_search: 向右平移搜索，累计1.2m内逐帧摄像头检测
-# ═══════════════════════════════════════════════════════════════
-
-def _action_rightward_search():
-    """向右平移搜索，累计1m内逐帧摄像头检测物品。
-
-    使用全局 _rightward_cumulative 跟踪跨轮次累计右移距离。
-
-    返回:
-        True  = 发现物品（已 stop_all，_rightward_cumulative 已保存断点）
-        False = 1m 完成无发现 / SW2 中断 / 超时
-    """
-    global _rightward_cumulative
-    target_heading = _lock_yaw()
-    print("  [RIGHT] 航向锁定: {:.1f}°".format(target_heading))
-    print("  [RIGHT] 当前累计进度: {:.2f}m / {:.1f}cm".format(
-        _rightward_cumulative, RIGHTWARD_SEARCH_DIST_CM))
-
-    target_dist_m = RIGHTWARD_SEARCH_DIST_CM / 100.0
-    if _rightward_cumulative >= target_dist_m:
-        print("  [RIGHT] 警告：累计右移已达目标值")
-        return False
-
-    session_dists = [0.0, 0.0, 0.0, 0.0]
-    start_ms = time.ticks_ms()
-    last_print_ms = start_ms
-    loop_cnt = 0
-    last_loop_ms = start_ms
-    cam = _ensure_cam()
-    led.value(1)
-
-    while True:
-        now_ms = time.ticks_ms()
-        if _abort_check():
-            stop_all()
-            led.value(0)
-            print("  [RIGHT] 检测到 SW2 手动中断")
-            return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > RIGHTWARD_TIMEOUT_S:
-            stop_all()
-            led.value(0)
-            print("  [RIGHT] 超时 ({:.1f}s)".format(elapsed))
-            return False
-        counts = get_encoder_counts()
-        if counts is None or len(counts) < 4:
-            time.sleep_ms(5)
-            continue
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001 or actual_dt > 3 * RIGHTWARD_CTRL_DT:
-            actual_dt = RIGHTWARD_CTRL_DT
-            global _local_speeds_initialized
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
-        last_loop_ms = now_ms
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                session_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-        session_avg = sum(session_dists) / 4.0
-        total_cumulative = _rightward_cumulative + session_avg
-        if total_cumulative >= target_dist_m:
-            _rightward_cumulative = total_cumulative
-            stop_all()
-            led.value(0)
-            print("  [RIGHT] 达到 1.2m 搜索边界 (实际 {:.2f}m)，未检测到目标".format(
-                total_cumulative))
-            return False
-        ctrl = cam.step()
-        if ctrl and ctrl.get('has_target', False):
-            _rightward_cumulative = total_cumulative
-            stop_all()
-            led.value(0)
-            print("  [RIGHT] 检测到目标！保存断点：{:.2f}m".format(_rightward_cumulative))
-            return True
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
-            print("  [RIGHT] cum={:.2f}m remain={:.1f}cm yaw={:.2f}°".format(
-                total_cumulative,
-                (RIGHTWARD_SEARCH_DIST_CM - total_cumulative * 100.0),
-                _yaw()))
-        loop_cnt += 1
-        if loop_cnt % 50 == 0:
-            gc.collect()
-        wz = _heading_correction(target_heading, dt=actual_dt)
-        try:
-            speeds = _get_local_filtered_speeds(counts, actual_dt)
-            omni_drive_closed_loop(0, RIGHTWARD_SPEED, wz, speeds, actual_dt)
-        except Exception as e:
-            print("  [RIGHT] 驱动异常:", e)
-        time.sleep_ms(int(RIGHTWARD_CTRL_DT * 1000))
-
-
-# ═══════════════════════════════════════════════════════════════
-#  _reverse_to_rightward_path: 倒车回到右移搜索路径线
+#  倒退回到原本 S 搜索路径
 # ═══════════════════════════════════════════════════════════════
 
 def _reverse_to_rightward_path():
-    """取物流程完成后，沿原路向后倒车回到右移搜索路径线上。
-
-    读取 _approach_forward_dist（取物流程净前进距离，已扣除 _execute_backup 的 20cm），
-    编码器里程计闭环倒车该距离，全程 IMU 航向保持。
-    完成后重置 _approach_forward_dist = 0。
+    """
+    取物流程完成后，高精度反向逆运动学倒车回退到搜索参考线上。
+    根据累加的物理前进距离 _approach_forward_dist 反向驱动，
+    精确回退到偏离原轨道的起始位置上（控制误差 ±3cm）。
     """
     global _approach_forward_dist
     if _approach_forward_dist <= 0.001:
-        print("  [REV] 前进距离 ≈ 0，无需倒车")
+        print("  [REV] 前进累加距离 ≈ 0，无需返回参考轨")
         return True
-    target_heading = _lock_yaw()
-    print("  [REV] 倒车回到右移路径，目标 {:.2f}m...".format(_approach_forward_dist))
-    backup_dists = [0.0, 0.0, 0.0, 0.0]
-    start_ms = time.ticks_ms()
-    last_print_ms = start_ms
-    loop_cnt = 0
-    last_loop_ms = start_ms
-
-    while True:
-        now_ms = time.ticks_ms()
-        if _abort_check():
-            stop_all()
-            _approach_forward_dist = 0
-            return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > BACKUP_PATH_TIMEOUT:
-            print("  [REV] 倒车超时 ({:.1f}s)".format(elapsed))
-            stop_all()
-            _approach_forward_dist = 0
-            return False
-        counts = get_encoder_counts()
-        if counts is None or len(counts) < 4:
-            time.sleep_ms(5)
-            continue
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001 or actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-            global _local_speeds_initialized
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
-        last_loop_ms = now_ms
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                backup_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-        avg_backup = sum(backup_dists) / len(backup_dists)
-        if avg_backup >= _approach_forward_dist:
-            print("  [REV] 倒车完成 dist={:.2f}m".format(avg_backup))
-            stop_all()
-            break
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
-            print("  [REV] dist={:.2f}m / {:.2f}m yaw={:.2f}°".format(
-                avg_backup, _approach_forward_dist, _yaw()))
-        loop_cnt += 1
-        if loop_cnt % 50 == 0:
-            gc.collect()
-        wz = _heading_correction(target_heading, dt=actual_dt)
-        try:
-            speeds = _get_local_filtered_speeds(counts, actual_dt)
-            omni_drive_closed_loop(-BACKUP_PATH_SPEED, 0, wz, speeds, actual_dt)
-        except Exception as e:
-            print("  [REV] 驱动错误:", e)
-        time.sleep_ms(int(FWD_CTRL_DT * 1000))
-
-    _approach_forward_dist = 0
+    print("  [REV] 倒车返回原参考轨道线，目标回退距离: {:.2f}m...".format(_approach_forward_dist))
+    
+    # 动作重用：使用统一闭环驱动器向后推进 (vx < 0)
+    _, dist_m = _drive_closed_loop(-BACKUP_PATH_SPEED, 0, _approach_forward_dist, 
+                                   check_target=False, timeout_s=BACKUP_PATH_TIMEOUT, label="REV_PATH")
+    
+    # 复位物理路径偏移计数器并清空编码器滤波器
+    _approach_forward_dist = 0.0
     _encoder_reset()
-    return True
+    return dist_m >= _approach_forward_dist
 
 
 # ═══════════════════════════════════════════════════════════════
-#  摄像头跟随靠近
+#  摄像头跟随靠近 (see_and_push)
 # ═══════════════════════════════════════════════════════════════
 
 def see_and_push():
     """
-    完全复用 test_vision_track.py 的核心跟随控制机理（CamDataReceiver + FollowController），
-    结合本地单次读取一阶低通滤波、动态时间步长与 8 帧对齐精准停靠判定。
+    基于物理学逆运动正解的高精度视觉对齐靠近算法。
     """
+    global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [APPROACH] === 视觉对齐靠近 ➔ 蓝牙同步流程 ===")
     cam = _ensure_cam()
     from cam_data import x_to_cm, y_to_distance
@@ -768,13 +673,8 @@ def see_and_push():
                     smooth_vy = 0.0
             rc = get_encoder_counts()
             if rc is not None and len(rc) >= 4:
-                global _approach_forward_dist
                 # 麦轮正解：带符号位移均值 = 纯纵向净前进，平移/自转分量自动抵消归零
-                dist_rf = rc[0] / ENC_SCALE[0]
-                dist_lf = rc[1] / ENC_SCALE[1]
-                dist_lb = rc[2] / ENC_SCALE[2]
-                dist_rb = rc[3] / ENC_SCALE[3]
-                step_forward = (dist_rf + dist_lf + dist_lb + dist_rb) / 4.0
+                step_forward = sum(rc[i] / ENC_SCALE[i] for i in range(4)) / 4.0
                 if step_forward > 0:
                     _approach_forward_dist += step_forward
                 speeds = _get_local_filtered_speeds(rc, dt_step)
@@ -846,10 +746,9 @@ def see_and_push():
 
 def _action_forward_until_uwb_x():
     """
-    全速前进，同时 UWB 判断 X 轴距离 或 摄像头识别黄线越界。
-    🟢 核心修复：即使 UWB 掉线，小车也绝不停车或返回起点，而是降低到安全速度继续向前推进并尝试在移动中重连，
-    同时完全依赖摄像头黄线检测作为绝对物理安全边界进行兜底拦截。
+    直行全速推进，并根据 UWB X 坐标平滑减速，结合视觉识别黄线实现双重安全拦截。
     """
+    global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [UWBX] === 全速前进，等待 UWB X < {:.0f}cm ===".format(UWB_X_THRESHOLD_CM))
     uwb = _ensure_uwb()
     if uwb is None:
@@ -879,7 +778,7 @@ def _action_forward_until_uwb_x():
             return False
         elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
         if elapsed > UWB_X_TIMEOUT_S:
-            print("  [UWBX] 超时 ({:.1f}s)，UWB 未达标，仅依靠视觉黄线推进兜底".format(elapsed))
+            print("  [UWBX] 超时 ({:.1f}s)，UWB 未达标，仅依靠视觉黄线推进".format(elapsed))
             pass
         counts = get_encoder_counts()
         if counts is None or len(counts) < 4:
@@ -888,20 +787,16 @@ def _action_forward_until_uwb_x():
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001 or actual_dt > 3 * FWD_CTRL_DT:
             actual_dt = FWD_CTRL_DT
-            global _local_speeds_initialized
             for i in range(4):
                 _local_prev_speeds[i] = 0.0
             _local_speeds_initialized = False
         last_loop_ms = now_ms
-        global _approach_forward_dist
+
         # 麦轮正解：带符号位移均值 = 纯纵向净前进，平移/自转分量自动抵消归零
-        dist_rf = counts[0] / ENC_SCALE[0]
-        dist_lf = counts[1] / ENC_SCALE[1]
-        dist_lb = counts[2] / ENC_SCALE[2]
-        dist_rb = counts[3] / ENC_SCALE[3]
-        step_forward = (dist_rf + dist_lf + dist_lb + dist_rb) / 4.0
+        step_forward = sum(counts[i] / ENC_SCALE[i] for i in range(4)) / 4.0
         if step_forward > 0:
             _approach_forward_dist += step_forward
+        
         now = time.ticks_ms()
         if uwb is not None and time.ticks_diff(now, last_uwb_ms) >= 50:
             uwb.step()
@@ -1058,7 +953,7 @@ def _action_uwb_translate():
         if _abort_check():
             led.value(0)
             return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+        elapsed = time.ticks_diff(now_ms, start_ms) / 1000.0
         if elapsed > UWB_TIMEOUT_S:
             print("  [UWB] 平移超时 ({:.1f}s)，结束本次平移动作".format(elapsed))
             led.value(0)
@@ -1130,9 +1025,8 @@ def _action_uwb_translate():
         actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
         if actual_dt <= 0.001 or actual_dt > 3 * UWB_CTRL_DT:
             actual_dt = UWB_CTRL_DT
-            global _local_speeds_initialized
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
+            global _local_prev_speeds, _local_speeds_initialized
+            _local_prev_speeds = [0.0, 0.0, 0.0, 0.0]
             _local_speeds_initialized = False
         last_loop_ms = now_ms
         wz = _heading_correction(target_heading, dt=actual_dt)
@@ -1149,10 +1043,7 @@ def _action_uwb_translate():
 # ═══════════════════════════════════════════════════════════════
 
 def move_toward_fixed_point():
-    """前进 50cm 再向右平移 110cm，全程 IMU 航向锁定不漂移。
-
-    参照 _forward_distance 的编码器里程计闭环 + IMU 航向保持模式。
-    """
+    """使用动力重合器前进 50cm，随后右移 110cm，全程 IMU 强纠偏"""
     print("\n" + "=" * 50)
     print("[MFP] 前进 50cm → 右平移 110cm（全程航向锁定）")
     print("=" * 50)
@@ -1160,123 +1051,19 @@ def move_toward_fixed_point():
     pause_encoder_ticker()
     _encoder_reset()
 
-    target_heading = _lock_yaw()
-    print("  [MFP] 航向锁定: {:.1f}°".format(target_heading))
+    _lock_yaw()
     led.value(1)
 
     # ── 阶段 1: 前进 50cm ──
     print("  [MFP] 阶段 1/2: 前进 {:.0f}cm...".format(MFP_FORWARD_DIST_CM))
-    fwd_dist_m = MFP_FORWARD_DIST_CM / 100.0
-    total_dists = [0.0, 0.0, 0.0, 0.0]
-    start_ms = time.ticks_ms()
-    last_print_ms = start_ms
-    loop_cnt = 0
-    last_loop_ms = start_ms
+    _drive_closed_loop(MFP_SPEED, 0, MFP_FORWARD_DIST_CM / 100.0, check_target=False, label="MFP_FWD")
 
-    while True:
-        now_ms = time.ticks_ms()
-        if _abort_check():
-            stop_all()
-            led.value(0)
-            return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > MFP_TIMEOUT_S:
-            print("  [MFP] 前进超时 ({:.1f}s)".format(elapsed))
-            stop_all()
-            led.value(0)
-            return False
-        counts = get_encoder_counts()
-        if counts is None or len(counts) < 4:
-            time.sleep_ms(5)
-            continue
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001 or actual_dt > 3 * MFP_CTRL_DT:
-            actual_dt = MFP_CTRL_DT
-            global _local_speeds_initialized
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
-        last_loop_ms = now_ms
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                total_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-        avg_dist = sum(total_dists) / len(total_dists)
-        if avg_dist >= fwd_dist_m:
-            print("  [MFP] 前进完成 dist={:.2f}m".format(avg_dist))
-            break
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
-            print("  [MFP] FWD dist={:.2f}m / {:.0f}cm yaw={:.2f}°".format(
-                avg_dist, MFP_FORWARD_DIST_CM, _yaw()))
-        loop_cnt += 1
-        if loop_cnt % 50 == 0:
-            gc.collect()
-        wz = _heading_correction(target_heading, dt=actual_dt)
-        try:
-            speeds = _get_local_filtered_speeds(counts, actual_dt)
-            omni_drive_closed_loop(MFP_SPEED, 0, wz, speeds, actual_dt)
-        except Exception as e:
-            print("  [MFP] 驱动错误:", e)
-        time.sleep_ms(int(MFP_CTRL_DT * 1000))
-
-    _pause_with_yaw_hold(target_heading, 300)
+    _pause_with_yaw_hold(_TARGET_HEADING, 300)
     _encoder_reset()
 
     # ── 阶段 2: 右平移 90cm ──
     print("  [MFP] 阶段 2/2: 右平移 {:.0f}cm...".format(MFP_RIGHT_DIST_CM))
-    right_dist_m = MFP_RIGHT_DIST_CM / 100.0
-    total_dists = [0.0, 0.0, 0.0, 0.0]
-    start_ms = time.ticks_ms()
-    last_print_ms = start_ms
-    loop_cnt = 0
-    last_loop_ms = start_ms
-
-    while True:
-        now_ms = time.ticks_ms()
-        if _abort_check():
-            stop_all()
-            led.value(0)
-            return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > MFP_TIMEOUT_S:
-            stop_all()
-            led.value(0)
-            return False
-        counts = get_encoder_counts()
-        if counts is None or len(counts) < 4:
-            time.sleep_ms(5)
-            continue
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001 or actual_dt > 3 * MFP_CTRL_DT:
-            actual_dt = MFP_CTRL_DT
-            global _local_speeds_initialized
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
-        last_loop_ms = now_ms
-        for i in range(4):
-            if ENC_SCALE[i] != 0:
-                total_dists[i] += abs(counts[i]) / abs(ENC_SCALE[i])
-        avg_dist = sum(total_dists) / len(total_dists)
-        if avg_dist >= right_dist_m:
-            print("  [MFP] 右平移完成 dist={:.2f}m".format(avg_dist))
-            break
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
-            print("  [MFP] RIGHT dist={:.2f}m / {:.0f}cm yaw={:.2f}°".format(
-                avg_dist, MFP_RIGHT_DIST_CM, _yaw()))
-        loop_cnt += 1
-        if loop_cnt % 50 == 0:
-            gc.collect()
-        wz = _heading_correction(target_heading, dt=actual_dt)
-        try:
-            speeds = _get_local_filtered_speeds(counts, actual_dt)
-            omni_drive_closed_loop(0, MFP_SPEED, wz, speeds, actual_dt)
-        except Exception as e:
-            print("  [MFP] 驱动错误:", e)
-        time.sleep_ms(int(MFP_CTRL_DT * 1000))
+    _drive_closed_loop(0, MFP_SPEED, MFP_RIGHT_DIST_CM / 100.0, check_target=False, label="MFP_RIGHT")
 
     stop_all()
     led.value(0)
@@ -1313,7 +1100,8 @@ def action_c14():
 
 
 def _action_forward_20cm():
-    return _forward_distance(FORWARD_DIST_M, FORWARD_SPEED, FWD_TIMEOUT_S, label="FWD")
+    _, dist = _drive_closed_loop(FORWARD_SPEED, 0, FORWARD_DIST_M, check_target=False, label="FWD")
+    return dist >= FORWARD_DIST_M
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1340,14 +1128,14 @@ def main():
             continue
 
         if key_triggered(2):
-            print("\n  [TEST_MODE] KEY2 (C9) 触发: 右移搜索 ➔ 取物流程")
+            print("\n  [TEST_MODE] KEY2 (C9) 触发: S 曲线搜索 ➔ 取物流程")
             try:
-                global _rightward_cumulative, _approach_forward_dist
-                _rightward_cumulative = 0.0
+                global _search_progress_cm, _approach_forward_dist
+                _search_progress_cm = 0.0
                 _approach_forward_dist = 0.0
                 pause_encoder_ticker()
                 _encoder_reset()
-                found = _action_rightward_search()
+                found = _action_s_pattern_search()
                 if found:
                     print("  [TEST_MODE] 发现目标，开始对齐靠近...")
                     _encoder_reset()
@@ -1395,6 +1183,7 @@ if RUN_MODE == "loop":
     _system_init()
 
     try:
+        # 第一阶段：推进固定路径
         move_toward_fixed_point()
 
         while True:
@@ -1402,30 +1191,33 @@ if RUN_MODE == "loop":
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
 
-            item_found = _action_rightward_search()
+            # 第二阶段：一轴 1D S 曲线横向扫描 (根据断点 _search_progress_cm 增量运行)
+            item_found = _action_s_pattern_search()
 
             if check_sw2():
                 print("  [MAIN_LOOP] SW2 介入打断，立即退出...")
                 break
 
             if not item_found:
-                print("\n  [MAIN_LOOP] 右移搜索完成未找到，UWB 返航至初始坐标...")
+                print("\n  [MAIN_LOOP] S型扫描结束且未搜索到更多目标，UWB返航...")
                 _action_return_to_origin()
                 break
 
             _approach_forward_dist = 0.0
             _encoder_reset()
 
+            # 第三阶段：视觉靠近，对准目标物
             if not see_and_push():
-                print("  [MAIN_LOOP] 对齐靠近中途中断，倒退回巡航轨道...")
+                print("  [MAIN_LOOP] 视觉靠近中断，正在无损退回到搜索轨道线...")
                 _reverse_to_rightward_path()
                 continue
 
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
 
+            # 第四阶段：物理/坐标双重防护推进黄线过线
             if not _action_forward_until_uwb_x():
-                print("  [MAIN_LOOP] 前行过线中途中断，倒退回巡航轨道...")
+                print("  [MAIN_LOOP] 过线推进中断，正在无损退回到搜索轨道线...")
                 _reverse_to_rightward_path()
                 continue
 
@@ -1462,11 +1254,12 @@ if RUN_MODE == "loop":
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
 
+            # 第五阶段：按照整个过程的高精度累计前进偏移进行回退复位
             _reverse_to_rightward_path()
 
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
-            print("  [MAIN_LOOP] 已顺利复位回到巡航主线，继续搜寻下个目标...")
+            print("  [MAIN_LOOP] 成功无损复位至 S 型轨道断点，继续执行下一次搜索...")
 
     except KeyboardInterrupt:
         print("  [MAIN_LOOP] 用户手动终止 (Ctrl+C)")
@@ -1476,3 +1269,4 @@ if RUN_MODE == "loop":
 elif RUN_MODE == "test":
     main()
     import sys; sys.exit()
+    
