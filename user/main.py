@@ -517,7 +517,7 @@ def _action_s_pattern_search():
     一维轴向一字型 S 曲线搜索路径规划。
     一维总进度通过全局变量 _search_progress_cm (0 ~ 220cm) 统一管理。
     """
-    global _search_progress_cm
+    global _search_progress_cm, _just_pushed
     # 清空 move_toward_fixed_point 阶段积压的摄像头 UART 脏帧，保证视觉时效
     _ensure_cam().reset()
     target_heading = _lock_yaw()
@@ -549,8 +549,8 @@ def _action_s_pattern_search():
         if check_sw2():
             return False
 
-    # ── 阶段 2: 左平移搜索区 (140 - 220cm) ──
-    if 140.0 <= _search_progress_cm < 220.0:
+    # ── 阶段 2: 左平移搜索区 (140 - 240cm) ──
+    if 140.0 <= _search_progress_cm < 240.0:
         rem_dist_m = (220.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 2 (向左平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
         # 向左平移使用负的 Y 速度分量
@@ -563,7 +563,7 @@ def _action_s_pattern_search():
             return False
 
     # ── 阶段 3: 无果判定 ──
-    if _search_progress_cm >= 220.0:
+    if _search_progress_cm >= 240.0:
         print("  [S_SEARCH] 阶段 3 (轴向搜索结束，未发现任何物品)。")
         return False
 
@@ -1252,7 +1252,7 @@ def _safe_return_and_exit():
 #  系统入口
 # ═══════════════════════════════════════════════════════════════
 
-RUN_MODE = "test"
+RUN_MODE = "loop"
 
 if RUN_MODE == "loop":
     _system_init()

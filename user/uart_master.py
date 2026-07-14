@@ -23,7 +23,7 @@ class MasterBT:
     """主控车蓝牙从机通信控制器"""
 
     def __init__(self, uart_id=5, baudrate=38400):
-        self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1)
+        self._uart = UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1, timeout=10)
 
 
     def send_imu_data(self, roll, pitch, yaw, wx, wy, wz):
