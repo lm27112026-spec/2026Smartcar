@@ -82,6 +82,7 @@ SW2_DEBOUNCE_MS  = 50
 # ── 状态机与物理位置全局变量 ──
 RUN_MODE              = "test"   # 运行模式: "loop" 或 "test"
 origin                = None    # 起点坐标 (x, y)
+supplies              = None    # 动态物资识别断点坐标 (x, y)，由扫描阶段动态写入
 _uwb_shared           = None    # 共享 UWBPosition 实例
 _cam_shared           = None    # 共享 CameraController 实例
 _TARGET_HEADING       = None    # 全程锁定的目标航向
@@ -509,6 +510,37 @@ def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadba
 
 
 # ═══════════════════════════════════════════════════════════════
+#  UWB 坐标断点记录器
+# ═══════════════════════════════════════════════════════════════
+
+def _record_supplies_position():
+    """读取当前 UWB 物理坐标，动态记录到 supplies 变量作为断点返回点。
+    优化：前行扫描期间没有 step，此处通过短暂循环刷新串口缓冲区，
+    确保获取到最新鲜、未过期的物理坐标。"""
+    global supplies
+    uwb = _ensure_uwb()
+    if uwb is not None:
+        print("  [UWB_RECORD] 正在刷新 UWB 接收缓冲区以获取最新坐标...")
+        start_t = time.ticks_ms()
+        old_frames = uwb.get_frame_count()
+        # 持续 step 刷新，最多等待 300ms，或者直到串口接收到至少一个全新的完整数据帧
+        while time.ticks_diff(time.ticks_ms(), start_t) < 300:
+            uwb.step()
+            time.sleep_ms(10)
+            if uwb.get_frame_count() > old_frames:
+                break
+
+        try:
+            supplies = uwb.get_position()
+            print("  [UWB_RECORD] 成功记录当前最新坐标到 supplies 断点: ({:.1f}, {:.1f})".format(
+                supplies[0], supplies[1]))
+        except Exception as e:
+            print("  [UWB_RECORD] 读取并保存 UWB 断点失败:", e)
+    else:
+        print("  [UWB_RECORD] 警告：UWB 未就绪或掉线，无法记录 supplies 坐标（将使用编码器倒车备用方案）")
+
+
+# ═══════════════════════════════════════════════════════════════
 #  一维一字型 S 曲线搜索算法 (1D S-Pattern State Machine)
 # ═══════════════════════════════════════════════════════════════
 
@@ -517,7 +549,7 @@ def _action_s_pattern_search():
     一维轴向一字型 S 曲线搜索路径规划。
     一维总进度通过全局变量 _search_progress_cm (0 ~ 220cm) 统一管理。
     """
-    global _search_progress_cm, _just_pushed
+    global _search_progress_cm, _just_pushed, supplies
     # 清空 move_toward_fixed_point 阶段积压的摄像头 UART 脏帧，保证视觉时效
     _ensure_cam().reset()
     target_heading = _lock_yaw()
@@ -534,6 +566,7 @@ def _action_s_pattern_search():
         found, moved_m = _drive_closed_loop(0, RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_0", ignore_dist_m=ignore_d)
         _search_progress_cm += moved_m * 100.0
         if found:
+            _record_supplies_position()
             print("  [S_SEARCH] 阶段 0 捕获目标! 断点已锁定在: {:.1f}cm".format(_search_progress_cm))
             return True
         if check_sw2():
@@ -557,6 +590,7 @@ def _action_s_pattern_search():
         found, moved_m = _drive_closed_loop(0, -RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_2", ignore_dist_m=ignore_d)
         _search_progress_cm += moved_m * 100.0
         if found:
+            _record_supplies_position()
             print("  [S_SEARCH] 阶段 2 捕获目标! 断点已锁定在: {:.1f}cm".format(_search_progress_cm))
             return True
         if check_sw2():
@@ -587,29 +621,86 @@ def _execute_backup(target_heading):
 # ═══════════════════════════════════════════════════════════════
 
 def _reverse_to_rightward_path():
-    """根据累加的物理前进距离 _approach_forward_dist 反向驱动，回退到搜索参考线上。"""
-    global _approach_forward_dist
-    if _approach_forward_dist <= 0.001:
-        print("  [REV] 前进累加距离 ≈ 0，无需返回参考轨")
+    """
+    复位到搜索参考线。
+    优先：通过 UWB 导航飞回动态记录的 supplies 断点坐标；
+    备用：若 UWB 离线或坐标为空（如测试模式），采用物理打滑比例补偿倒退。
+    """
+    global _approach_forward_dist, supplies
+
+    uwb = _ensure_uwb()
+
+    # ── 优先方案：UWB 闭环导航返回 supplies 断点 ──
+    if uwb is not None and not uwb.is_timeout() and supplies is not None:
+        print("  [REV] 检测到有效 UWB 及 supplies 断点坐标，启动 UWB 导航返回: ({:.1f}, {:.1f})".format(
+            supplies[0], supplies[1]))
+        target_x, target_y = supplies
+
+        # 声明 goto_location 的闭环控制回调依赖
+        def _lock_fn(): return _lock_yaw()
+        def _wz_fn(target, db): return _heading_correction(target, deadband=db, dt=ORIGIN_CTRL_DT)
+        def _yaw_fn(): return _yaw()
+        def _abort_fn():
+            pet_watchdog()
+            if check_sw2():
+                print("  [SW2] Abort requested")
+                return True
+            return False
+        def _drive_fn(vx, vy, wz, dt):
+            rc = get_encoder_counts()
+            if rc is not None and len(rc) >= 4:
+                speeds = _get_local_filtered_speeds(rc, dt)
+                omni_drive_closed_loop(vx, vy, wz, speeds, dt)
+        def _stop_fn(): stop_all()
+        def _led_fn(val): led.value(val)
+
+        # 闭环导航返回断点起点：临时收紧到位死区防止多次循环累积横向漂移
+        _save_db = uwb_control.GOTO_DB
+        uwb_control.GOTO_DB = 5.0  # 缩小到位死区，提高轨道复位精度
+        try:
+            arrived, reason = goto_location(
+                uwb, target_x, target_y,
+                _lock_fn, _wz_fn, _yaw_fn,
+                _abort_fn, _drive_fn, _stop_fn,
+                _led_fn, label="REV_UWB"
+            )
+        finally:
+            uwb_control.GOTO_DB = _save_db  # 恢复原值，不影响返航精度
+        if arrived:
+            print("  [REV] 成功通过 UWB 导航复位到 supplies 断点轨道！")
+            _approach_forward_dist = 0.0
+            _encoder_reset()
+            return True
+        else:
+            print("  [REV] UWB 导航返回断点失败 (Reason: {})，自动切换到备用编码器倒车".format(reason))
+
+    # ── 备用方案（Fallback）：编码器滑移补偿倒退（支持测试模式与断连保障） ──
+    SLIP_COMPENSATION_FACTOR = 0.65  # 轮子阻力打滑补偿系数
+    compensated_dist = _approach_forward_dist * SLIP_COMPENSATION_FACTOR
+
+    if compensated_dist <= 0.001:
+        print("  [REV] 积攒前进距离 ≈ 0，无需返回")
         return True
-    print("  [REV] 倒车返回原参考轨道线，目标回退距离: {:.2f}m...".format(_approach_forward_dist))
-    
-    # 动作重用：使用统一闭环驱动器向后推进 (vx < 0)
-    _, dist_m = _drive_closed_loop(-BACKUP_PATH_SPEED, 0, _approach_forward_dist, 
-                                   check_target=False, timeout_s=BACKUP_PATH_TIMEOUT, label="REV_PATH")
-    
-    # 复位物理路径偏移计数器并清空编码器滤波器
+
+    print("  [REV] [Fallback] UWB 不可用，使用编码器补偿。原积攒: {:.2f}m, 补偿后倒退: {:.2f}m...".format(
+        _approach_forward_dist, compensated_dist))
+
+    # 使用统一闭环驱动器向后推进
+    _, dist_m = _drive_closed_loop(-BACKUP_PATH_SPEED, 0, compensated_dist,
+                                   check_target=False, timeout_s=BACKUP_PATH_TIMEOUT, label="REV_FALLBACK")
+
     _approach_forward_dist = 0.0
     _encoder_reset()
-    return dist_m >= _approach_forward_dist
+    return dist_m >= compensated_dist
 
 
 # ═══════════════════════════════════════════════════════════════
-#  摄像头跟随靠近 (see_and_push)
+#  摄像头跟随靠近 (see_and_push) - 修复高精度安全停靠版
 # ═══════════════════════════════════════════════════════════════
 
 def see_and_push():
-    """基于物理学逆运动学正解的高精度视觉对齐靠近算法。"""
+    """基于物理学逆运动学正解的高精度视觉对齐靠近算法 (修复高精度停靠版)。
+    保留新版闭环的高精准贴合停靠品质，通过真实新帧确认、速度收敛判据、丢标超时与硬限时实现绝对稳定停靠退出。"""
     global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [APPROACH] === 视觉对齐靠近 ➔ 蓝牙同步流程 ===")
     cam = _ensure_cam()
@@ -623,9 +714,17 @@ def see_and_push():
     last_x_cm = 0.0
     last_dist_cm = 0.0
     last_has_tgt = False
-    prev_vy = 0.0
+
+    # ── 物理停靠判定变量 ──
     align_consecutive_count = 0
     arrived_success = False
+
+    # ── 计时器与保护机制 ──
+    start_time_ms = time.ticks_ms()
+    last_target_seen_ms = start_time_ms
+    MAX_APPROACH_TIME_S = 8.0     # 8秒整段最大靠近时限，防止意外卡住
+    LOST_TARGET_TIMEOUT_MS = 1500  # 丢失目标 1.5秒 安全退出保护
+
     LOOP_MS = 10
     t_prev = time.ticks_ms()
     loop_cnt = 0
@@ -638,12 +737,23 @@ def see_and_push():
             t_prev = t_now
             if dt_act <= 0 or dt_act > 0.1:
                 dt_act = 0.01
+
+            # ── 1. 整段最大时间硬超时拦截 ──
+            if time.ticks_diff(t_now, start_time_ms) / 1000.0 > MAX_APPROACH_TIME_S:
+                print("  [APPROACH] 达到单次靠近时限 ({:.1f}s)，物理停车并退出".format(MAX_APPROACH_TIME_S))
+                stop_all()
+                break
+
             cam_data = recv.read()
             wz = _heading_correction(target_heading, dt=dt_act)
             has_tgt = False
             x_cm = 0.0
             dist_cm = 0.0
-            if cam_data is not None:
+
+            # 💡 核心修复：检查当前周期是否接收到真正的串口新数据包
+            new_frame_arrived = (cam_data is not None)
+
+            if new_frame_arrived:
                 has_tgt = cam_data['is_target']
                 if has_tgt:
                     x_cm = x_to_cm(cam_data['x'])
@@ -651,6 +761,7 @@ def see_and_push():
                     last_x_cm = x_cm
                     last_dist_cm = dist_cm
                     last_has_tgt = True
+                    last_target_seen_ms = t_now  # 重置丢标安全时钟
                 elif last_has_tgt:
                     x_cm = last_x_cm
                     dist_cm = last_dist_cm
@@ -659,13 +770,19 @@ def see_and_push():
                     x_cm = last_x_cm
                     dist_cm = last_dist_cm
 
+            # ── 2. 丢标安全超时拦截 ──
+            if time.ticks_diff(t_now, last_target_seen_ms) > LOST_TARGET_TIMEOUT_MS:
+                print("  [APPROACH] 目标丢失超时 ({:.1f}s)，安全断开退出".format(LOST_TARGET_TIMEOUT_MS / 1000.0))
+                stop_all()
+                break
+
             # 保持真实的 has_tgt 输入，让控制器内部的 500ms 容忍时钟正常工作
             vx, vy, wz_out, is_aligned, dt_step = fc.step(
                 x_cm, dist_cm, has_tgt, wz_in=wz, now_ms=t_now)
-            
-            # ── 依据控制器输出状态分级驱动底盘（与测试文件逻辑对齐） ──
+
+            # ── 3. 依据控制器输出状态分级驱动底盘 ──
             if abs(vx) > 0.001 or abs(vy) > 0.001:
-                # 【纵向纯净位移积分】：只在真正向前移动时累加；若过冲产生向后修正（vx < 0），则对应递减
+                # 【纵向纯净位移积分】
                 step_forward = vx * dt_step
                 _approach_forward_dist += step_forward
                 if _approach_forward_dist < 0.0:
@@ -674,7 +791,7 @@ def see_and_push():
                 rc = get_encoder_counts()
                 if rc is not None and len(rc) >= 4:
                     speeds = _get_local_filtered_speeds(rc, dt_step)
-                    # 直接采用控制器原生的 vx 和 vy 进行驱动，支持双向修正、自动减速与精准停靠
+                    # 采用控制器原生 vx 和 vy 进行高精度贴停与自动减速
                     omni_drive_closed_loop(vx, vy, wz_out, speeds, dt_step)
                 else:
                     stop_all()
@@ -690,15 +807,29 @@ def see_and_push():
                 else:
                     stop_all()
 
-            if is_aligned:
-                align_consecutive_count += 1
-            else:
-                align_consecutive_count = 0
-            if align_consecutive_count >= 8:
+            # ── 4. 优化后的精准停靠判定逻辑 ──
+            # 💡 核心修复：仅在收到真实摄像机新帧且包含目标时，才累加对齐计数，彻底防止假数据帧过冲
+            if new_frame_arrived and has_tgt:
+                if is_aligned:
+                    align_consecutive_count += 1
+                else:
+                    align_consecutive_count = 0
+
+            # 💡 双保险判据：
+            # 保险 A：在相机新帧更新的前提下，连续 4 次确认对齐（稳定维持约 130ms）
+            # 保险 B：虽然计数未满，但 vx/vy 速度输出已经完全衰减收敛（小于 0.03m/s），说明底盘已完全停稳
+            speed_converged = is_aligned and abs(vx) < 0.03 and abs(vy) < 0.03
+
+            if align_consecutive_count >= 4 or speed_converged:
                 stop_all()
-                print("\n  [APPROACH] 目标精准对齐停靠完成 (连续 8 帧对齐确认)！")
+                time.sleep_ms(80)  # 原地物理刹车释能，消解余震
+                _encoder_reset()
+
+                print("\n  [APPROACH] 目标精准停靠确认 ({})！".format(
+                    "连续真实帧对齐" if align_consecutive_count >= 4 else "输出速度收敛"))
                 arrived_success = True
                 break
+
             if _abort_check():
                 print("\n  [APPROACH] SW2 手动跳过对齐，执行短距试探前进...")
                 stop_all()
@@ -706,6 +837,7 @@ def see_and_push():
                 _drive_closed_loop(0.35, 0, 0.20, check_target=False, timeout_s=3.0, label="APPROACH_SKIP_FWD")
                 arrived_success = True
                 break
+
             elap = time.ticks_diff(time.ticks_ms(), t_now)
             if elap < LOOP_MS:
                 time.sleep_ms(LOOP_MS - elap)
@@ -1136,10 +1268,11 @@ def main():
         if key_triggered(1):
             print("\n  [TEST_MODE] KEY1 (C8) 被按下。开始执行 S形搜索 ➔ 推出 ➔ 倒车复位闭环流程...")
             try:
-                global _search_progress_cm, _approach_forward_dist, _just_pushed
+                global _search_progress_cm, _approach_forward_dist, _just_pushed, supplies
                 _search_progress_cm = 0.0
                 _approach_forward_dist = 0.0
                 _just_pushed = False
+                supplies = None
 
                 while True:
                     pause_encoder_ticker()
@@ -1198,10 +1331,11 @@ def main():
         if key_triggered(2):
             print("\n  [TEST_MODE] KEY2 (C9) 触发: 原始带通信的 S 曲线测试")
             try:
-                global _search_progress_cm, _approach_forward_dist, _just_pushed
+                global _search_progress_cm, _approach_forward_dist, _just_pushed, supplies
                 _search_progress_cm = 0.0
                 _approach_forward_dist = 0.0
                 _just_pushed = False
+                supplies = None
                 pause_encoder_ticker()
                 _encoder_reset()
                 found = _action_s_pattern_search()
