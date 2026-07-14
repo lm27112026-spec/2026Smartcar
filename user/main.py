@@ -17,6 +17,7 @@ def _yaw():
 from key import capture, key_triggered, pet_watchdog, stop as stop_key, start_watchdog
 from uwb_position import UWBPosition
 from IMU_hold import HeadingHold
+import uwb_control
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -186,17 +187,14 @@ def _system_init():
     start_watchdog()
     print("  [INIT] 独立硬件看门狗已启用 (3秒超时)")
 
-    # 4. 初始化 UWB（非 test 模式才初始化，免连线等待）
-    if RUN_MODE != "test":
-        uwb = _ensure_uwb()
-        if uwb is not None and uwb.get_frame_count() > 0:
-            origin = uwb.get_position()
-            print("  [INIT] UWB 起点坐标已记录: ({:.1f}, {:.1f})".format(origin[0], origin[1]))
-        else:
-            print("  [INIT] UWB 未就绪，使用默认坐标")
-            origin = (130.0, 262.0)
+    # 4. 初始化 UWB（两个模式均统一初始化，保证测试/循环一致性）
+    uwb = _ensure_uwb()
+    if uwb is not None and uwb.get_frame_count() > 0:
+        origin = uwb.get_position()
+        print("  [INIT] UWB 起点坐标已记录: ({:.1f}, {:.1f})".format(origin[0], origin[1]))
     else:
-        print("  [INIT] 测试模式下，跳过 UWB 模块初始化")
+        print("  [INIT] UWB 未就绪，使用默认坐标")
+        origin = (130.0, 262.0)
 
     print("[SYSTEM] 初始化就绪，空闲内存: {} 字节\n".format(gc.mem_free()))
 
@@ -436,6 +434,7 @@ def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadba
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     last_loop_ms = start_ms
+    last_uwb_step_ms = start_ms
     loop_cnt = 0
     cam = _ensure_cam() if check_target else None
     led.value(1)
@@ -443,6 +442,12 @@ def _drive_closed_loop(vx, vy, target_dist_m, check_target=False, heading_deadba
     while True:
         now_ms = time.ticks_ms()
         pet_watchdog()
+
+        # ── UWB 串口防积压：每隔 50ms 步进一次，防止长期不读导致 uart_bytes=255 超时 ──
+        if time.ticks_diff(now_ms, last_uwb_step_ms) >= 50:
+            if _uwb_shared is not None:
+                _uwb_shared.step()
+            last_uwb_step_ms = now_ms
 
         if _abort_check():
             stop_all()
@@ -727,12 +732,19 @@ def see_and_push():
 
     LOOP_MS = 10
     t_prev = time.ticks_ms()
+    last_uwb_step_ms = t_prev
     loop_cnt = 0
     led.value(1)
 
     try:
         while True:
             t_now = time.ticks_ms()
+
+            # ── UWB 串口防积压：每隔 50ms 步进一次，防止长期不读导致 uart_bytes=255 超时 ──
+            if time.ticks_diff(t_now, last_uwb_step_ms) >= 50:
+                if _uwb_shared is not None:
+                    _uwb_shared.step()
+                last_uwb_step_ms = t_now
             dt_act = time.ticks_diff(t_now, t_prev) * 0.001
             t_prev = t_now
             if dt_act <= 0 or dt_act > 0.1:
@@ -893,19 +905,13 @@ def see_and_push():
 # ═══════════════════════════════════════════════════════════════
 
 def _action_forward_until_uwb_x():
-    """直行全速推进。在 test 模式下绕过 UWB 坐标，仅使用视觉黄线 + 安全里程拦截推进。"""
+    """直行全速推进。全模式统一引入 UWB 物理坐标安全控制 + 视觉黄线复合守护推进。"""
     global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [UWBX] === 开始过线推进 ===")
     
-    # ── 测试模式自适应参数 ──
-    is_test_mode = (RUN_MODE == "test")
-    if is_test_mode:
-        uwb = None  # 测试模式下完全排除 UWB，强制其走 fallback 分支
-        print("  [UWBX] 检测到测试模式：已屏蔽 UWB 坐标检验，进入纯视觉与安全里程（1.5m）混合守护。")
-    else:
-        uwb = _ensure_uwb()
-        if uwb is None:
-            print("  [UWBX] 警告：UWB 初始不可用，将在前行移动中建立连接...")
+    uwb = _ensure_uwb()
+    if uwb is None:
+        print("  [UWBX] 警告：UWB 初始不可用，将在前行移动中建立连接...")
 
     target_heading = _lock_yaw()
     start_ms = time.ticks_ms()
@@ -956,8 +962,8 @@ def _action_forward_until_uwb_x():
             _approach_forward_dist += step_forward
             total_fwd_dist_m += step_forward
 
-        # ── 测试模式物理防越界脱轨保护 ──
-        if is_test_mode and total_fwd_dist_m >= 1.5:
+        # ── 通用安全物理最长防护距离 (1.5m) ──
+        if total_fwd_dist_m >= 1.5:
             stop_all()
             led.value(0)
             print("  [UWBX] 已达到测试模式最长物理防护距离 (1.5m)，触发停车。")
@@ -984,31 +990,30 @@ def _action_forward_until_uwb_x():
         uwb_is_active = True
         if uwb is None or uwb.is_timeout():
             uwb_is_active = False
-            if not is_test_mode:
-                if uwb_dead_start == 0:
+            if uwb_dead_start == 0:
+                uwb_dead_start = time.ticks_ms()
+                print("  [UWBX] UWB 数据中断，车身保持安全巡航速度并于移动中尝试重连...")
+            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > UWB_DEAD_TIMEOUT_S * 1000:
+                if uwb is not None and uwb.is_uart_alive():
+                    print("  [UWBX] UART 仍活跃，延长移动等待 (帧过滤中)...")
                     uwb_dead_start = time.ticks_ms()
-                    print("  [UWBX] UWB 数据中断，车身保持安全巡航速度并于移动中尝试重连...")
-                elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > UWB_DEAD_TIMEOUT_S * 1000:
-                    if uwb is not None and uwb.is_uart_alive():
-                        print("  [UWBX] UART 仍活跃，延长移动等待 (帧过滤中)...")
-                        uwb_dead_start = time.ticks_ms()
-                    elif uwb_dead_reconnect < UWB_DEAD_RECONNECT_MAX:
-                        uwb_dead_reconnect += 1
-                        print("  [UWBX] UART 离线，移动中进行第 {}/{} 次硬件重连重建...".format(
-                            uwb_dead_reconnect, UWB_DEAD_RECONNECT_MAX))
-                        _reset_uwb_if_needed()
-                        new_uwb = _ensure_uwb()
-                        if new_uwb is not None:
-                            uwb = new_uwb
-                            uwb_dead_start = 0
-                            last_uwb_ms = time.ticks_ms()
-                            print("  [UWBX] UWB 移动中重连建立成功！")
-                            uwb_is_active = True
-                            continue
-                        uwb_dead_start = time.ticks_ms()
-                    else:
-                        print("  [UWBX] UWB 彻底离线，已进入视觉托管状态，继续安全车速行进...")
-                        uwb_dead_start = time.ticks_ms()
+                elif uwb_dead_reconnect < UWB_DEAD_RECONNECT_MAX:
+                    uwb_dead_reconnect += 1
+                    print("  [UWBX] UART 离线，移动中进行第 {}/{} 次硬件重连重建...".format(
+                        uwb_dead_reconnect, UWB_DEAD_RECONNECT_MAX))
+                    _reset_uwb_if_needed()
+                    new_uwb = _ensure_uwb()
+                    if new_uwb is not None:
+                        uwb = new_uwb
+                        uwb_dead_start = 0
+                        last_uwb_ms = time.ticks_ms()
+                        print("  [UWBX] UWB 移动中重连建立成功！")
+                        uwb_is_active = True
+                        continue
+                    uwb_dead_start = time.ticks_ms()
+                else:
+                    print("  [UWBX] UWB 彻底离线，已进入视觉托管状态，继续安全车速行进...")
+                    uwb_dead_start = time.ticks_ms()
         else:
             if uwb_dead_start != 0:
                 print("  [UWBX] UWB 链路已自主恢复")
@@ -1263,7 +1268,7 @@ def main():
         pet_watchdog()
 
         # ──────────────────────────────────────────────────────────
-        # KEY1 (C8) 触发：S形扫描物资并推离 (无蓝牙通信、无 UWB 坐标参与，直接内嵌逻辑)
+        # KEY1 (C8) 触发：S形扫描物资并推离 (全模式统一 UWB 闭环 + 蓝牙由 see_and_push 内自动过滤)
         # ──────────────────────────────────────────────────────────
         if key_triggered(1):
             print("\n  [TEST_MODE] KEY1 (C8) 被按下。开始执行 S形搜索 ➔ 推出 ➔ 倒车复位闭环流程...")
@@ -1283,12 +1288,14 @@ def main():
                     item_found = _action_s_pattern_search()
 
                     if check_sw2():
-                        print("  [TEST_MODE] SW2 介入打断，立即退出...")
+                        print("  [TEST_MODE] SW2 介入打断，正在返航...")
+                        _action_return_to_origin()
                         break
 
-                    # 扫描无果代表全部区域搜索完毕，直接结束，不触发 UWB 归巢导航
+                    # 扫描无果代表全部区域搜索完毕，UWB 归巢返航
                     if not item_found:
-                        print("  [TEST_MODE] S型横向搜索全部完成且未发现更多物资，动作安全终止。")
+                        print("  [TEST_MODE] S型横向搜索全部完成且未发现更多物资，正在返航...")
+                        _action_return_to_origin()
                         break
 
                     _approach_forward_dist = 0.0
@@ -1303,7 +1310,7 @@ def main():
                     _pause_with_yaw_hold(_TARGET_HEADING, 300)
                     _encoder_reset()
 
-                    # 3. 越黄线推进 (在 _action_forward_until_uwb_x 内自动不加载 UWB，通过黄线与 1.5m 限制判定)
+                    # 3. 越黄线推进 (全模式统一 UWB 坐标 + 视觉黄线复合守护)
                     if not _action_forward_until_uwb_x():
                         print("  [TEST_MODE] 推进中断，正在退回到搜索轨道线...")
                         _reverse_to_rightward_path()
@@ -1386,7 +1393,7 @@ def _safe_return_and_exit():
 #  系统入口
 # ═══════════════════════════════════════════════════════════════
 
-RUN_MODE = "loop"
+RUN_MODE = "test"
 
 if RUN_MODE == "loop":
     _system_init()
