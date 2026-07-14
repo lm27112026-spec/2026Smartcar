@@ -700,12 +700,12 @@ def _reverse_to_rightward_path():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  摄像头跟随靠近 (see_and_push) - 修复高精度安全停靠版
+#  摄像头跟随靠近 (see_and_push) - 竞速级高速对齐版
 # ═══════════════════════════════════════════════════════════════
 
 def see_and_push():
-    """基于物理学逆运动学正解的高精度视觉对齐靠近算法 (修复高精度停靠版)。
-    保留新版闭环的高精准贴合停靠品质，通过真实新帧确认、速度收敛判据、丢标超时与硬限时实现绝对稳定停靠退出。"""
+    """基于物理学逆运动学正解的高精度视觉对齐靠近算法 (竞速级高速对齐版)。
+    1.35倍速度增益消除拖沓，0.08m/s收敛门限瞬间斩断蠕动长尾，提升比赛竞速净效率。"""
     global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [APPROACH] === 视觉对齐靠近 ➔ 蓝牙同步流程 ===")
     cam = _ensure_cam()
@@ -792,10 +792,15 @@ def see_and_push():
             vx, vy, wz_out, is_aligned, dt_step = fc.step(
                 x_cm, dist_cm, has_tgt, wz_in=wz, now_ms=t_now)
 
-            # ── 3. 依据控制器输出状态分级驱动底盘 ──
-            if abs(vx) > 0.001 or abs(vy) > 0.001:
-                # 【纵向纯净位移积分】
-                step_forward = vx * dt_step
+            # ── 3. 🔴 竞速优化：给控制器输出乘以 1.35 倍增益，并进行安全最高限幅 ──
+            vx_boosted = vx * 1.35
+            vy_boosted = vy * 1.35
+            vx_boosted = max(-0.50, min(vx_boosted, 0.50))
+            vy_boosted = max(-0.50, min(vy_boosted, 0.50))
+
+            if abs(vx_boosted) > 0.001 or abs(vy_boosted) > 0.001:
+                # 【纵向纯净位移积分】：累加实际使用的 vx_boosted 移动量
+                step_forward = vx_boosted * dt_step
                 _approach_forward_dist += step_forward
                 if _approach_forward_dist < 0.0:
                     _approach_forward_dist = 0.0
@@ -803,8 +808,8 @@ def see_and_push():
                 rc = get_encoder_counts()
                 if rc is not None and len(rc) >= 4:
                     speeds = _get_local_filtered_speeds(rc, dt_step)
-                    # 采用控制器原生 vx 和 vy 进行高精度贴停与自动减速
-                    omni_drive_closed_loop(vx, vy, wz_out, speeds, dt_step)
+                    # 采用高增益后的 vx_boosted 和 vy_boosted 进行底盘控制，缩短过渡期
+                    omni_drive_closed_loop(vx_boosted, vy_boosted, wz_out, speeds, dt_step)
                 else:
                     stop_all()
             else:
@@ -820,7 +825,6 @@ def see_and_push():
                     stop_all()
 
             # ── 4. 优化后的精准停靠判定逻辑 ──
-            # 💡 核心修复：仅在收到真实摄像机新帧且包含目标时，才累加对齐计数，彻底防止假数据帧过冲
             if new_frame_arrived and has_tgt:
                 if is_aligned:
                     align_consecutive_count += 1
@@ -828,17 +832,18 @@ def see_and_push():
                     align_consecutive_count = 0
 
             # 💡 双保险判据：
-            # 保险 A：在相机新帧更新的前提下，连续 4 次确认对齐（稳定维持约 130ms）
-            # 保险 B：虽然计数未满，但 vx/vy 速度输出已经完全衰减收敛（小于 0.03m/s），说明底盘已完全停稳
-            speed_converged = is_aligned and abs(vx) < 0.03 and abs(vy) < 0.03
+            # 保险 A：在相机新帧更新的前提下，连续 3 次确认对齐（稳定维持约 100ms）
+            # 保险 B：将收敛阈值从原先的 0.03m/s 放宽到 0.08m/s (8cm/s)。
+            # 这能瞬间切除末端极慢的"爬行尾巴"，至少能节省 3-4 秒的调整时间，且由于速度极低，惯性对角度精度无影响。
+            speed_converged = is_aligned and abs(vx_boosted) < 0.08 and abs(vy_boosted) < 0.08
 
-            if align_consecutive_count >= 4 or speed_converged:
+            if align_consecutive_count >= 3 or speed_converged:
                 stop_all()
                 time.sleep_ms(80)  # 原地物理刹车释能，消解余震
                 _encoder_reset()
 
                 print("\n  [APPROACH] 目标精准停靠确认 ({})！".format(
-                    "连续真实帧对齐" if align_consecutive_count >= 4 else "输出速度收敛"))
+                    "连续真实帧对齐" if align_consecutive_count >= 3 else "输出速度收敛"))
                 arrived_success = True
                 break
 

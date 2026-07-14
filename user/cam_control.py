@@ -12,7 +12,7 @@ from motor import (stop_all, omni_drive_closed_loop,
                    get_encoder_speeds_filtered, get_encoder_counts,
                    reset_encoder_filter, reset_wheel_pi)
 
-DIST, E_X = 4, 5
+DIST, E_X = 5, 5
 PX, IX, DX = 0.03, 0.0, 0.002
 PY, IY, DY = 0.03, 0.00, 0.001
 DEAD_X, DEAD_DIST = 0.3, 0.5
