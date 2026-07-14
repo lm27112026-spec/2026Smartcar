@@ -53,8 +53,8 @@ UWB_X_SLOWDOWN_CM      = -80.0    # X < 此值时开始线性减速，防止冲�
 UWB_X_MIN_SPEED        = 0.25     # 接近阈值时的最低速度 (m/s)
 UWB_X_TIMEOUT_S        = 15.0     # UWB X 距离检测超时 (s)
 UWB_BACKUP_DIST_CM     = 20.0     # 触发后倒退距离 (cm)
-UWB_BACKUP_SPEED       = 0.50     # 倒退速度 (m/s)
-UWB_BACKUP_TIMEOUT_S   = 8.0      # 倒退超时 (s)
+UWB_BACKUP_SPEED       = 0.90     # 倒退速度 (m/s)
+UWB_BACKUP_TIMEOUT_S   = 4.0      # 倒退超时 (s)
 UWB_DEAD_TIMEOUT_S     = 2.0      # UWB 掉线容忍超时 (s)
 UWB_DEAD_RECONNECT_MAX  = 4       # UWB 掉线最大重连次数
 
@@ -283,11 +283,11 @@ def _lock_yaw():
     return _TARGET_HEADING
 
 
-def _heading_correction(target_yaw, deadband=1.0, dt=None):
+def _heading_correction(target_yaw, deadband=0.40, dt=None):
     if dt is None:
         dt = FWD_CTRL_DT
     if deadband is None:
-        deadband = 1.0
+        deadband = 0.40
     _read_imu_update_yaw()
     current_yaw = _yaw()
     diff = (target_yaw - current_yaw + 180) % 360 - 180
@@ -905,7 +905,8 @@ def see_and_push():
 # ═══════════════════════════════════════════════════════════════
 
 def _action_forward_until_uwb_x():
-    """直行全速推进。全模式统一引入 UWB 物理坐标安全控制 + 视觉黄线复合守护推进。"""
+    """直行全速推进。推进期间临时倍增 P、I、D 参数并松绑纠偏上限，
+    配合竞速级安全阈值抗打滑策略（TCS），在不损失竞速效率的前提下极力压制初始漂移峰值。"""
     global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [UWBX] === 开始过线推进 ===")
     
@@ -914,6 +915,30 @@ def _action_forward_until_uwb_x():
         print("  [UWBX] 警告：UWB 初始不可用，将在前行移动中建立连接...")
 
     target_heading = _lock_yaw()
+    
+    # ── 🔴 穿透 hold 对象，直接定位到内部的 pid 控制器实例 ──
+    hold = _get_heading_hold()
+    pid = hold._pid
+    
+    # 备份原始参数以便 finally 块还原
+    orig_kp = pid.kp
+    orig_ki = pid.ki
+    orig_kd = pid.kd if hasattr(pid, 'kd') else 0.0
+    orig_i_limit = pid.integral_limit
+    orig_wz_max = pid.output_limit
+
+    # ── 临时"极限竞速"参数调整 ──
+    pid.kp = orig_kp * 1.8                  # 🔴 核心优化1：比例项放大1.8倍，极大缩短反应延迟，压制初始漂移峰值
+    pid.ki = orig_ki * 4.0 if orig_ki > 0.0 else 0.02
+    if hasattr(pid, 'kd') and orig_kd > 0.0:
+        pid.kd = orig_kd * 1.5              # 🔴 核心优化2：微分项同步放大1.5倍，提供强力物理阻尼，防止纠偏过冲
+        
+    pid.integral_limit = orig_i_limit * 5.0
+    pid.output_limit = 0.85                 # wz纠偏输出限幅松绑到 0.85（最大动用 85% 电机功率转向纠偏）
+
+    print("  [UWBX] 竞速纠偏解限: Kp={:.2f}→{:.2f}, Ki={:.4f}→{:.4f}, I_LIMIT={:.3f}→{:.3f}, WZ_MAX={:.3f}→{:.3f}".format(
+        orig_kp, pid.kp, orig_ki, pid.ki, orig_i_limit, pid.integral_limit, orig_wz_max, pid.output_limit))
+
     start_ms = time.ticks_ms()
     last_print_ms = start_ms
     last_uwb_ms = start_ms
@@ -933,130 +958,152 @@ def _action_forward_until_uwb_x():
     # 安全里程积分器
     total_fwd_dist_m = 0.0
 
-    while True:
-        now_ms = time.ticks_ms()
-        if _abort_check():
-            led.value(0)
-            return False
-        elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
-        if elapsed > UWB_X_TIMEOUT_S:
-            print("  [UWBX] 超时 ({:.1f}s)，停止推进。".format(elapsed))
-            led.value(0)
-            return False
+    # ── 使用 try...finally 安全闭环包裹，保障参数在任何出口无损恢复 ──
+    try:
+        while True:
+            now_ms = time.ticks_ms()
+            if _abort_check():
+                led.value(0)
+                return False
+            elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000.0
+            if elapsed > UWB_X_TIMEOUT_S:
+                print("  [UWBX] 超时 ({:.1f}s)，停止推进。".format(elapsed))
+                led.value(0)
+                return False
 
-        counts = get_encoder_counts()
-        if counts is None or len(counts) < 4:
-            time.sleep_ms(5)
-            continue
-        actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
-        if actual_dt <= 0.001 or actual_dt > 3 * FWD_CTRL_DT:
-            actual_dt = FWD_CTRL_DT
-            for i in range(4):
-                _local_prev_speeds[i] = 0.0
-            _local_speeds_initialized = False
-        last_loop_ms = now_ms
+            counts = get_encoder_counts()
+            if counts is None or len(counts) < 4:
+                time.sleep_ms(5)
+                continue
+            actual_dt = time.ticks_diff(now_ms, last_loop_ms) / 1000.0
+            if actual_dt <= 0.001 or actual_dt > 3 * FWD_CTRL_DT:
+                actual_dt = FWD_CTRL_DT
+                for i in range(4):
+                    _local_prev_speeds[i] = 0.0
+                _local_speeds_initialized = False
+            last_loop_ms = now_ms
 
-        # 绝对值累加里程：由于是 vy=0 的纯直行，绝对值累加能高精度准确反映直行里程。
-        step_forward = sum(abs(counts[i] / ENC_SCALE[i]) for i in range(4)) / 4.0
-        if step_forward > 0:
-            _approach_forward_dist += step_forward
-            total_fwd_dist_m += step_forward
+            # 绝对值累加里程：由于是 vy=0 的纯直行，绝对值累加能高精度准确反映直行里程。
+            step_forward = sum(abs(counts[i] / ENC_SCALE[i]) for i in range(4)) / 4.0
+            if step_forward > 0:
+                _approach_forward_dist += step_forward
+                total_fwd_dist_m += step_forward
 
-        # ── 通用安全物理最长防护距离 (1.5m) ──
-        if total_fwd_dist_m >= 1.5:
-            stop_all()
-            led.value(0)
-            print("  [UWBX] 已达到测试模式最长物理防护距离 (1.5m)，触发停车。")
-            return True
+            # ── 通用安全物理最长防护距离 (1.5m) ──
+            if total_fwd_dist_m >= 1.5:
+                stop_all()
+                led.value(0)
+                print("  [UWBX] 已达到最长物理防护距离 (1.5m)，触发停车。")
+                return True
 
-        now = time.ticks_ms()
-        if uwb is not None and time.ticks_diff(now, last_uwb_ms) >= 50:
-            uwb.step()
-            last_uwb_ms = now
-        if time.ticks_diff(now, last_cam_ms) >= 50:
-            ctrl = cam.step()
-            last_cam_ms = now
-        line_detected = ctrl.get('line_flag', 0) if ctrl else 0
-        if line_detected:
-            armed_to_trigger = True
-            yellow_lost_count = 0
-        elif armed_to_trigger:
-            yellow_lost_count += 1
-        if armed_to_trigger and yellow_lost_count >= BLIND_TOLERANCE:
-            stop_all()
-            print("  [UWBX] 黄线越界确认 (连续{}帧) → 触发停车！".format(BLIND_TOLERANCE))
-            return True
+            now = time.ticks_ms()
+            if uwb is not None and time.ticks_diff(now, last_uwb_ms) >= 50:
+                uwb.step()
+                last_uwb_ms = now
+            if time.ticks_diff(now, last_cam_ms) >= 50:
+                ctrl = cam.step()
+                last_cam_ms = now
+            line_detected = ctrl.get('line_flag', 0) if ctrl else 0
+            if line_detected:
+                armed_to_trigger = True
+                yellow_lost_count = 0
+            elif armed_to_trigger:
+                yellow_lost_count += 1
+            if armed_to_trigger and yellow_lost_count >= BLIND_TOLERANCE:
+                stop_all()
+                print("  [UWBX] 黄线越界确认 (连续{}帧) → 触发停车！".format(BLIND_TOLERANCE))
+                return True
 
-        uwb_is_active = True
-        if uwb is None or uwb.is_timeout():
-            uwb_is_active = False
-            if uwb_dead_start == 0:
-                uwb_dead_start = time.ticks_ms()
-                print("  [UWBX] UWB 数据中断，车身保持安全巡航速度并于移动中尝试重连...")
-            elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > UWB_DEAD_TIMEOUT_S * 1000:
-                if uwb is not None and uwb.is_uart_alive():
-                    print("  [UWBX] UART 仍活跃，延长移动等待 (帧过滤中)...")
+            uwb_is_active = True
+            if uwb is None or uwb.is_timeout():
+                uwb_is_active = False
+                if uwb_dead_start == 0:
                     uwb_dead_start = time.ticks_ms()
-                elif uwb_dead_reconnect < UWB_DEAD_RECONNECT_MAX:
-                    uwb_dead_reconnect += 1
-                    print("  [UWBX] UART 离线，移动中进行第 {}/{} 次硬件重连重建...".format(
-                        uwb_dead_reconnect, UWB_DEAD_RECONNECT_MAX))
-                    _reset_uwb_if_needed()
-                    new_uwb = _ensure_uwb()
-                    if new_uwb is not None:
-                        uwb = new_uwb
-                        uwb_dead_start = 0
-                        last_uwb_ms = time.ticks_ms()
-                        print("  [UWBX] UWB 移动中重连建立成功！")
-                        uwb_is_active = True
-                        continue
-                    uwb_dead_start = time.ticks_ms()
-                else:
-                    print("  [UWBX] UWB 彻底离线，已进入视觉托管状态，继续安全车速行进...")
-                    uwb_dead_start = time.ticks_ms()
-        else:
-            if uwb_dead_start != 0:
-                print("  [UWBX] UWB 链路已自主恢复")
-            uwb_dead_start = 0
-            uwb_dead_reconnect = 0
+                    print("  [UWBX] UWB 数据中断，车身保持安全巡航速度并于移动中尝试重连...")
+                elif time.ticks_diff(time.ticks_ms(), uwb_dead_start) > UWB_DEAD_TIMEOUT_S * 1000:
+                    if uwb is not None and uwb.is_uart_alive():
+                        print("  [UWBX] UART 仍活跃，延长移动等待 (帧过滤中)...")
+                        uwb_dead_start = time.ticks_ms()
+                    elif uwb_dead_reconnect < UWB_DEAD_RECONNECT_MAX:
+                        uwb_dead_reconnect += 1
+                        print("  [UWBX] UART 离线，移动中进行第 {}/{} 次硬件重连重建...".format(
+                            uwb_dead_reconnect, UWB_DEAD_RECONNECT_MAX))
+                        _reset_uwb_if_needed()
+                        new_uwb = _ensure_uwb()
+                        if new_uwb is not None:
+                            uwb = new_uwb
+                            uwb_dead_start = 0
+                            last_uwb_ms = time.ticks_ms()
+                            print("  [UWBX] UWB 移动中重连建立成功！")
+                            uwb_is_active = True
+                            continue
+                        uwb_dead_start = time.ticks_ms()
+                    else:
+                        print("  [UWBX] UWB 彻底离线，已进入视觉托管状态，继续安全车速行进...")
+                        uwb_dead_start = time.ticks_ms()
+            else:
+                if uwb_dead_start != 0:
+                    print("  [UWBX] UWB 链路已自主恢复")
+                uwb_dead_start = 0
+                uwb_dead_reconnect = 0
 
-        fwd_speed = UWB_X_MIN_SPEED
-        if uwb_is_active:
+            fwd_speed = UWB_X_MIN_SPEED
+            if uwb_is_active:
+                try:
+                    x_cm, y_cm = uwb.get_position()
+                    if x_cm < UWB_X_THRESHOLD_CM:
+                        stop_all()
+                        print("  [UWBX] UWB X={:.1f}cm < {:.0f}cm，坐标触发停车！".format(
+                            x_cm, UWB_X_THRESHOLD_CM))
+                        return True
+                    if x_cm < UWB_X_SLOWDOWN_CM:
+                        slowdown_range = UWB_X_SLOWDOWN_CM - UWB_X_THRESHOLD_CM
+                        ratio = (UWB_X_SLOWDOWN_CM - x_cm) / slowdown_range
+                        ratio = max(0.0, min(1.0, ratio))
+                        fwd_speed = STARTUP_FULL_SPEED - ratio * (STARTUP_FULL_SPEED - UWB_X_MIN_SPEED)
+                    else:
+                        fwd_speed = STARTUP_FULL_SPEED
+                except Exception as e:
+                    print("  [UWBX] get_position() 读取异常:", e)
+                    fwd_speed = UWB_X_MIN_SPEED
+            else:
+                fwd_speed = 0.35
+
+            # ── 🔴 核心优化3：竞速级"安全阈值抗滑移"控滑策略 ──
+            # 在跑偏 10° 以内时，100% 满功率竞速推进，绝不降速！
+            # 仅在偏航角突破 10° 警戒线时，才启动极轻微的前进速度衰减（最低限制到 40% 蠕动），给 wz 释放物理抓地力
+            # 一旦纠偏拉回到 10° 以内，底盘立刻重新爆发 100% 全速推进，完美保障竞速时间！
+            _read_imu_update_yaw()
+            yaw_err = abs((target_heading - _yaw() + 180) % 360 - 180)
+            if yaw_err > 10.0:
+                fwd_scale = max(0.40, min(1.0, 1.0 - ((yaw_err - 10.0) / 20.0)))
+                fwd_speed = fwd_speed * fwd_scale
+
+            if time.ticks_diff(now, last_print_ms) >= 500:
+                last_print_ms = now
+                st = "HEALTHY" if uwb_is_active else "DROPPED(RUNNING)"
+                print("  [UWBX] UWB_Link={} v={:.2f}m/s yaw={:.2f}° t={:.1f}s dist={:.2f}m".format(
+                    st, fwd_speed, _yaw(), elapsed, total_fwd_dist_m))
+            loop_cnt += 1
+            if loop_cnt % 50 == 0:
+                gc.collect()
+            wz = _heading_correction(target_heading, dt=actual_dt)
             try:
-                x_cm, y_cm = uwb.get_position()
-                if x_cm < UWB_X_THRESHOLD_CM:
-                    stop_all()
-                    print("  [UWBX] UWB X={:.1f}cm < {:.0f}cm，坐标触发停车！".format(
-                        x_cm, UWB_X_THRESHOLD_CM))
-                    return True
-                if x_cm < UWB_X_SLOWDOWN_CM:
-                    slowdown_range = UWB_X_SLOWDOWN_CM - UWB_X_THRESHOLD_CM
-                    ratio = (UWB_X_SLOWDOWN_CM - x_cm) / slowdown_range
-                    ratio = max(0.0, min(1.0, ratio))
-                    fwd_speed = STARTUP_FULL_SPEED - ratio * (STARTUP_FULL_SPEED - UWB_X_MIN_SPEED)
-                else:
-                    fwd_speed = STARTUP_FULL_SPEED
+                speeds = _get_local_filtered_speeds(counts, actual_dt)
+                omni_drive_closed_loop(fwd_speed, 0, wz, speeds, actual_dt)
             except Exception as e:
-                print("  [UWBX] get_position() 读取异常:", e)
-                fwd_speed = UWB_X_MIN_SPEED
-        else:
-            fwd_speed = 0.35
-
-        if time.ticks_diff(now, last_print_ms) >= 500:
-            last_print_ms = now
-            st = "HEALTHY" if uwb_is_active else "DROPPED(RUNNING)"
-            print("  [UWBX] UWB_Link={} v={:.2f}m/s yaw={:.2f}° t={:.1f}s dist={:.2f}m".format(
-                st, fwd_speed, _yaw(), elapsed, total_fwd_dist_m))
-        loop_cnt += 1
-        if loop_cnt % 50 == 0:
-            gc.collect()
-        wz = _heading_correction(target_heading, dt=actual_dt)
-        try:
-            speeds = _get_local_filtered_speeds(counts, actual_dt)
-            omni_drive_closed_loop(fwd_speed, 0, wz, speeds, actual_dt)
-        except Exception as e:
-            print("  [UWBX] 驱动运行错误:", e)
-        time.sleep_ms(int(FWD_CTRL_DT * 1000))
+                print("  [UWBX] 驱动运行错误:", e)
+            time.sleep_ms(int(FWD_CTRL_DT * 1000))
+    finally:
+        # ── 🔴 还原原始参数，并将推重物累积的饱和积分及微分缓存彻底复位 ──
+        pid.kp = orig_kp
+        pid.ki = orig_ki
+        if hasattr(pid, 'kd'):
+            pid.kd = orig_kd
+        pid.integral_limit = orig_i_limit
+        pid.output_limit = orig_wz_max
+        pid.reset()  
+        print("  [UWBX] 纠偏参数已安全复原，积分及微分缓存已清空。")
 
 
 # ═══════════════════════════════════════════════════════════════
