@@ -46,9 +46,9 @@ _heading_hold = None        # HeadingHold 实例（首次 _lock_yaw 时懒初始
 # ── 蓝牙信号 ──
 BT_WAIT_DEADLINE_S       = 30.0     # 蓝牙单次等待超时 (s)
 
-# ── 启动: 收到 ok 后全速前进至 UWB X 距离 < -130cm ──
+# ── 启动: 收到 ok 后全速前进至 UWB X 距离 < -150cm ──
 STARTUP_FULL_SPEED     = 1.00     # 全速前进速度（绝对值，m/s）
-UWB_X_THRESHOLD_CM     = -130.0   # UWB X 轴距离阈值 (cm)，小于此值触发停车
+UWB_X_THRESHOLD_CM     = -150.0   # UWB X 轴距离阈值 (cm)，小于此值触发停车
 UWB_X_SLOWDOWN_CM      = -80.0    # X < 此值时开始线性减速，防止冲出 UWB 覆盖
 UWB_X_MIN_SPEED        = 0.25     # 接近阈值时的最低速度 (m/s)
 UWB_X_TIMEOUT_S        = 15.0     # UWB X 距离检测超时 (s)
@@ -103,7 +103,7 @@ goto_location = None
 
 
 def _get_local_filtered_speeds(raw_counts, dt):
-    """基于外部传入的 counts 数组计算一阶低通滤波速度 [rf, lf, lb, rb] (m/s)。"""
+    """基于外部传入 of counts 数组计算一阶低通滤波速度 [rf, lf, lb, rb] (m/s)。"""
     global _local_prev_speeds, _local_speeds_initialized
     if raw_counts is None or len(raw_counts) < 4:
         return _local_prev_speeds
@@ -335,6 +335,7 @@ def _maintain_yaw(target_heading):
 def _pause_with_yaw_hold(target_heading, duration_ms):
     deadline = time.ticks_ms() + duration_ms
     while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+        pet_watchdog() # 💡 强力喂狗
         _maintain_yaw(target_heading)
         time.sleep_ms(10)
     stop_all()
@@ -558,7 +559,7 @@ def _action_s_pattern_search():
     一维总进度通过全局变量 _search_progress_cm (0 ~ 220cm) 统一管理。
     """
     global _search_progress_cm, _just_pushed, supplies
-    # 清空 move_toward_fixed_point 阶段积压的摄像头 UART 脏帧，保证视觉时效
+    # 清空 move_toward_fixed_point 阶段积压 of 摄像头 UART 脏帧，保证视觉时效
     _ensure_cam().reset()
     target_heading = _lock_yaw()
     print("\n  [S_SEARCH] 开始/恢复 S 曲线搜索路径。当前全局总轴向进度: {:.1f}cm".format(_search_progress_cm))
@@ -795,7 +796,7 @@ def see_and_push():
                 stop_all()
                 break
 
-            # 保持真实的 has_tgt 输入，让控制器内部的 500ms 容忍时钟正常工作
+            # 保持真实的 has_tgt 输入，让控制器内部 of 500ms 容忍时钟正常工作
             vx, vy, wz_out, is_aligned, dt_step = fc.step(
                 x_cm, dist_cm, has_tgt, wz_in=wz, now_ms=t_now)
 
@@ -888,36 +889,37 @@ def see_and_push():
     print("  [APPROACH] 向从车发送数字 0 (turn_right)...")
     retry_count = 0
     try:
-        # 彻底清空历史积压的 "ok"（来自 exit 或 direction 指令的回复）
-        while bt.read_response() is not None:
-            time.sleep_ms(5)
+        # 💡 强力清除方案：持续循环读取 300ms，把所有积压数据彻底读空并喂狗
+        clear_start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), clear_start) < 300:
+            pet_watchdog()
+            bt.read_response()
+            time.sleep_ms(10)
 
+        bt.turn_right()
+        print("  [APPROACH] 指令已发，等待从车 ok（超时 3s 后自动继续）...")
+        bt_wait_start = time.ticks_ms()
         while True:
-            bt.turn_right()
-            retry_count += 1
-            suffix = " (第{}次发送)".format(retry_count) if retry_count > 1 else ""
-            print("  [APPROACH] 指令已发{}，等待从车 ok（单次超时 {}s）...".format(suffix, BT_WAIT_DEADLINE_S))
-            bt_wait_start = time.ticks_ms()
-            while True:
-                pet_watchdog()
-                _maintain_yaw(target_heading)
-                if time.ticks_diff(time.ticks_ms(), bt_wait_start) > BT_WAIT_DEADLINE_S * 1000:
-                    print("  [APPROACH] 等待从车 ok 超时 ({}s)，重新发送...".format(BT_WAIT_DEADLINE_S))
-                    break
-                if check_sw2():
-                    print("  [APPROACH] SW2 中断，跳过蓝牙等待")
-                    return True
-                resp = bt.read_response()
-                if resp == "ok":
-                    print("  [APPROACH] 从车确认完毕 (ok)")
-                    return True
-                time.sleep_ms(10)
+            pet_watchdog()
+            _maintain_yaw(target_heading)
+            if time.ticks_diff(time.ticks_ms(), bt_wait_start) > 3000:
+                print("  [APPROACH] 等待从车 ok 超时 (3s)，直接继续执行")
+                break
+            if check_sw2():
+                print("  [APPROACH] SW2 中断，跳过蓝牙等待")
+                break
+            resp = bt.read_response()
+            if resp == "ok":
+                print("  [APPROACH] 从车确认完毕 (ok)")
+                break
+            time.sleep_ms(10)
     except Exception as e:
         print("  [APPROACH] 蓝牙通信发生异常:", e)
         return False
+    return True
 
 # ═══════════════════════════════════════════════════════════════
-#  全速前进至 UWB X 距离 < -130cm
+#  全速前进至 UWB X 距离 < -150cm
 # ═══════════════════════════════════════════════════════════════
 
 def _action_forward_until_uwb_x():
@@ -1052,7 +1054,7 @@ def _action_forward_until_uwb_x():
                             uwb = new_uwb
                             uwb_dead_start = 0
                             last_uwb_ms = time.ticks_ms()
-                            print("  [UWBX] UWB 移动中重连建立成功！")
+                            print("  [UWB] 移动中重连建立成功！")
                             uwb_is_active = True
                             continue
                         uwb_dead_start = time.ticks_ms()
@@ -1545,6 +1547,10 @@ if RUN_MODE == "loop":
                 except Exception as e:
                     print("  [MAIN_LOOP] 蓝牙通信异常:", e)
 
+            # 💡 收到从车 ok 后停车 2 秒，等待从车完成推物动作
+            stop_all()
+            time.sleep_ms(3000)
+
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
 
@@ -1566,4 +1572,4 @@ if RUN_MODE == "loop":
 elif RUN_MODE == "test":
     main()
     import sys; sys.exit()
-
+    
