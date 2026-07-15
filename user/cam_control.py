@@ -12,14 +12,14 @@ from motor import (stop_all, omni_drive_closed_loop,
                    get_encoder_speeds_filtered, get_encoder_counts,
                    reset_encoder_filter, reset_wheel_pi)
 
-DIST, E_X = 5, 5
-PX, IX, DX = 0.03, 0.0, 0.002
-PY, IY, DY = 0.03, 0.00, 0.001
-DEAD_X, DEAD_DIST = 0.3, 0.5
+DIST, E_X = 8, 3
+PX, IX, DX = 0.025, 0.002, 0.004
+PY, IY, DY = 0.025, 0.002, 0.004
+DEAD_X, DEAD_DIST = 0.8, 0.8
 MAX_VX, MAX_VY, MAX_WZ = 1.5, 1.5, 1
 IX_OUT, IY_OUT = 0.20, 0.20
 SPEED_BUDGET, VY_BUDGET_MAX, VY_BUDGET_MIN = 1.0, 0.70, 0.30
-ALIGN_EX, ALIGN_DIST = 0.5, 0.5
+ALIGN_EX, ALIGN_DIST = 3, 3
 LOST_T, DT = 500, 0.01
 
 S_FOLLOW, S_STOP, S_LOST = 0, 1, 2
@@ -197,3 +197,5 @@ def cam_approach(cam, lock_heading_fn, calc_wz_fn,
         time.sleep_ms(int(DT * 1000))
     if led_fn: led_fn(False)
     return (True, 'arrived')
+
+
