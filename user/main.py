@@ -89,6 +89,7 @@ _cam_shared           = None    # 共享 CameraController 实例
 _TARGET_HEADING       = None    # 全程锁定的目标航向
 _approach_forward_dist = 0.0     # 取物流程净前进距离 (m)，由正解投影精确累加
 _search_progress_cm   = 0.0     # 一维轴向S形总里程进度（0 ~ 220cm）
+_origin_return_offset = 0.0     # 返航 X 坐标累计偏移 (cm)，每次返航 +10
 _just_pushed          = False    # 避盲区保护标志：刚完成推出后置 True，用于起步避开二次触发
 
 # ── 本地一阶低通滤波器（用于动力闭环速度输入）──
@@ -165,7 +166,7 @@ def check_sw2():
 
 def _system_init():
     """统一初始化：保证 loop / test 模式硬件与软件状态完全一致"""
-    global origin, CameraController, goto_location, _TARGET_HEADING
+    global origin, CameraController, goto_location, _TARGET_HEADING, _origin_return_offset
     print("\n[SYSTEM] 执行统一系统状态初始化...")
 
     pause_encoder_ticker()
@@ -186,6 +187,8 @@ def _system_init():
     # 3. 正式开启 WDT
     start_watchdog()
     print("  [INIT] 独立硬件看门狗已启用 (3秒超时)")
+
+    _origin_return_offset = 0.0
 
     # 4. 初始化 UWB（两个模式均统一初始化，保证测试/循环一致性）
     uwb = _ensure_uwb()
@@ -885,6 +888,10 @@ def see_and_push():
     print("  [APPROACH] 向从车发送数字 0 (turn_right)...")
     retry_count = 0
     try:
+        # 彻底清空历史积压的 "ok"（来自 exit 或 direction 指令的回复）
+        while bt.read_response() is not None:
+            time.sleep_ms(5)
+
         while True:
             bt.turn_right()
             retry_count += 1
@@ -1123,7 +1130,7 @@ def _action_forward_until_uwb_x():
 # ═══════════════════════════════════════════════════════════════
 
 def _action_return_to_origin():
-    global origin
+    global origin, _origin_return_offset
     uwb = _ensure_uwb()
     if uwb is None:
         print("  [RTN] UWB 不可用")
@@ -1131,7 +1138,9 @@ def _action_return_to_origin():
     if origin is None:
         print("  [RTN] origin 坐标未记录")
         return False
-    target_x, target_y = origin
+    target_x = origin[0] + _origin_return_offset
+    target_y = origin[1]
+    print("  [RTN] 返航目标: ({:.1f}, {:.1f})  X偏移 +{:.0f}cm".format(target_x, target_y, _origin_return_offset))
     for _ in range(5):
         _ = get_encoder_counts()
         time.sleep_ms(10)
@@ -1159,6 +1168,9 @@ def _action_return_to_origin():
         _abort_fn, _drive_fn, _stop_fn,
         _led_fn, label="RTN"
     )
+    if arrived:
+        _origin_return_offset += 10.0
+        print("  [RTN] 到达，下次返航 X 偏移累计: +{:.0f}cm".format(_origin_return_offset))
     return arrived
 
 
@@ -1273,36 +1285,33 @@ def _action_uwb_translate():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  move_toward_fixed_point: 前进 50cm → 右平移 60cm
+#  move_toward_fixed_point: 直线到达目标点，IMU 航向锁定
 # ═══════════════════════════════════════════════════════════════
 
 def move_toward_fixed_point():
-    """使用动力重合器前进 50cm，随后右移 60cm，全程 IMU 强纠偏"""
+    """直线斜向到达目标点 (前55cm, 右60cm)，全程 IMU 航向角锁定"""
+    import math
+    fwd_m  = MFP_FORWARD_DIST_CM / 100.0   # 0.55
+    right_m = MFP_RIGHT_DIST_CM / 100.0    # 0.60
+    diag_m = math.sqrt(fwd_m**2 + right_m**2)
+
+    # 按位移比例分配速度分量，总速率 = MFP_SPEED
+    vx = MFP_SPEED * fwd_m  / diag_m
+    vy = MFP_SPEED * right_m / diag_m
+
     print("\n" + "=" * 50)
-    print("[MFP] 前进 50cm → 右平移 110cm（全程航向锁定）")
+    print("[MFP] 斜线直达: 前{:.0f}cm + 右{:.0f}cm  对角{:.1f}cm（航向锁定）"
+          .format(MFP_FORWARD_DIST_CM, MFP_RIGHT_DIST_CM, diag_m * 100))
     print("=" * 50)
 
     pause_encoder_ticker()
     _encoder_reset()
 
-    _lock_yaw()
-    led.value(1)
+    _drive_closed_loop(vx, vy, diag_m,
+                       check_target=False,
+                       timeout_s=MFP_TIMEOUT_S,
+                       label="MFP")
 
-    # ── 阶段 1: 前进 50cm ──
-    print("  [MFP] 阶段 1/2: 前进 {:.0f}cm...".format(MFP_FORWARD_DIST_CM))
-    bt.send_direction('L', MFP_SPEED)  # 前进
-    _drive_closed_loop(MFP_SPEED, 0, MFP_FORWARD_DIST_CM / 100.0, check_target=False, label="MFP_FWD")
-    bt.send_direction('exit')
-
-    _pause_with_yaw_hold(_TARGET_HEADING, 300)
-    _encoder_reset()
-
-    # ── 阶段 2: 右平移 90cm ──
-    print("  [MFP] 阶段 2/2: 右平移 {:.0f}cm...".format(MFP_RIGHT_DIST_CM))
-    _drive_closed_loop(0, MFP_SPEED, MFP_RIGHT_DIST_CM / 100.0, check_target=False, label="MFP_RIGHT")
-
-    stop_all()
-    led.value(0)
     print("[MFP] ✓ 完成")
     print("=" * 50 + "\n")
     return True
@@ -1454,7 +1463,7 @@ def _safe_return_and_exit():
 #  系统入口
 # ═══════════════════════════════════════════════════════════════
 
-RUN_MODE = "test"
+RUN_MODE = "loop"
 
 if RUN_MODE == "loop":
     _system_init()
@@ -1504,6 +1513,14 @@ if RUN_MODE == "loop":
                 target_heading = _lock_yaw()
                 retry_count = 0
                 try:
+                    # 等待 exit 指令的 "ok" 经蓝牙链路传回（50-120ms 物理延迟）
+                    # 确保后续清空缓冲区时能一次性扫干净，防止误读为 turn_left 的 ok
+                    time.sleep_ms(200)
+
+                    print("  [MAIN_LOOP] 正在清空主车接收缓冲区...")
+                    while bt.read_response() is not None:
+                        time.sleep_ms(5)
+
                     while True:
                         bt.turn_left()
                         retry_count += 1
