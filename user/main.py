@@ -585,10 +585,8 @@ def _action_s_pattern_search():
     if 90.0 <= _search_progress_cm < 140.0:
         rem_dist_m = (140.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 1 (前行过渡): 剩余前行过渡距离 = {:.1f}cm".format(rem_dist_m * 100.0))
-        bt.send_direction('L', 0.40)  # 前进
         # 前行段不进行视觉拦截
         _, moved_m = _drive_closed_loop(0.40, 0, rem_dist_m, check_target=False, label="S_STAGE_1")
-        bt.send_direction('exit')
         _search_progress_cm += moved_m * 100.0
         if check_sw2():
             return False
@@ -597,7 +595,7 @@ def _action_s_pattern_search():
     if 140.0 <= _search_progress_cm < 240.0:
         rem_dist_m = (220.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 2 (向左平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
-        bt.send_direction('B', RIGHTWARD_SPEED)  # 左移
+        bt.send_direction('B', 0.5)  # 左移
         # 向左平移使用负的 Y 速度分量
         found, moved_m = _drive_closed_loop(0, -RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_2", ignore_dist_m=ignore_d)
         bt.send_direction('exit')
@@ -977,6 +975,25 @@ def _action_forward_until_uwb_x():
 
     # 安全里程积分器
     total_fwd_dist_m = 0.0
+
+    # ── 阻尼式安全物理减速软刹车机制 ──
+    # 消除多电机在高功率下直接卸载产生的电源轨负载突卸振荡
+    def _soft_stop(start_vx, start_wz, dt_step):
+        steps = 4
+        for idx in range(steps):
+            scale = (steps - 1 - idx) / steps
+            vx_t = start_vx * scale
+            wz_t = start_wz * scale
+            rc_counts = get_encoder_counts()
+            spds = [0.0, 0.0, 0.0, 0.0]
+            if rc_counts is not None and len(rc_counts) >= 4:
+                spds = _get_local_filtered_speeds(rc_counts, dt_step)
+            try:
+                omni_drive_closed_loop(vx_t, 0, wz_t, spds, dt_step)
+            except Exception:
+                pass
+            time.sleep_ms(25)
+        stop_all()
 
     # ── 使用 try...finally 安全闭环包裹，保障参数在任何出口无损恢复 ──
     try:
@@ -1547,9 +1564,14 @@ if RUN_MODE == "loop":
                 except Exception as e:
                     print("  [MAIN_LOOP] 蓝牙通信异常:", e)
 
-            # 💡 收到从车 ok 后停车 2 秒，等待从车完成推物动作
+            # 💡 收到从车 ok 后物理停车 3 秒，等待从车完成转身推物动作
+            # 分片睡眠 + 每 100ms 喂一次狗，防止脱机看门狗复位
             stop_all()
-            time.sleep_ms(3000)
+            wait_start = time.ticks_ms()
+            while time.ticks_diff(time.ticks_ms(), wait_start) < 3000:
+                pet_watchdog()
+                _maintain_yaw(_TARGET_HEADING)
+                time.sleep_ms(100)
 
             _pause_with_yaw_hold(_TARGET_HEADING, 300)
             _encoder_reset()
@@ -1571,5 +1593,6 @@ if RUN_MODE == "loop":
 
 elif RUN_MODE == "test":
     main()
-    import sys; sys.exit()
+    import sys
+    sys.exit()
     
