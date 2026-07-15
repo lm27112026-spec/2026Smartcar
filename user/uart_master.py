@@ -57,6 +57,16 @@ class MasterBT:
         print("MasterBT: turn_right -> 0")
         self._uart.write(b"0\r\n")
 
+    def send_direction(self, char, speed=None):
+        """发送方向+速度: F=前, B=后, L=左, R=右 (从车视角)。火抛不等待应答。
+        格式: F,0.50\\r\\n  或仅 F\\r\\n (speed=None 时)"""
+        if speed is not None:
+            msg = "{},{:.2f}\r\n".format(char, speed)
+        else:
+            msg = char + "\r\n"
+        print("MasterBT: direction -> " + msg.strip())
+        self._uart.write(msg.encode())
+
     
     # ── 接收 ───────────────────────────────────────────
 

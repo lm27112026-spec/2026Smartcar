@@ -29,12 +29,12 @@ SW2_PIN  = 'D9'
 
 # ── C14: 前进 20cm ──
 FORWARD_DIST_M   = 0.20    # 目标距离 (m)
-FORWARD_SPEED    = 0.50    # 前进速度 (m/s)
+FORWARD_SPEED    = 0.30    # 前进速度 (m/s)
 FWD_TIMEOUT_S    = 10.0    # 超时 (s)
 FWD_CTRL_DT      = 0.02    # 控制周期 (s)
 
 # ── C14: UWB 平移 ──
-UWB_LAT_SPEED    = 0.50    # 最大平移速度 (m/s)
+UWB_LAT_SPEED    = 0.30    # 最大平移速度 (m/s)
 UWB_X_DEADBAND   = 3.0     # X 方向死区 (cm)
 
 UWB_LAT_P_GAIN   = 0.02    # X 误差 → 平移速度 P 增益
@@ -44,7 +44,7 @@ UWB_CTRL_DT      = 0.02    # 控制周期 (s)
 _heading_hold = None        # HeadingHold 实例（首次 _lock_yaw 时懒初始化）
 
 # ── 蓝牙信号 ──
-BT_WAIT_DEADLINE_S       = 10.0     # 蓝牙单次等待超时 (s)
+BT_WAIT_DEADLINE_S       = 30.0     # 蓝牙单次等待超时 (s)
 
 # ── 启动: 收到 ok 后全速前进至 UWB X 距离 < -130cm ──
 STARTUP_FULL_SPEED     = 1.00     # 全速前进速度（绝对值，m/s）
@@ -53,7 +53,7 @@ UWB_X_SLOWDOWN_CM      = -80.0    # X < 此值时开始线性减速，防止冲�
 UWB_X_MIN_SPEED        = 0.25     # 接近阈值时的最低速度 (m/s)
 UWB_X_TIMEOUT_S        = 15.0     # UWB X 距离检测超时 (s)
 UWB_BACKUP_DIST_CM     = 20.0     # 触发后倒退距离 (cm)
-UWB_BACKUP_SPEED       = 0.90     # 倒退速度 (m/s)
+UWB_BACKUP_SPEED       = 0.30     # 倒退速度 (m/s)
 UWB_BACKUP_TIMEOUT_S   = 4.0      # 倒退超时 (s)
 UWB_DEAD_TIMEOUT_S     = 2.0      # UWB 掉线容忍超时 (s)
 UWB_DEAD_RECONNECT_MAX  = 4       # UWB 掉线最大重连次数
@@ -68,12 +68,12 @@ BACKUP_PATH_TIMEOUT = 15.0    # 倒车回到路径超时 (s)
 # ── move_toward_fixed_point ──
 MFP_FORWARD_DIST_CM  = 55.0    # 目标50cm 
 MFP_RIGHT_DIST_CM    = 60.0    # 目标110cm - 20cm惯性 = 90.0cm
-MFP_SPEED            = 0.50    # 行进速度 (m/s)
+MFP_SPEED            = 0.40    # 行进速度 (m/s)
 MFP_TIMEOUT_S        = 15.0    # 超时 (s)
 MFP_CTRL_DT          = 0.02    # 控制周期 (s)
 
 # ── S形搜索参数 ──
-RIGHTWARD_SPEED          = 0.40    # 平移速度 (m/s)
+RIGHTWARD_SPEED          = 0.30    # 平移速度 (m/s)
 RIGHTWARD_TIMEOUT_S      = 20.0    # 单段平移超时 (s)
 RIGHTWARD_CTRL_DT        = 0.02    # 控制周期 (s)
 
@@ -581,8 +581,10 @@ def _action_s_pattern_search():
     if 90.0 <= _search_progress_cm < 140.0:
         rem_dist_m = (140.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 1 (前行过渡): 剩余前行过渡距离 = {:.1f}cm".format(rem_dist_m * 100.0))
+        bt.send_direction('L', 0.40)  # 前进
         # 前行段不进行视觉拦截
         _, moved_m = _drive_closed_loop(0.40, 0, rem_dist_m, check_target=False, label="S_STAGE_1")
+        bt.send_direction('exit')
         _search_progress_cm += moved_m * 100.0
         if check_sw2():
             return False
@@ -591,8 +593,10 @@ def _action_s_pattern_search():
     if 140.0 <= _search_progress_cm < 240.0:
         rem_dist_m = (220.0 - _search_progress_cm) / 100.0
         print("  [S_SEARCH] 阶段 2 (向左平移搜索): 剩余待搜索距离 = {:.1f}cm".format(rem_dist_m * 100.0))
+        bt.send_direction('B', RIGHTWARD_SPEED)  # 左移
         # 向左平移使用负的 Y 速度分量
         found, moved_m = _drive_closed_loop(0, -RIGHTWARD_SPEED, rem_dist_m, check_target=True, label="S_STAGE_2", ignore_dist_m=ignore_d)
+        bt.send_direction('exit')
         _search_progress_cm += moved_m * 100.0
         if found:
             _record_supplies_position()
@@ -915,6 +919,8 @@ def _action_forward_until_uwb_x():
     global _approach_forward_dist, _local_prev_speeds, _local_speeds_initialized
     print("\n  [UWBX] === 开始过线推进 ===")
     
+    bt.send_direction('B', STARTUP_FULL_SPEED)  # 前进
+    
     uwb = _ensure_uwb()
     if uwb is None:
         print("  [UWBX] 警告：UWB 初始不可用，将在前行移动中建立连接...")
@@ -1108,6 +1114,7 @@ def _action_forward_until_uwb_x():
         pid.integral_limit = orig_i_limit
         pid.output_limit = orig_wz_max
         pid.reset()  
+        bt.send_direction('exit')
         print("  [UWBX] 纠偏参数已安全复原，积分及微分缓存已清空。")
 
 
@@ -1283,7 +1290,9 @@ def move_toward_fixed_point():
 
     # ── 阶段 1: 前进 50cm ──
     print("  [MFP] 阶段 1/2: 前进 {:.0f}cm...".format(MFP_FORWARD_DIST_CM))
+    bt.send_direction('L', MFP_SPEED)  # 前进
     _drive_closed_loop(MFP_SPEED, 0, MFP_FORWARD_DIST_CM / 100.0, check_target=False, label="MFP_FWD")
+    bt.send_direction('exit')
 
     _pause_with_yaw_hold(_TARGET_HEADING, 300)
     _encoder_reset()
@@ -1540,3 +1549,4 @@ if RUN_MODE == "loop":
 elif RUN_MODE == "test":
     main()
     import sys; sys.exit()
+

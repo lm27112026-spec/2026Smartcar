@@ -1,6 +1,6 @@
 """
 test_bluetooth.py — 主车蓝牙收发测试
-发送 turn_left(1) / turn_right(0)，等待从车回复 ok。
+向从车发送方向+速度指令 B,0.40（后退），等待从车回复 ok。
 协议、超时、重试逻辑与 main.py 完全一致。
 """
 
@@ -21,12 +21,12 @@ def check_sw2():
     return sw2.value() == 0
 
 
-def send_and_wait_ok(cmd_name, send_fn):
-    """发送指令并等待从车回复 ok，超时重试。与 main.py 逻辑一致。"""
-    print("\n[TEST] 发送 {} ...".format(cmd_name))
+def send_direction_and_wait_ok(direction, speed, label):
+    """发送方向+速度指令并等待从车回复 ok，超时重试。"""
+    print("\n[TEST] 发送 {} -> {},{:.2f} ...".format(label, direction, speed))
     retry = 0
     while True:
-        send_fn()
+        bt.send_direction(direction, speed)
         retry += 1
         print("[TEST] 等待 ok (第{}次, 超时{}s)...".format(retry, BT_WAIT_DEADLINE_S))
         start = time.ticks_ms()
@@ -46,14 +46,12 @@ def send_and_wait_ok(cmd_name, send_fn):
 
 # ══════════════════════════════════════════════════
 print("=" * 40)
-print("  主车蓝牙测试 — turn_right + turn_left")
+print("  主车蓝牙测试 — B,0.40 (后退)")
 print("  SW2 按下退出")
 print("=" * 40)
 
 try:
-    send_and_wait_ok("turn_right (0)", bt.turn_right)
-    time.sleep_ms(300)
-    send_and_wait_ok("turn_left  (1)", bt.turn_left)
+    send_direction_and_wait_ok('L', 0.40, "后退")
 except Exception as e:
     print("[TEST] 异常:", e)
 

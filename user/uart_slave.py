@@ -7,6 +7,7 @@ uart_slave.py - UART 从机蓝牙接收解析模块
   {"roll":R,"yaw":Y,"wx":X,"wy":Y,"wz":Z}\r\n   -- IMU 姿态角速度 (JSON, {:.1f} 格式化)
   "1\r\n"                                        -- 左转 (turn_left)
   "0\r\n"                                        -- 右转 (turn_right)
+  "F,0.50\r\n"                                   -- 方向+速度 (F=前 B=后 L=左 R=右, 从车视角)
 
 应答:
   收到指令后发送 "ok\r\n" 应答。
@@ -24,6 +25,7 @@ except ImportError:
 _IMU_FIELDS = ('roll', 'yaw', 'wx', 'wy', 'wz')       # 主控车发送的 IMU JSON 字段（不含 pitch）
 _CMD_LEFT  = '1'        # 左转
 _CMD_RIGHT = '0'        # 右转
+_DIR_CHARS = frozenset({'F', 'L', 'R', 'B'})  # 方向字符
 
 
 class SlaveBT:
@@ -51,6 +53,7 @@ class SlaveBT:
             dict: {"type": "imu_data",       "roll":..., "yaw":..., "wx":..., "wy":..., "wz":...}
                   {"type": "turn_left"}
                   {"type": "turn_right"}
+                  {"type": "direction",      "direction": "F"/"L"/"R"/"B", "speed": 0.50}
             None: 无数据或格式错误
         """
         if not self._uart.any():
@@ -72,6 +75,16 @@ class SlaveBT:
         if line.startswith('{'):
             result = self._parse_imu_json(line)
             return result
+
+        # 方向+速度: F,0.50 / L,1.00 / R,0.50 / B,0.40
+        if len(line) >= 2 and line[0] in _DIR_CHARS and line[1] == ',':
+            result = self._parse_direction(line)
+            if result is not None:
+                return result
+
+        # 运动结束
+        if line == 'exit':
+            return {'type': 'exit'}
 
         # 左转
         if line == _CMD_LEFT:
@@ -102,6 +115,18 @@ class SlaveBT:
         except (ValueError, TypeError, KeyError):
             pass
         return None
+
+    def _parse_direction(self, line: str):
+        """解析方向+速度指令: F,0.50 → {type, direction, speed}"""
+        try:
+            parts = line.split(',')
+            if len(parts) != 2:
+                return None
+            direction = parts[0]
+            speed = float(parts[1])
+            return {'type': 'direction', 'direction': direction, 'speed': speed}
+        except (ValueError, IndexError):
+            return None
 
 
 
